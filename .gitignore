@@ -36,6 +36,7 @@ output/
 
 # Environment
 .env
+deploy/docker/.env.local.example
 .venv
 venv/
 ENV/
