@@ -16,13 +16,47 @@ from typing import List, Dict, Optional, Tuple
 from loguru import logger
 
 
+_STRICT_OOXML_NAMESPACE_MAP = {
+    "http://purl.oclc.org/ooxml/spreadsheetml/main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/worksheet": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/sharedStrings": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/styles": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/theme": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/extendedProperties": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extendedProperties",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/customProperties": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customProperties",
+    "http://purl.oclc.org/ooxml/drawingml/main": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "http://purl.oclc.org/ooxml/officeDocument/extendedProperties": "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties",
+    "http://purl.oclc.org/ooxml/officeDocument/customProperties": "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties",
+    "http://purl.oclc.org/ooxml/officeDocument/docPropsVTypes": "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes",
+}
+
+
+def _normalize_strict_ooxml_namespaces(data: bytes) -> bytes:
+    text = data.decode("utf-8", errors="ignore")
+    if "purl.oclc.org/ooxml" not in text:
+        return data
+    for strict_uri, transitional_uri in _STRICT_OOXML_NAMESPACE_MAP.items():
+        text = text.replace(strict_uri, transitional_uri)
+    return text.encode("utf-8")
+
+
+def _is_ooxml_text_part(item: str) -> bool:
+    return item.endswith(".xml") or item.endswith(".rels") or item == "[Content_Types].xml"
+
+
 def _strip_external_links_to_tmp(xlsx_path: str) -> str:
     """
-    复制一份 xlsx，移除 xl/externalLinks/ 及 workbook.xml 中的 <externalReferences> 节点。
+    复制一份 xlsx，移除外部链接并规范化 Strict OOXML 命名空间。
 
     openpyxl 对含外部工作簿引用（externalReferences，常见于 WPS / 链接了其它表格的 Excel）
     的 xlsx 解析有兼容缺陷：ExternalReference.__init__() missing 'id'。移除这些外部链接后
-    即可正常加载，对表格数据本身无影响。返回处理后的临时文件路径（调用方负责删除）。
+    即可正常加载，对表格数据本身无影响。
+
+    部分 WPS/Excel 文件会保存为 Strict OOXML。openpyxl 对 strict 的 worksheet relationship
+    识别不完整，可能加载成 0 个 sheet，因此这里同步转换为 transitional OOXML URI。
+    返回处理后的临时文件路径（调用方负责删除）。
     """
     import os
     import zipfile
@@ -35,6 +69,12 @@ def _strip_external_links_to_tmp(xlsx_path: str) -> str:
             if item.startswith("xl/externalLinks/"):
                 continue  # 丢弃外部链接定义
             data = zin.read(item)
+            if _is_ooxml_text_part(item):
+                data = _normalize_strict_ooxml_namespaces(data)
+            if item == "[Content_Types].xml":
+                text = data.decode("utf-8", errors="ignore")
+                text = re.sub(r"<Override[^>]*?/xl/externalLinks/[^>]*?/>", "", text)
+                data = text.encode("utf-8")
             if item == "xl/workbook.xml":
                 text = data.decode("utf-8", errors="ignore")
                 text = re.sub(r"<externalReferences>.*?</externalReferences>", "", text, flags=re.DOTALL)
@@ -46,6 +86,43 @@ def _strip_external_links_to_tmp(xlsx_path: str) -> str:
                 data = text.encode("utf-8")
             zout.writestr(item, data)
     return tmp_path
+
+
+def _load_xlsx_workbook(xlsx_path: str):
+    from openpyxl import load_workbook
+
+    try:
+        wb = load_workbook(xlsx_path, data_only=True)
+    except TypeError as e:
+        # openpyxl 对含 externalReferences（外部工作簿引用）的 xlsx 解析有兼容缺陷
+        # （ExternalReference.__init__() missing 'id'）。预处理移除外部链接后重试。
+        if "ExternalReference" in str(e) or "external" in str(e).lower():
+            logger.warning(f"⚠️  xlsx 含外部引用导致 openpyxl 解析失败，移除外部链接后重试: {e}")
+            cleaned = _strip_external_links_to_tmp(xlsx_path)
+            try:
+                wb = load_workbook(cleaned, data_only=True)
+            finally:
+                try:
+                    Path(cleaned).unlink()
+                except Exception:
+                    pass
+        else:
+            raise
+
+    if not wb.worksheets:
+        cleaned = _strip_external_links_to_tmp(xlsx_path)
+        try:
+            wb = load_workbook(cleaned, data_only=True)
+        finally:
+            try:
+                Path(cleaned).unlink()
+            except Exception:
+                pass
+
+    if not wb.worksheets:
+        raise ValueError("XLSX workbook contains no readable worksheets after preprocessing")
+
+    return wb
 
 
 # ---------------------------------------------------------------------------
@@ -323,28 +400,10 @@ def xlsx_to_markdown(
     Returns:
         (markdown_content, images)
     """
-    from openpyxl import load_workbook
-
     images_path = Path(images_dir)
     images_path.mkdir(parents=True, exist_ok=True)
 
-    try:
-        wb = load_workbook(xlsx_path, data_only=True)
-    except TypeError as e:
-        # openpyxl 对含 externalReferences（外部工作簿引用）的 xlsx 解析有兼容缺陷
-        # （ExternalReference.__init__() missing 'id'）。预处理移除外部链接后重试。
-        if "ExternalReference" in str(e) or "external" in str(e).lower():
-            logger.warning(f"⚠️  xlsx 含外部引用导致 openpyxl 解析失败，移除外部链接后重试: {e}")
-            cleaned = _strip_external_links_to_tmp(xlsx_path)
-            try:
-                wb = load_workbook(cleaned, data_only=True)
-            finally:
-                try:
-                    Path(cleaned).unlink()
-                except Exception:
-                    pass
-        else:
-            raise
+    wb = _load_xlsx_workbook(xlsx_path)
     images: List[Dict] = []
     image_counter = 0
     output_parts: List[str] = []
@@ -360,7 +419,8 @@ def xlsx_to_markdown(
                 logger.warning(f"⚠️  RustFS upload failed for {img_name}: {e}")
         return str(local_path), rustfs_url
 
-    for ws in wb.worksheets:
+    worksheets = [ws for ws in wb.worksheets if ws.sheet_state == "visible"] or wb.worksheets
+    for ws in worksheets:
         sheet_parts: List[str] = [f"## {ws.title}"]
 
         # 表格数据
