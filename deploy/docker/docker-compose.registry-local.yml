@@ -201,7 +201,10 @@ services:
           memory: ${WORKER_MEMORY_RESERVATION:-16G}
           devices:
             - driver: nvidia
-              count: ${GPU_COUNT:-1}
+              # 精确绑定宿主机 GPU；容器内该卡始终映射为 cuda:0。
+              # device_ids 与 count 互斥，不能同时配置。
+              device_ids:
+                - "${GPU_DEVICE_ID:-0}"
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
