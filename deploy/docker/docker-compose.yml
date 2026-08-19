@@ -1,41 +1,90 @@
-# Tianshu3 (mineru-tianshu) - 生产部署（本地存储 / 私有镜像 / SQLite 队列 / autoheal）
-# ============================================================================
-# 基底 = tianshu2 的 deploy/docker/docker-compose.local.yml（你已验证的生产配置）：
-#   - 私有 registry 镜像（REGISTRY_PREFIX + *_TAG、RUSTFS_IMAGE、AUTOHEAL_IMAGE）
-#   - backend 默认不占 GPU（整张卡留给 worker，缓解显存 OOM）
-#   - SQLite 队列（不用 Redis），autoheal 监控 worker 自动重启
-#   - 所有“其他存储”路径沿用 local.yml：/data/tianshu/...（rustfs 用 bind mount + chown 10001）
+# Tianshu (天枢) - Registry-based Docker Compose
+# 基于镜像仓库部署（所有镜像从阿里云 ACR 等仓库拉取）
 #
-# 相对 local.yml 仅改两处（适配 tianshu3 / mineru-tianshu）：
-#   1. 【模型路径机制】tianshu2 的 /models-external + init-models 复制 + cache/*-root-cache 整挂
-#      → 改为 tianshu3 的【只读直挂 ${OFFLINE_MODELS_PATH} + 6 个子目录】，init-models.sh 仅校验不复制
-#   2. 【离线环境变量】补齐 tianshu3 成套离线 env（MODELSCOPE_OFFLINE / MINERU_MODEL_SOURCE /
-#      PADDLE_PDX_* / PADDLEX_HOME / TORCH_HOME / LAMA_MODEL / YOLO_* / HF_ENDPOINT 置空 等）
-#   另：scheduler 命令改 ["python","task_scheduler.py",...]（tianshu3 entrypoint 不认识 "scheduler"）。
+# 使用方式:
+#   1. 复制 .env.example 为 .env 并配置（包括 REGISTRY_PREFIX）
+#   2. 登录镜像仓库: docker login registry.cn-xxx.aliyuncs.com
+#   3. 拉取并启动:
+#      docker-compose -f docker-compose.registry.yml up -d
+#   4. 查看日志: docker-compose -f docker-compose.registry.yml logs -f
+#   5. 停止: docker-compose -f docker-compose.registry.yml down
 #
-# 启动前创建目录:
-#   sudo mkdir -p /data/tianshu/{data/uploads,data/output,data/db}
-#   sudo mkdir -p /data/tianshu/{logs/backend,logs/worker,logs/scheduler,logs/mcp}
-#   sudo mkdir -p /data/tianshu/rustfs/{data,logs} && sudo chown -R 10001:10001 /data/tianshu/rustfs
-#   # 模型放到 ${OFFLINE_MODELS_PATH} 指向的目录（tianshu3 标准 models-offline 布局）
-#   # 可选：cp ../../mcp_config.example.json /data/tianshu/mcp_config.json
-#
-# 启动: docker compose -f docker-compose.registry-local.yml --env-file .env up -d
+# 前置要求:
+#   - Docker 20.10+
+#   - Docker Compose 2.0+
+#   - NVIDIA GPU + NVIDIA Driver 525+ + NVIDIA Container Toolkit
+#   - 已登录镜像仓库
 
+# 项目名称
 name: tianshu
 
 services:
   # ============================================================================
-  # Backend API Server（纯 API：上传/查询/文件服务，默认不占 GPU）
+  # Redis (高性能任务队列 - 可选)
+  # ============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: tianshu-redis
+    restart: unless-stopped
+    profiles:
+      - redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      - TZ=Asia/Shanghai
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - tianshu-network
+
+  # ============================================================================
+  # RustFS Object Storage (S3 Compatible)
+  # ============================================================================
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: tianshu-rustfs
+    restart: unless-stopped
+    ports:
+      - "${RUSTFS_PORT:-9000}:9000"
+      - "${RUSTFS_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - rustfs-data:/data
+      - rustfs-logs:/logs
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      - TZ=Asia/Shanghai
+      - RUSTFS_ROOT_USER=${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_ROOT_PASSWORD=${RUSTFS_SECRET_KEY:-rustfsadmin}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - tianshu-network
+
+  # ============================================================================
+  # Backend API Server
   # ============================================================================
   backend:
-    image: ${REGISTRY_PREFIX:-registry.cn-chengdu.aliyuncs.com/tavan-ai}/tianshu-backend:${BACKEND_TAG:-latest}
+    image: ${REGISTRY_PREFIX:-registry.cn-hangzhou.aliyuncs.com/yourns}/tianshu-backend:${BACKEND_TAG:-latest}
     container_name: tianshu-backend
     restart: unless-stopped
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
-      # —— 模型：tianshu3 只读直挂（替代 tianshu2 的 /models-external + 复制 + cache 整挂）——
+      # 离线模型目录(只读，通过 OFFLINE_MODELS_PATH 指定主机路径；有就用，缺失直接报错不下载)
       - ${OFFLINE_MODELS_PATH:-./models-offline}:/app/models:ro
       - ${OFFLINE_MODELS_PATH:-./models-offline}/paddlex_cache:/root/.paddlex:ro
       - ${OFFLINE_MODELS_PATH:-./models-offline}/paddleocr_cache:/root/.paddleocr:ro
@@ -43,11 +92,12 @@ services:
       - ${OFFLINE_MODELS_PATH:-./models-offline}/huggingface_cache:/root/.cache/huggingface:ro
       - ${OFFLINE_MODELS_PATH:-./models-offline}/torch_cache:/root/.cache/torch:ro
       - ${OFFLINE_MODELS_PATH:-./models-offline}/watermark_models:/root/.cache/watermark_models:ro
-      # —— 其他存储：沿用 local.yml 的 /data/tianshu 路径 ——
-      - /data/tianshu/data/uploads:/app/data/uploads:rw
-      - /data/tianshu/data/output:/app/data/output:rw
-      - /data/tianshu/logs/backend:/app/logs:rw
-      - /data/tianshu/data/db:/app/data/db:rw
+      # 数据目录
+      - ./data/uploads:/app/data/uploads:rw
+      - ./data/output:/app/data/output:rw
+      - ./logs/backend:/app/logs:rw
+      - ./data/db:/app/data/db:rw
+      # 时区
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     environment:
@@ -59,21 +109,21 @@ services:
       - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
       - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:80}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
       - WORKER_URL=${WORKER_URL:-http://worker:8001}
       - MAX_FILE_SIZE=${MAX_FILE_SIZE:-0}
       - MODEL_PATH=/app/models
       - OUTPUT_PATH=/app/data/output
       - UPLOAD_PATH=/app/data/uploads
       - DATABASE_PATH=${DATABASE_PATH:-/app/data/db/mineru_tianshu.db}
-      # RustFS（默认 false=本地文件服务；true 时图片走对象存储）
-      - RUSTFS_ENABLED=${RUSTFS_ENABLED:-false}
+      - RUSTFS_ENABLED=${RUSTFS_ENABLED:-true}
       - RUSTFS_ENDPOINT=${RUSTFS_ENDPOINT:-rustfs:9000}
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
       - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
       - RUSTFS_BUCKET=${RUSTFS_BUCKET:-ts-img}
       - RUSTFS_SECURE=${RUSTFS_SECURE:-false}
       - RUSTFS_PUBLIC_URL=${RUSTFS_PUBLIC_URL}
-      # —— tianshu3 离线模型 env（纯本地，禁止联网下载）——
+      # 模型配置(纯离线本地模型：有就用，缺失直接报错，绝不联网下载)
       - MODEL_DOWNLOAD_SOURCE=local
       - HF_HUB_OFFLINE=1
       - TRANSFORMERS_OFFLINE=1
@@ -92,16 +142,18 @@ services:
       - YOLO_CONFIG_DIR=/app/data
       - ULTRALYTICS_CONFIG_DIR=/app/data/Ultralytics
       - YOLO_OFFLINE=True
-      # Redis 已禁用，使用 SQLite 队列
-      - REDIS_QUEUE_ENABLED=false
-    # backend 默认不分配 GPU（推理都在 worker）。若确认 backend 需要 GPU，取消下面注释：
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+      - REDIS_QUEUE_ENABLED=${REDIS_QUEUE_ENABLED:-false}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-1}
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
       interval: 30s
@@ -113,21 +165,21 @@ services:
     depends_on:
       worker:
         condition: service_started
+      rustfs:
+        condition: service_started
 
   # ============================================================================
-  # LitServe Worker（独占 GPU）
+  # LitServe Worker
   # ============================================================================
   worker:
-    image: ${REGISTRY_PREFIX:-registry.cn-chengdu.aliyuncs.com/tavan-ai}/tianshu-backend:${BACKEND_TAG:-latest}
+    image: ${REGISTRY_PREFIX:-registry.cn-hangzhou.aliyuncs.com/yourns}/tianshu-backend:${BACKEND_TAG:-latest}
     container_name: tianshu-worker
     restart: unless-stopped
     command: ["worker", "python", "litserve_worker.py"]
-    labels:
-      - autoheal=true   # 被 autoheal 监控：healthcheck 失败时自动重启
     ports:
       - "${WORKER_PORT:-8001}:8001"
     volumes:
-      # —— 模型：tianshu3 只读直挂 ——
+      # 离线模型目录(只读，通过 OFFLINE_MODELS_PATH 指定主机路径；有就用，缺失直接报错不下载)
       - ${OFFLINE_MODELS_PATH:-./models-offline}:/app/models:ro
       - ${OFFLINE_MODELS_PATH:-./models-offline}/paddlex_cache:/root/.paddlex:ro
       - ${OFFLINE_MODELS_PATH:-./models-offline}/paddleocr_cache:/root/.paddleocr:ro
@@ -135,11 +187,12 @@ services:
       - ${OFFLINE_MODELS_PATH:-./models-offline}/huggingface_cache:/root/.cache/huggingface:ro
       - ${OFFLINE_MODELS_PATH:-./models-offline}/torch_cache:/root/.cache/torch:ro
       - ${OFFLINE_MODELS_PATH:-./models-offline}/watermark_models:/root/.cache/watermark_models:ro
-      # —— 其他存储：沿用 local.yml 的 /data/tianshu 路径 ——
-      - /data/tianshu/data/uploads:/app/data/uploads:rw
-      - /data/tianshu/data/output:/app/data/output:rw
-      - /data/tianshu/logs/worker:/app/logs:rw
-      - /data/tianshu/data/db:/app/data/db:rw
+      # 数据目录
+      - ./data/uploads:/app/data/uploads:rw
+      - ./data/output:/app/data/output:rw
+      - ./logs/worker:/app/logs:rw
+      - ./data/db:/app/data/db:rw
+      # 时区
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     environment:
@@ -147,14 +200,14 @@ services:
       - HOST=0.0.0.0
       - WORKER_PORT=8001
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - WORKER_GPUS=${WORKER_GPUS:-1}
+      - WORKER_GPUS=${WORKER_GPUS:-2}
       - MODEL_PATH=/app/models
       - OUTPUT_PATH=/app/data/output
       - UPLOAD_PATH=/app/data/uploads
       - DATABASE_PATH=${DATABASE_PATH:-/app/data/db/mineru_tianshu.db}
-      - MAX_BATCH_SIZE=${MAX_BATCH_SIZE:-2}
+      - MAX_BATCH_SIZE=${MAX_BATCH_SIZE:-4}
       - TIMEOUT=${WORKER_TIMEOUT:-300}
-      # —— tianshu3 离线模型 env（与 backend 一致）——
+      # 模型配置(纯离线本地模型：有就用，缺失直接报错，绝不联网下载)
       - MODEL_DOWNLOAD_SOURCE=local
       - HF_HUB_OFFLINE=1
       - TRANSFORMERS_OFFLINE=1
@@ -173,26 +226,25 @@ services:
       - YOLO_CONFIG_DIR=/app/data
       - ULTRALYTICS_CONFIG_DIR=/app/data/Ultralytics
       - YOLO_OFFLINE=True
-      # 代理默认留空（纯离线无需）
-      - HTTP_PROXY=${HTTP_PROXY:-}
-      - HTTPS_PROXY=${HTTPS_PROXY:-}
-      - http_proxy=${http_proxy:-}
-      - https_proxy=${https_proxy:-}
-      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,worker,backend,scheduler}
-      # PDF 拆分（防 OOM：分片调小）
       - PDF_SPLIT_ENABLED=${PDF_SPLIT_ENABLED:-true}
       - PDF_SPLIT_THRESHOLD_PAGES=${PDF_SPLIT_THRESHOLD_PAGES:-500}
-      - PDF_SPLIT_CHUNK_SIZE=${PDF_SPLIT_CHUNK_SIZE:-100}
-      - PDF_SPLIT_SIZE_MB=${PDF_SPLIT_SIZE_MB:-15}
-      # RustFS（worker 上传图片用；默认 false）
-      - RUSTFS_ENABLED=${RUSTFS_ENABLED:-false}
+      - PDF_SPLIT_CHUNK_SIZE=${PDF_SPLIT_CHUNK_SIZE:-250}
+      - PDF_SPLIT_SIZE_MB=${PDF_SPLIT_SIZE_MB:-20}
+      - RUSTFS_ENABLED=${RUSTFS_ENABLED:-true}
       - RUSTFS_ENDPOINT=${RUSTFS_ENDPOINT:-rustfs:9000}
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
       - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
       - RUSTFS_BUCKET=${RUSTFS_BUCKET:-ts-img}
       - RUSTFS_SECURE=${RUSTFS_SECURE:-false}
       - RUSTFS_PUBLIC_URL=${RUSTFS_PUBLIC_URL}
-      - REDIS_QUEUE_ENABLED=false
+      - REDIS_QUEUE_ENABLED=${REDIS_QUEUE_ENABLED:-false}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    mem_limit: ${WORKER_MEMORY_LIMIT:-32G}
+    memswap_limit: ${WORKER_MEMSWAP_LIMIT:-40G}
+    mem_reservation: ${WORKER_MEMORY_RESERVATION:-16G}
     deploy:
       resources:
         limits:
@@ -201,10 +253,7 @@ services:
           memory: ${WORKER_MEMORY_RESERVATION:-16G}
           devices:
             - driver: nvidia
-              # 精确绑定宿主机 GPU；容器内该卡始终映射为 cuda:0。
-              # device_ids 与 count 互斥，不能同时配置。
-              device_ids:
-                - "${GPU_DEVICE_ID:-0}"
+              count: ${GPU_COUNT:-1}
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
@@ -214,32 +263,28 @@ services:
       start_period: 120s
     networks:
       - tianshu-network
+    depends_on:
+      rustfs:
+        condition: service_started
 
   # ============================================================================
-  # Task Scheduler（监控 + 故障恢复 + 清理；SQLite 队列模式）
-  # ⚠️ tianshu3 entrypoint 无 "scheduler" 分支：命令用 ["python","task_scheduler.py",...]；
-  #    并设 MODEL_DOWNLOAD_SOURCE=auto 以跳过离线模型校验（scheduler 不挂模型）。
+  # Task Scheduler
   # ============================================================================
   scheduler:
-    image: ${REGISTRY_PREFIX:-registry.cn-chengdu.aliyuncs.com/tavan-ai}/tianshu-backend:${BACKEND_TAG:-latest}
+    image: ${REGISTRY_PREFIX:-registry.cn-hangzhou.aliyuncs.com/yourns}/tianshu-backend:${BACKEND_TAG:-latest}
     container_name: tianshu-scheduler
     restart: unless-stopped
-    command:
-      - python
-      - task_scheduler.py
-      - --litserve-url
-      - http://worker:8001/predict
-      - --monitor-interval
-      - "60"
-      - --stale-task-timeout
-      - "30"
-      - --cleanup-old-files-days
-      - "${CLEANUP_OLD_FILES_DAYS:-7}"
-      - --wait-for-workers
+    # ⚠️ entrypoint 无 "scheduler" 分支：command 不能带 "scheduler" 前缀(否则 exec 失败)，直接用 python
+    command: ["python", "task_scheduler.py",
+      "--litserve-url", "http://worker:8001/predict",
+      "--monitor-interval", "60",
+      "--stale-task-timeout", "30",
+      "--cleanup-old-files-days", "${CLEANUP_OLD_FILES_DAYS:-7}",
+      "--wait-for-workers"]
     volumes:
-      - /data/tianshu/data/db:/app/data/db:rw
-      - /data/tianshu/data/output:/app/data/output:rw
-      - /data/tianshu/logs/scheduler:/app/logs:rw
+      - ./data/db:/app/data/db:rw
+      - ./data/output:/app/data/output:rw
+      - ./logs/scheduler:/app/logs:rw
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     environment:
@@ -247,11 +292,10 @@ services:
       - DATABASE_PATH=${DATABASE_PATH:-/app/data/db/mineru_tianshu.db}
       - OUTPUT_PATH=/app/data/output
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      # entrypoint 对非 worker/mcp 服务要求 JWT_SECRET_KEY 非空
+      # entrypoint 对非 worker/mcp 服务强制校验 JWT_SECRET_KEY，缺失会 exit 1 导致重启循环
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
-      # auto：scheduler 不挂模型，避免 init-models.sh 校验失败退出
+      # scheduler 不挂模型，设 auto 避免 MODEL_DOWNLOAD_SOURCE=local 触发离线模型校验而退出
       - MODEL_DOWNLOAD_SOURCE=auto
-      - REDIS_QUEUE_ENABLED=false
     networks:
       - tianshu-network
     depends_on:
@@ -259,18 +303,18 @@ services:
       - backend
 
   # ============================================================================
-  # MCP Server (可选)
+  # MCP Server
   # ============================================================================
   mcp-server:
-    image: ${REGISTRY_PREFIX:-registry.cn-chengdu.aliyuncs.com/tavan-ai}/tianshu-backend:${BACKEND_TAG:-latest}
+    image: ${REGISTRY_PREFIX:-registry.cn-hangzhou.aliyuncs.com/yourns}/tianshu-backend:${BACKEND_TAG:-latest}
     container_name: tianshu-mcp
     restart: unless-stopped
     command: ["mcp", "python", "mcp_server.py"]
     ports:
       - "${MCP_PORT:-8002}:8002"
     volumes:
-      - /data/tianshu/mcp_config.json:/app/backend/mcp_config.json:ro
-      - /data/tianshu/logs/mcp:/app/logs:rw
+      - ./mcp_config.example.json:/app/backend/mcp_config.json:ro
+      - ./logs/mcp:/app/logs:rw
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     environment:
@@ -294,7 +338,7 @@ services:
   # Frontend (Vue 3 + Nginx)
   # ============================================================================
   frontend:
-    image: ${REGISTRY_PREFIX:-registry.cn-chengdu.aliyuncs.com/tavan-ai}/tianshu-frontend:${FRONTEND_TAG:-latest}
+    image: ${REGISTRY_PREFIX:-registry.cn-hangzhou.aliyuncs.com/yourns}/tianshu-frontend:${FRONTEND_TAG:-latest}
     container_name: tianshu-frontend
     restart: unless-stopped
     ports:
@@ -317,59 +361,6 @@ services:
     depends_on:
       - backend
 
-  # ============================================================================
-  # Autoheal：监控带 autoheal=true 标签的容器，healthcheck 失败时自动重启
-  # ============================================================================
-  autoheal:
-    image: ${AUTOHEAL_IMAGE:-willfarrell/autoheal:latest}
-    container_name: tianshu-autoheal
-    restart: unless-stopped
-    environment:
-      - AUTOHEAL_CONTAINER_LABEL=autoheal
-      - AUTOHEAL_INTERVAL=30
-      - AUTOHEAL_START_PERIOD=120
-      - TZ=Asia/Shanghai
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-
-  # ============================================================================
-  # RustFS 对象存储（S3 兼容，存图片）
-  # 前置准备：
-  #   1. CPU 支持 SSE4.1: grep -m1 sse4_1 /proc/cpuinfo （有输出才行）
-  #   2. 放行 9000（图片 URL 要外部可访问）
-  #   3. 建目录并赋权给 rustfs 运行用户(UID/GID 10001):
-  #        mkdir -p /data/tianshu/rustfs/data /data/tianshu/rustfs/logs
-  #        chown -R 10001:10001 /data/tianshu/rustfs
-  # ============================================================================
-  rustfs:
-    # 私有仓库已有: registry.cn-chengdu.aliyuncs.com/tavan-ai/rustfs:latest（.env 设 RUSTFS_IMAGE）
-    image: ${RUSTFS_IMAGE:-rustfs/rustfs:latest}
-    container_name: tianshu-rustfs
-    restart: unless-stopped
-    ports:
-      - "${RUSTFS_PORT:-9000}:9000"          # S3 API
-      - "${RUSTFS_CONSOLE_PORT:-9001}:9001"  # Web 控制台
-    volumes:
-      # 本地存储：与本套部署其它服务一致统一放 /data/tianshu 下；目录须属 10001:10001（见上方准备）
-      - /data/tianshu/rustfs/data:/data
-      - /data/tianshu/rustfs/logs:/logs
-      - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
-    environment:
-      - TZ=Asia/Shanghai
-      # ⚠️ rustfs 认 ROOT_USER/ROOT_PASSWORD（不是 ACCESS_KEY，issue #1058 的坑）；
-      #    取值用 .env 的 RUSTFS_ACCESS_KEY/SECRET_KEY 保持一致，也是控制台登录账号/密码。
-      - RUSTFS_ROOT_USER=${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      - RUSTFS_ROOT_PASSWORD=${RUSTFS_SECRET_KEY:-rustfsadmin}
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    networks:
-      - tianshu-network
-
 networks:
   tianshu-network:
     driver: bridge
@@ -379,3 +370,14 @@ networks:
       config:
         - subnet: 172.30.0.0/16
           gateway: 172.30.0.1
+
+volumes:
+  redis-data:
+    driver: local
+    name: tianshu-redis-data
+  rustfs-data:
+    driver: local
+    name: tianshu-rustfs-data
+  rustfs-logs:
+    driver: local
+    name: tianshu-rustfs-logs
