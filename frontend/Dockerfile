@@ -39,6 +39,9 @@ RUN apk add --no-cache curl
 
 # 复制自定义 Nginx 配置
 COPY <<'EOF' /etc/nginx/conf.d/default.conf
+# Query strings can contain preview JWTs; never include them or Referer in logs.
+log_format tianshu_safe '$remote_addr - $request_method $uri $status $body_bytes_sent';
+access_log /var/log/nginx/access.log tianshu_safe;
 server {
     listen 80;
     server_name _;
@@ -97,6 +100,7 @@ server {
     }
 
     # 安全头
+    add_header Referrer-Policy "no-referrer" always;
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;

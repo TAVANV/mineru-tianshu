@@ -558,6 +558,11 @@ export default {
     bearerToken: 'Bearer Token',
   },
   apiKey: {
+    scopeLabel: 'Permission scope',
+    scopeAll: 'Follow account permissions',
+    scopeRead: 'Read own tasks and files',
+    scopeParse: 'Submit, read and manage own tasks',
+
     title: 'API Token 管理',
     createNew: '创建新 Token',
     noTokens: '暂无 API Token',

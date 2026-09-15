@@ -34,6 +34,12 @@ except ImportError:
     torch = None
 
 
+_LOCAL_VLLM_REWRITE = {
+    "vlm-auto-engine": "vlm-http-client",
+    "hybrid-auto-engine": "hybrid-http-client",
+}
+
+
 class MinerUPipelineEngine:
     """
     MinerU Pipeline 引擎
@@ -247,16 +253,14 @@ class MinerUPipelineEngine:
             backend = user_backend
             server_url = options.get("server_url")
 
-            # 智能切换 VLLM
+            # 调用方未指定 server_url 时一律走本地 vLLM：*-auto-engine 先改写成
+            # *-http-client，*-http-client 则直接补上地址。
             if not server_url and self.vlm_api_base:
-                if user_backend == "vlm-auto-engine":
-                    backend = "vlm-http-client"
-                    server_url = self.vlm_api_base.replace("/v1", "")
-                    logger.info(f"🔄 [Accelerate] Switching to {backend} using local vLLM")
-                elif user_backend == "hybrid-auto-engine":
-                    backend = "hybrid-http-client"
-                    server_url = self.vlm_api_base.replace("/v1", "")
-                    logger.info(f"🔄 [Accelerate] Switching to {backend} using local vLLM")
+                backend = _LOCAL_VLLM_REWRITE.get(user_backend, user_backend)
+                if "http-client" in backend:
+                    server_url = self.vlm_api_base.rstrip("/").removesuffix("/v1")
+                    if backend != user_backend:
+                        logger.info(f"🔄 [Accelerate] Switching to {backend} using local vLLM")
 
             # 服务健康检查
             if "http-client" in backend and server_url:

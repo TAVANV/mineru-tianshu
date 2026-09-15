@@ -15,6 +15,8 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, nextTick, watch } from 'vue'
+import { authenticatedFileUrl } from '@/api/fileUrl'
+import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import hljs from 'highlight.js'
 import 'highlight.js/styles/github.css'
@@ -98,7 +100,16 @@ const renderedContent = computed(() => {
       }
     })
 
-    return html
+    const doc = new DOMParser().parseFromString(DOMPurify.sanitize(html), 'text/html')
+    doc.querySelectorAll('img').forEach(img => {
+      img.setAttribute('src', authenticatedFileUrl(img.getAttribute('src') || ''))
+      img.setAttribute('referrerpolicy', 'no-referrer')
+    })
+    doc.querySelectorAll('a[href]').forEach(link => {
+      link.setAttribute('href', authenticatedFileUrl(link.getAttribute('href') || ''))
+      link.setAttribute('rel', 'noopener noreferrer')
+    })
+    return doc.body.innerHTML
   } catch (err) {
     console.error('Markdown parse error:', err)
     return '<p class="text-red-600">Markdown 解析错误</p>'

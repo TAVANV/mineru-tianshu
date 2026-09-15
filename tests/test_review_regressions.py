@@ -50,6 +50,13 @@ def make_worker(db, output):
         SENSEVOICE_AVAILABLE=False,
         VIDEO_ENGINE_AVAILABLE=False,
     )
+    constant = next(
+        n
+        for n in ast.parse((ROOT / "backend/litserve_worker.py").read_text()).body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "LOCAL_VLLM_BACKENDS" for t in n.targets)
+    )
+    exec(compile(ast.Module(body=[constant], type_ignores=[]), "<worker-constants>", "exec"), namespace)
     exec(compile(ast.Module(body=methods, type_ignores=[]), "<review-worker>", "exec"), namespace)
     obj = SimpleNamespace(
         task_db=db, output_dir=str(output), worker_id="worker-old", mineru_vllm_api=None, watermark_handler=None
@@ -116,7 +123,7 @@ def test_zip_json_body_survives_parent_rustfs_recovery(tmp_path, monkeypatch):
 @pytest.mark.parametrize("rustfs", [False, True])
 def test_bracket_caption_actual_image_handoff(api, monkeypatch, rustfs):
     from fastapi.testclient import TestClient
-    from auth.dependencies import get_current_active_user
+    from auth.dependencies import get_current_active_user, get_current_user_flexible
     from image_caption.processor import _write_back_markdown
 
     output = api.OUTPUT_DIR / "captioned"
@@ -132,8 +139,9 @@ def test_bracket_caption_actual_image_handoff(api, monkeypatch, rustfs):
     set_status(api.db, tid, "processing")
     api.db.update_task_status(tid, "completed", result_path=str(output))
     api.app.dependency_overrides[get_current_active_user] = lambda: SimpleNamespace(
-        user_id="owner", has_permission=lambda p: False
+        user_id="owner", has_permission=lambda p: p.value in {"task:view:own", "task:delete:own"}
     )
+    api.app.dependency_overrides[get_current_user_flexible] = api.app.dependency_overrides[get_current_active_user]
     try:
         with TestClient(api.app) as client:
             listing = client.get(f"/api/v1/tasks/{tid}/images")

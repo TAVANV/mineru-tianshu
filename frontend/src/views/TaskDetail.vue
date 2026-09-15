@@ -75,7 +75,7 @@
           </div>
 
           <div class="flex-1 relative overflow-auto min-h-0 bg-gray-200">
-            <img v-if="imageUrl" :src="imageUrl" :alt="task.file_name" class="max-w-full h-auto mx-auto" />
+            <img v-if="imageUrl" :src="imageUrl" :alt="task.file_name" referrerpolicy="no-referrer" class="max-w-full h-auto mx-auto" />
             <VirtualPdfViewer
               v-if="!imageUrl && pdfUrl"
               ref="pdfViewerRef"
@@ -155,6 +155,7 @@
 </template>
 
 <script setup lang="ts">
+import { authenticatedFileUrl } from '@/api/fileUrl'
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
@@ -184,9 +185,9 @@ const layoutMode = ref<'split' | 'single'>('split')
 const activeBlockId = ref<string | number | null>(null)
 const pdfViewerRef = ref<InstanceType<typeof VirtualPdfViewer> | null>(null)
 
-const pdfUrl = computed(() => task.value?.data?.pdf_path ? `/api/v1/files/output/${task.value.data.pdf_path}` : null)
+const pdfUrl = computed(() => task.value?.data?.pdf_path ? authenticatedFileUrl(`/api/v1/files/output/${task.value.data.pdf_path}`) : null)
 const imageUrl = computed(() => /\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(task.value?.file_name || '')
-  ? task.value?.source_url || null : null)
+  ? (task.value?.source_url ? authenticatedFileUrl(task.value.source_url) : null) : null)
 const showPdf = computed(() => Boolean(imageUrl.value || pdfUrl.value))
 const showMarkdown = computed(() => layoutMode.value === 'split' || !showPdf.value)
 

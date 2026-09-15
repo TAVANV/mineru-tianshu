@@ -17,7 +17,7 @@ import mimetypes  # ✅ 用于自动识别文件类型
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, parse_qsl, urlencode
 
 import anyio
 import uvicorn
@@ -26,6 +26,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from loguru import logger
 from starlette.types import ASGIApp, Receive, Scope, Send  # ✅ 用于底层中间件
+
+from auth.dependencies import get_current_user_flexible
+from utils.file_utils import sanitize_filename, ensure_within_directory, FilenameValidationError
 
 # 导入认证模块
 from auth import (
@@ -82,6 +85,13 @@ class NginxPathRewriteMiddleware:
                 # 某些底层组件匹配强依赖 raw_path，也一并修改
                 if "raw_path" in scope:
                     scope["raw_path"] = b"/api" + scope["raw_path"]
+            # Keep preview JWTs out of backend access logs; pass only through internal state.
+            if scope.get("path", "").startswith("/api/v1/files/"):
+                query = parse_qsl(scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True)
+                tokens = [value for key, value in query if key == "token"]
+                if tokens:
+                    scope.setdefault("state", {})["file_token"] = tokens[-1]
+                    scope["query_string"] = urlencode([(key, value) for key, value in query if key != "token"]).encode()
         await self.app(scope, receive, send)
 
 
@@ -91,7 +101,7 @@ app.add_middleware(NginxPathRewriteMiddleware)
 # 添加 CORS 中间件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip() and o.strip() != "*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -287,14 +297,23 @@ async def submit_task(
     except (ValueError, OSError):
         raise HTTPException(status_code=400, detail="Invalid webhook endpoint or host not allowed")
     try:
-        unique_filename = f"{uuid.uuid4().hex}_{file.filename}"
-        temp_file_path = UPLOAD_DIR / unique_filename
+        safe_filename = sanitize_filename(file.filename)
+    except FilenameValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        unique_filename = f"{uuid.uuid4().hex}_{safe_filename}"
+        temp_file_path = ensure_within_directory(UPLOAD_DIR / unique_filename, UPLOAD_DIR)
+        uploaded_bytes = 0
+        max_bytes = int(os.getenv("MAX_FILE_SIZE", "0"))
 
         async with await anyio.open_file(temp_file_path, "wb") as temp_file:
             while True:
                 chunk = await file.read(1 << 20)
                 if not chunk:
                     break
+                uploaded_bytes += len(chunk)
+                if max_bytes > 0 and uploaded_bytes > max_bytes:
+                    raise HTTPException(status_code=413, detail="File too large")
                 await temp_file.write(chunk)
 
         options = {
@@ -380,7 +399,9 @@ async def submit_task(
                 await anyio.to_thread.run_sync(lambda: Path(temp_path).unlink(missing_ok=True))
             except Exception:
                 pass
-        raise HTTPException(status_code=500, detail=str(e))
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/tasks/{task_id}", tags=["任务管理"])
@@ -396,7 +417,7 @@ def get_task_status(
         raise HTTPException(status_code=404, detail="Task not found")
 
     if not current_user.has_permission(Permission.TASK_VIEW_ALL):
-        if task.get("user_id") != current_user.user_id:
+        if task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_VIEW_OWN):
             raise HTTPException(status_code=403, detail="Permission denied: You can only view your own tasks")
 
     source_url = None
@@ -557,7 +578,7 @@ def get_task_images(
 
     # 权限检查：用户只能查看自己的任务，管理员可以查看所有任务
     if not current_user.has_permission(Permission.TASK_VIEW_ALL):
-        if task.get("user_id") != current_user.user_id:
+        if task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_VIEW_OWN):
             raise HTTPException(status_code=403, detail="Permission denied: You can only view your own tasks")
 
     if task["status"] != "completed":
@@ -731,7 +752,7 @@ def delete_task(task_id: str, current_user: User = Depends(get_current_active_us
 
     # 权限检查
     if not current_user.has_permission(Permission.TASK_DELETE_ALL):
-        if task.get("user_id") != current_user.user_id:
+        if task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_DELETE_OWN):
             raise HTTPException(status_code=403, detail="Permission denied: You can only delete your own tasks")
 
     # 收集子任务（大 PDF 拆分会产生 parent_task_id 指向本任务的子任务）
@@ -792,7 +813,7 @@ def retry_task(task_id: str, current_user: User = Depends(get_current_active_use
 
     # 🚨 修复属性名称错误
     if not current_user.has_permission(Permission.TASK_DELETE_ALL):
-        if task.get("user_id") != current_user.user_id:
+        if task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_DELETE_OWN):
             raise HTTPException(status_code=403, detail="Permission denied")
 
     # 清理在任务重新变为 pending 之前完成，防止 Worker 已开始新一轮处理后输出被删除。
@@ -807,7 +828,9 @@ def cancel_task_endpoint(task_id: str, current_user: User = Depends(get_current_
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    if not current_user.has_permission(Permission.TASK_DELETE_ALL) and task.get("user_id") != current_user.user_id:
+    if not current_user.has_permission(Permission.TASK_DELETE_ALL) and (
+        task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_DELETE_OWN)
+    ):
         raise HTTPException(403, "Permission denied")
     if not db.cancel_task(task_id):
         raise HTTPException(409, "Task is no longer cancellable")
@@ -825,7 +848,7 @@ def pause_task_endpoint(task_id: str, current_user: User = Depends(get_current_a
 
     # 🚨 修复属性名称错误
     if not current_user.has_permission(Permission.TASK_DELETE_ALL):
-        if task.get("user_id") != current_user.user_id:
+        if task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_DELETE_OWN):
             raise HTTPException(status_code=403, detail="Permission denied")
 
     if db.pause_task(task_id):
@@ -845,7 +868,7 @@ def resume_task_endpoint(task_id: str, current_user: User = Depends(get_current_
 
     # 🚨 修复属性名称错误
     if not current_user.has_permission(Permission.TASK_DELETE_ALL):
-        if task.get("user_id") != current_user.user_id:
+        if task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_DELETE_OWN):
             raise HTTPException(status_code=403, detail="Permission denied")
 
     if db.resume_task(task_id):
@@ -864,7 +887,7 @@ def clear_task_cache_endpoint(task_id: str, current_user: User = Depends(get_cur
         raise HTTPException(status_code=404, detail="Task not found")
 
     if not current_user.has_permission(Permission.TASK_DELETE_ALL):
-        if task.get("user_id") != current_user.user_id:
+        if task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_DELETE_OWN):
             raise HTTPException(status_code=403, detail="Permission denied")
 
     # 用 result_path 删除输出（非 task_id）
@@ -899,6 +922,8 @@ def list_tasks(
     current_user: User = Depends(get_current_active_user),
 ):
     can_view_all = current_user.has_permission(Permission.TASK_VIEW_ALL)
+    if not can_view_all and not current_user.has_permission(Permission.TASK_VIEW_OWN):
+        raise HTTPException(status_code=403, detail="Permission denied")
     conditions = []
     params = []
 
@@ -977,7 +1002,7 @@ def reset_stale_tasks(
 
 
 @router.get("/engines", tags=["系统信息"])
-def list_engines():
+def list_engines(current_user: User = Depends(get_current_active_user)):
     import importlib.util
     import importlib.metadata
     import sys
@@ -1147,20 +1172,43 @@ def list_engines():
 @router.get("/health", tags=["系统信息"])
 def health_check():
     try:
-        stats = db.get_queue_stats()
+        db.get_queue_stats()
         return {
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
             "database": "connected",
-            "queue_stats": stats,
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "error": "Internal server error"})
+
+
+INLINE_MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+def _build_file_response(full_path: Path) -> FileResponse:
+    """构造安全的文件下载/预览响应（MIME 白名单 + 安全响应头）"""
+    media_type = INLINE_MIME_TYPES.get(full_path.suffix.lower())
+    disposition = "inline" if media_type else "attachment"
+    headers = {
+        "Content-Disposition": f"{disposition}; filename*=utf-8''{quote(full_path.name)}",
+        "X-Content-Type-Options": "nosniff",
+        "Cache-Control": "private, no-store",
+        "Referrer-Policy": "no-referrer",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+    }
+    return FileResponse(path=str(full_path), media_type=media_type or "application/octet-stream", headers=headers)
 
 
 @router.get("/files/output/{file_path:path}", tags=["文件服务"])
-def serve_output_file(file_path: str):
+def serve_output_file(file_path: str, current_user: User = Depends(get_current_user_flexible)):
     """提供输出文件的访问服务"""
     try:
         decoded_path = unquote(file_path).lstrip("/")
@@ -1172,12 +1220,15 @@ def serve_output_file(file_path: str):
             logger.warning(f"❌ Access denied or file not found: {full_path}")
             raise HTTPException(status_code=404, detail="File not found or access denied")
 
-        media_type, _ = mimetypes.guess_type(full_path)
-        media_type = media_type or "application/octet-stream"
-
-        headers = {"Content-Disposition": f"inline; filename*=utf-8''{quote(full_path.name)}"}
-
-        return FileResponse(path=str(full_path), media_type=media_type, headers=headers)
+        task = db.get_task_by_file_path(full_path, OUTPUT_DIR, output=True)
+        if not current_user.has_permission(Permission.TASK_VIEW_ALL):
+            if (
+                task is None
+                or task.get("user_id") != current_user.user_id
+                or not current_user.has_permission(Permission.TASK_VIEW_OWN)
+            ):
+                raise HTTPException(status_code=403, detail="Permission denied")
+        return _build_file_response(full_path)
 
     except HTTPException:
         raise
@@ -1187,7 +1238,7 @@ def serve_output_file(file_path: str):
 
 
 @router.get("/files/upload/{file_path:path}", tags=["文件服务"])
-def serve_upload_file(file_path: str):
+def serve_upload_file(file_path: str, current_user: User = Depends(get_current_user_flexible)):
     """提供上传源文件的访问服务"""
     try:
         decoded_path = unquote(file_path).lstrip("/")
@@ -1199,12 +1250,15 @@ def serve_upload_file(file_path: str):
             logger.warning(f"❌ Access denied or file not found: {full_path}")
             raise HTTPException(status_code=404, detail="File not found or access denied")
 
-        media_type, _ = mimetypes.guess_type(full_path)
-        media_type = media_type or "application/octet-stream"
-
-        headers = {"Content-Disposition": f"inline; filename*=utf-8''{quote(full_path.name)}"}
-
-        return FileResponse(path=str(full_path), media_type=media_type, headers=headers)
+        task = db.get_task_by_file_path(full_path, UPLOAD_DIR, output=False)
+        if not current_user.has_permission(Permission.TASK_VIEW_ALL):
+            if (
+                task is None
+                or task.get("user_id") != current_user.user_id
+                or not current_user.has_permission(Permission.TASK_VIEW_OWN)
+            ):
+                raise HTTPException(status_code=403, detail="Permission denied")
+        return _build_file_response(full_path)
 
     except HTTPException:
         raise

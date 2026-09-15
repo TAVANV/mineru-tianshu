@@ -358,6 +358,13 @@ def test_zip_worker_end_to_end_without_models(db, tmp_path, monkeypatch):
         "VIDEO_ENGINE_AVAILABLE": False,
         "MINERU_PIPELINE_AVAILABLE": False,
     }
+    constant = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "LOCAL_VLLM_BACKENDS" for t in n.targets)
+    )
+    exec(compile(ast.Module(body=[constant], type_ignores=[]), "<worker-constants>", "exec"), namespace)
     exec(compile(ast.Module(body=methods, type_ignores=[]), "<worker-archive>", "exec"), namespace)
     instance = SimpleNamespace(task_db=db, output_dir=str(tmp_path), watermark_handler=None)
     for method in methods:

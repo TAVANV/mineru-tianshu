@@ -96,6 +96,7 @@ services:
       - HOST=0.0.0.0
       - API_PORT=8000
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
       - WORKER_URL=${WORKER_URL:-http://worker:8001}
@@ -145,6 +146,7 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - DATABASE_PATH=/app/data/db/mineru_tianshu.db
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
     depends_on:
       - backend
@@ -348,7 +350,12 @@ services:
       - HOST=0.0.0.0
       - MCP_PORT=8002
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - API_URL=${API_URL:-http://backend:8000}
+      - API_BASE_URL=${API_URL:-http://backend:8000}
+      - MCP_HOST=0.0.0.0
+      - MCP_API_KEYS=${MCP_API_KEYS:-}
+      - TIANSHU_API_KEY=${TIANSHU_API_KEY:-}
+      - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-localhost:*,127.0.0.1:*}
+      - MCP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS:-}
     networks:
       - tianshu-network
     depends_on:

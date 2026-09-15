@@ -237,11 +237,11 @@ def test_invalid_exif_rotation():
 
 def test_image_handoff_and_source_download(api):
     from fastapi.testclient import TestClient
-    from auth.dependencies import get_current_active_user
+    from auth.dependencies import get_current_active_user, get_current_user_flexible
     from types import SimpleNamespace
 
-    owner = SimpleNamespace(user_id="owner", has_permission=lambda p: False)
-    other = SimpleNamespace(user_id="other", has_permission=lambda p: False)
+    owner = SimpleNamespace(user_id="owner", has_permission=lambda p: p.value in {"task:view:own", "task:delete:own"})
+    other = SimpleNamespace(user_id="other", has_permission=lambda p: p.value in {"task:view:own", "task:delete:own"})
     result = api.OUTPUT_DIR / "sample"
     images = result / "images"
     images.mkdir(parents=True)
@@ -255,6 +255,7 @@ def test_image_handoff_and_source_download(api):
     )
     with api.db.get_cursor() as c:
         c.execute("UPDATE tasks SET status='completed', result_path=? WHERE task_id=?", (str(result), tid))
+    api.app.dependency_overrides[get_current_user_flexible] = lambda: owner
     api.app.dependency_overrides[get_current_active_user] = lambda: owner
     try:
         with TestClient(api.app) as client:

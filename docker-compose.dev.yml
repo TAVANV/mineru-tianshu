@@ -59,7 +59,7 @@ services:
       - ACCESS_TOKEN_EXPIRE_MINUTES=1440  # 24小时
 
       # CORS 配置（开发环境允许所有）
-      - ALLOWED_ORIGINS=*
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:3000}
 
       # GPU 配置
       - CUDA_VISIBLE_DEVICES=0
@@ -188,7 +188,12 @@ services:
       - LOG_LEVEL=DEBUG
       - HOST=0.0.0.0
       - PORT=8002
-      - API_URL=http://backend-dev:8000
+      - API_BASE_URL=http://backend-dev:8000
+      - MCP_HOST=0.0.0.0
+      - MCP_API_KEYS=${MCP_API_KEYS:-}
+      - TIANSHU_API_KEY=${TIANSHU_API_KEY:-}
+      - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-localhost:*,127.0.0.1:*}
+      - MCP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS:-}
       - RELOAD=true
     working_dir: /app/backend
     command: ["python", "mcp_server.py"]

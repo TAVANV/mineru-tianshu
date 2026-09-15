@@ -103,10 +103,17 @@
               <option :value="90">{{ $t('apiKey.days90') }}</option>
               <option :value="180">{{ $t('apiKey.days180') }}</option>
               <option :value="365">{{ $t('apiKey.days365') }}</option>
-              <option :value="null">{{ $t('apiKey.neverExpires') }}</option>
             </select>
           </div>
 
+          <div>
+            <label class="block text-sm font-medium text-gray-700 mb-1">{{ $t('apiKey.scopeLabel') }}</label>
+            <select v-model="scopePreset" class="w-full px-3 py-2 border border-gray-300 rounded-lg">
+              <option value="all">{{ $t('apiKey.scopeAll') }}</option>
+              <option value="read">{{ $t('apiKey.scopeRead') }}</option>
+              <option value="parse">{{ $t('apiKey.scopeParse') }}</option>
+            </select>
+          </div>
           <div class="flex gap-3 pt-4">
             <button
               type="submit"
@@ -205,6 +212,7 @@ const showCreateDialog = ref(false)
 const newToken = ref<string | null>(null)
 const deleteTarget = ref<any | null>(null)
 
+const scopePreset = ref('all')
 const createForm = ref({
   name: '',
   expires_days: 90,
@@ -237,11 +245,13 @@ async function handleCreate() {
     const response = await authApi.createAPIKey({
       name: createForm.value.name,
       expires_days: createForm.value.expires_days,
+      scopes: scopePreset.value === 'all' ? undefined : scopePreset.value === 'read' ? ['task:view:own'] : ['task:submit', 'task:view:own', 'task:delete:own', 'queue:view'],
     })
 
     newToken.value = response.api_key
     showCreateDialog.value = false
     createForm.value = { name: '', expires_days: 90 }
+    scopePreset.value = 'all'
 
     // 重新加载列表
     await loadAPIKeys()

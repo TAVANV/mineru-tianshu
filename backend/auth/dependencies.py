@@ -29,6 +29,36 @@ def get_auth_db() -> AuthDB:
     return _auth_db
 
 
+def _authenticate_jwt(token: str, auth_db: AuthDB) -> Optional[User]:
+    """
+    校验 JWT 并返回用户（验签 + 吊销检查 + 令牌代次检查）
+
+    Args:
+        token: JWT Token
+        auth_db: 认证数据库实例
+
+    Returns:
+        User: 用户对象，任何一步校验失败返回 None
+    """
+    token_data = verify_token(token)
+    if not token_data:
+        return None
+
+    # jti 在吊销表中说明该 Token 已被主动注销
+    if token_data.jti and auth_db.is_token_revoked(token_data.jti):
+        return None
+
+    user = auth_db.get_user_by_id(token_data.user_id)
+    if not user:
+        return None
+
+    # 改密后 token_epoch 递增，代次偏低的旧令牌一律作废
+    if token_data.epoch < auth_db.get_token_epoch(user.user_id):
+        return None
+
+    return user
+
+
 def get_current_user_from_token(
     credentials: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
     auth_db: AuthDB = Depends(get_auth_db),
@@ -46,14 +76,7 @@ def get_current_user_from_token(
     if not credentials:
         return None
 
-    token = credentials.credentials
-    token_data = verify_token(token)
-
-    if not token_data:
-        return None
-
-    user = auth_db.get_user_by_id(token_data.user_id)
-    return user
+    return _authenticate_jwt(credentials.credentials, auth_db)
 
 
 def get_current_user_from_apikey(
@@ -223,3 +246,45 @@ async def get_optional_user(
         Optional[User]: 用户对象或 None
     """
     return user_from_token or user_from_apikey
+
+
+def get_current_user_flexible(
+    request: Request,
+    auth_db: AuthDB = Depends(get_auth_db),
+) -> User:
+    """
+    文件认证：依次选择 Bearer 头、预览查询 JWT、X-API-Key；所选凭据无效时拒绝
+
+    浏览器内嵌预览（<img>/<iframe>）无法携带请求头，因此文件端点允许
+    通过查询参数传递 JWT。两种方式都会做验签 + 吊销 + 令牌代次 + 激活状态校验。
+
+    Returns:
+        User: 激活的用户对象
+
+    Raises:
+        HTTPException: 未认证 (401) 或用户未激活 (403)
+    """
+    token = None
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[len("Bearer ") :]
+    if not token:
+        token = request.scope.get("state", {}).get("file_token") or request.query_params.get("token")
+    api_key = request.headers.get("X-API-Key")
+    if not token and not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = _authenticate_jwt(token, auth_db) if token else auth_db.verify_api_key(api_key)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user")
+    return user

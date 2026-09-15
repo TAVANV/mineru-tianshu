@@ -54,6 +54,7 @@ export interface PasswordChangeRequest {
 export interface APIKeyCreate {
   name: string
   expires_days?: number
+  scopes?: string[]
 }
 
 // API Key 响应

@@ -8,7 +8,7 @@ MinerU Tianshu - Authentication Routes
 from fastapi import APIRouter, Depends, HTTPException, status, Request, UploadFile, File
 from fastapi.responses import RedirectResponse
 from typing import List
-from datetime import timedelta
+from datetime import timedelta, datetime
 from loguru import logger
 
 from .models import (
@@ -23,7 +23,7 @@ from .models import (
     Permission,
 )
 from .auth_db import AuthDB
-from .jwt_handler import create_access_token, JWT_EXPIRE_MINUTES
+from .jwt_handler import create_access_token, JWT_EXPIRE_MINUTES, decode_token_payload
 from .dependencies import (
     get_auth_db,
     get_current_active_user,
@@ -88,6 +88,7 @@ def login(credentials: UserLogin, request: Request, auth_db: AuthDB = Depends(ge
         user_id=user.user_id,
         username=user.username,
         role=user.role,
+        epoch=user.token_epoch,
         expires_delta=timedelta(minutes=JWT_EXPIRE_MINUTES),
     )
 
@@ -98,8 +99,20 @@ def login(credentials: UserLogin, request: Request, auth_db: AuthDB = Depends(ge
 
 
 @router.post("/logout")
-def logout(current_user: User = Depends(get_current_active_user)):
-    """Record a voluntary client logout without changing existing JWT semantics."""
+def logout(
+    request: Request, current_user: User = Depends(get_current_active_user), auth_db: AuthDB = Depends(get_auth_db)
+):
+    authorization = request.headers.get("Authorization", "")
+    if authorization.lower().startswith("bearer "):
+        payload = decode_token_payload(authorization[7:])
+        if payload and payload.get("jti"):
+            auth_db.revoke_token(payload["jti"], current_user.user_id, datetime.utcfromtimestamp(payload["exp"]))
+        elif payload:
+            # Historical JWTs have no jti: invalidate the user's pre-migration sessions.
+            with auth_db.get_cursor() as cursor:
+                cursor.execute(
+                    "UPDATE users SET token_epoch = token_epoch + 1 WHERE user_id = ?", (current_user.user_id,)
+                )
     return {"success": True}
 
 
@@ -124,6 +137,8 @@ async def update_current_user(
 
     用户可以更新自己的邮箱和全名，不能更新角色。
     """
+    if current_user.api_key_scopes is not None:
+        raise HTTPException(status_code=403, detail="Use a login session to update account details")
     # 用户不能更改自己的角色
     if user_update.role is not None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot change your own role")
@@ -154,6 +169,8 @@ async def change_password(
 
     用户需要提供旧密码和新密码。SSO 用户不能修改密码。
     """
+    if current_user.api_key_scopes is not None:
+        raise HTTPException(status_code=403, detail="Use a login session to change password")
     try:
         success = auth_db.change_password(
             current_user.user_id,
@@ -191,10 +208,14 @@ async def create_api_key(
 
     为当前用户创建一个新的 API Key。API Key 只会在创建时返回一次，请妥善保管。
     """
+    if current_user.api_key_scopes is not None:
+        if key_data.scopes is None or not set(key_data.scopes).issubset(current_user.api_key_scopes):
+            raise HTTPException(status_code=403, detail="Child key scopes must not exceed caller scopes")
     key_info = auth_db.create_api_key(
         user_id=current_user.user_id,
         name=key_data.name,
         expires_days=key_data.expires_days,
+        scopes=key_data.scopes,
     )
 
     logger.info(f"✅ API Key created: {key_info['prefix']}... for user {current_user.username}")
@@ -435,6 +456,7 @@ if OIDC_AVAILABLE:
                 user_id=user.user_id,
                 username=user.username,
                 role=user.role,
+                epoch=user.token_epoch,
                 expires_delta=timedelta(minutes=JWT_EXPIRE_MINUTES),
             )
 

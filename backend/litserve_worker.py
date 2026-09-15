@@ -139,67 +139,41 @@ except ImportError as e:
 # ==============================================================================
 # 3. VLLM Container Controller
 # ==============================================================================
+LOCAL_VLLM_BACKENDS = frozenset({"vlm-auto-engine", "hybrid-auto-engine", "vlm-http-client", "hybrid-http-client"})
+
+
 class VLLMController:
-    """管理 vLLM Docker 容器的互斥启动"""
-
-    def __init__(self):
-        pass
-
-    def _get_client(self):
-        """按需获取 Docker 客户端"""
-        try:
-            import docker
-
-            return docker.from_env()
-        except Exception as e:
-            logger.warning(f"⚠️  Docker client init failed: {e}")
-            return None
+    """Upstream e740406 cold start, retaining PaddleOCR mutual exclusion."""
 
     def ensure_service(self, target_container: str, conflict_container: str):
-        """
-        确保目标容器运行，并关闭冲突容器 (严格互斥逻辑)
-        """
-        client = self._get_client()
-        if not client:
-            return
-
         try:
-            # 1. 检查并关闭冲突容器
-            try:
-                conflict = client.containers.get(conflict_container)
-                if conflict.status == "running":
-                    logger.info(f"🛑 Stopping conflicting service {conflict_container} to free VRAM...")
-                    conflict.stop()
-                    time.sleep(2)  # 等待释放
-                    logger.info(f"✅ Service {conflict_container} stopped.")
-            except Exception:
-                pass
-
-            # 2. 检查并启动目标容器
+            import docker
+        except ImportError:
+            logger.info("Docker SDK unavailable; vLLM is externally managed")
+            return
+        try:
+            client = docker.from_env()
+        except docker.errors.DockerException:
+            logger.info("Docker unreachable; vLLM is externally managed")
+            return
+        try:
+            # Resolve target before touching a conflict: external services own their lifecycle.
             try:
                 target = client.containers.get(target_container)
-                if target.status == "running":
-                    return
-
-                logger.info(f"🚀 Starting service {target_container} (Manual/Cold Start)...")
-                target.start()
-
-                # 等待服务健康 (简单轮询)
-                for _ in range(30):
-                    time.sleep(1)
-                    target.reload()
-                    if target.status == "running":
-                        break
-                logger.info(f"✅ Service {target_container} started.")
-
-            except Exception as e:
-                logger.error(f"❌ Failed to start target container {target_container}: {e}")
-                raise e
-        finally:
+            except docker.errors.NotFound:
+                logger.info("vLLM container absent; service is externally managed")
+                return
             try:
-                client.close()
-            except Exception:
-                pass
+                conflict = client.containers.get(conflict_container)
+            except docker.errors.NotFound:
+                conflict = None
+            if conflict is not None and conflict.status == "running":
+                conflict.stop()
+            if target.status != "running":
+                target.start()
+            # Model readiness is checked by the engine, not container status polling.
+        finally:
+            client.close()
 
 
 # ==============================================================================
@@ -474,7 +448,7 @@ class MinerUWorkerAPI(ls.LitAPI):
                 self.vllm_controller.ensure_service(
                     target_container=paddle_container, conflict_container=mineru_container
                 )
-            elif backend in ["vlm-auto-engine", "hybrid-auto-engine"] and self.mineru_vllm_api:
+            elif backend in LOCAL_VLLM_BACKENDS and self.mineru_vllm_api and not options.get("server_url"):
                 self.vllm_controller.ensure_service(
                     target_container=mineru_container, conflict_container=paddle_container
                 )
@@ -687,9 +661,6 @@ class MinerUWorkerAPI(ls.LitAPI):
 
         output_dir = Path(self.output_dir) / Path(file_path).stem
         output_dir.mkdir(parents=True, exist_ok=True)
-
-        if "http-client" in options.get("parse_mode", "") and self.mineru_vllm_api:
-            options.setdefault("server_url", self.mineru_vllm_api.replace("/v1", ""))
 
         result = self.mineru_pipeline_engine.parse(file_path, output_path=str(output_dir), options=options)
 

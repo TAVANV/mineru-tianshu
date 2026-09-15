@@ -7,6 +7,7 @@ MinerU Tianshu - Authentication Database
 
 import os
 import sqlite3
+import json
 import hashlib
 import secrets
 import uuid
@@ -125,11 +126,36 @@ class AuthDB:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_key_prefix ON api_keys(prefix)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_key_user ON api_keys(user_id)")
 
+            # 已吊销 JWT 表（logout / 安全事件时写入）
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS revoked_tokens (
+                    jti TEXT PRIMARY KEY,
+                    user_id TEXT,
+                    expires_at TIMESTAMP
+                )
+            """)
+
             # 修改 tasks 表，添加 user_id 字段 (如果不存在)
             try:
                 cursor.execute("ALTER TABLE tasks ADD COLUMN user_id TEXT")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_user ON tasks(user_id)")
                 logger.info("✅ Added user_id column to tasks table")
+            except sqlite3.OperationalError:
+                # 字段已存在，忽略
+                pass
+
+            # users 表添加 token_epoch 字段（令牌代次，改密后递增使旧令牌失效）
+            try:
+                cursor.execute("ALTER TABLE users ADD COLUMN token_epoch INTEGER DEFAULT 0")
+                logger.info("✅ Added token_epoch column to users table")
+            except sqlite3.OperationalError:
+                # 字段已存在，忽略
+                pass
+
+            # api_keys 表添加 scopes 字段（JSON 数组字符串，NULL 表示不限权限）
+            try:
+                cursor.execute("ALTER TABLE api_keys ADD COLUMN scopes TEXT")
+                logger.info("✅ Added scopes column to api_keys table")
             except sqlite3.OperationalError:
                 # 字段已存在，忽略
                 pass
@@ -345,9 +371,12 @@ class AuthDB:
             if not password_hash or not self._verify_password(old_password, password_hash):
                 raise ValueError("Incorrect old password")
 
-            # 更新密码
+            # 更新密码，同时递增令牌代次使该用户已签发的 JWT 全部失效
             new_password_hash = self._hash_password(new_password)
-            cursor.execute("UPDATE users SET password_hash = ? WHERE user_id = ?", (new_password_hash, user_id))
+            cursor.execute(
+                "UPDATE users SET password_hash = ?, token_epoch = token_epoch + 1 WHERE user_id = ?",
+                (new_password_hash, user_id),
+            )
 
             return cursor.rowcount > 0
 
@@ -357,14 +386,17 @@ class AuthDB:
             cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
             return cursor.rowcount > 0
 
-    def create_api_key(self, user_id: str, name: str, expires_days: Optional[int] = None) -> Dict[str, str]:
+    def create_api_key(
+        self, user_id: str, name: str, expires_days: int = 90, scopes: Optional[List[str]] = None
+    ) -> Dict[str, str]:
         """
         创建 API Key
 
         Args:
             user_id: 用户ID
             name: API Key 名称
-            expires_days: 过期天数 (None 表示永不过期)
+            expires_days: 过期天数（必须限期，默认 90 天）
+            scopes: 权限作用域列表（None 表示不限）
 
         Returns:
             dict: 包含 key_id, api_key, prefix, created_at, expires_at
@@ -379,17 +411,16 @@ class AuthDB:
 
         # 统一使用 UTC 时间
         created_at = datetime.utcnow()
-        expires_at = None
-        if expires_days:
-            expires_at = created_at + timedelta(days=expires_days)
+        expires_at = created_at + timedelta(days=expires_days)
+        scopes_json = json.dumps(scopes) if scopes is not None else None
 
         with self.get_cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO api_keys (key_id, user_id, api_key_hash, name, prefix, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO api_keys (key_id, user_id, api_key_hash, name, prefix, expires_at, scopes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-                (key_id, user_id, api_key_hash, name, prefix, expires_at.isoformat() if expires_at else None),
+                (key_id, user_id, api_key_hash, name, prefix, expires_at.isoformat(), scopes_json),
             )
 
         return {
@@ -419,7 +450,7 @@ class AuthDB:
                 SELECT ak.*, u.* FROM api_keys ak
                 JOIN users u ON ak.user_id = u.user_id
                 WHERE ak.prefix = ? AND ak.api_key_hash = ? AND ak.is_active = 1 AND u.is_active = 1
-                AND (ak.expires_at IS NULL OR ak.expires_at > datetime('now'))
+                AND (ak.expires_at IS NULL OR julianday(ak.expires_at) > julianday('now'))
             """,
                 (prefix, api_key_hash),
             )
@@ -431,7 +462,20 @@ class AuthDB:
             # 更新最后使用时间
             cursor.execute("UPDATE api_keys SET last_used = CURRENT_TIMESTAMP WHERE key_id = ?", (row["key_id"],))
 
-            return self._row_to_user(row)
+            user = self._row_to_user(row)
+            # 反序列化 API Key 作用域并挂到 User 上，供 has_permission 做细粒度限制
+            scopes_raw = row["scopes"]
+            if scopes_raw is not None:
+                try:
+                    user.api_key_scopes = json.loads(scopes_raw)
+                    if not isinstance(user.api_key_scopes, list) or not all(
+                        isinstance(s, str) for s in user.api_key_scopes
+                    ):
+                        user.api_key_scopes = []
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(f"Invalid scopes JSON on API Key {row['key_id']}")
+                    user.api_key_scopes = []
+            return user
 
     def list_api_keys(self, user_id: str) -> List[Dict]:
         """列出用户的所有 API Key"""
@@ -501,6 +545,7 @@ class AuthDB:
     def _row_to_user(row: sqlite3.Row) -> User:
         """将数据库行转换为 User 对象"""
         return User(
+            token_epoch=int(row["token_epoch"] or 0),
             user_id=row["user_id"],
             username=row["username"],
             email=row["email"],
@@ -513,6 +558,41 @@ class AuthDB:
             created_at=datetime.fromisoformat(row["created_at"]),
             last_login=datetime.fromisoformat(row["last_login"]) if row["last_login"] else None,
         )
+
+    def get_token_epoch(self, user_id: str) -> int:
+        """获取用户当前令牌代次（不存在时返回 0）"""
+        with self.get_cursor() as cursor:
+            cursor.execute("SELECT token_epoch FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            if row and row["token_epoch"] is not None:
+                return int(row["token_epoch"])
+            return 0
+
+    def revoke_token(self, jti: str, user_id: str, expires_at: datetime) -> None:
+        """
+        吊销指定 JWT（logout 时调用），并顺带清理已过期的吊销记录
+
+        Args:
+            jti: Token 唯一标识
+            user_id: 用户ID
+            expires_at: Token 过期时间
+        """
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                "INSERT OR REPLACE INTO revoked_tokens (jti, user_id, expires_at) VALUES (?, ?, ?)",
+                (jti, user_id, expires_at.isoformat()),
+            )
+            # 已过期的 Token 本身就会验签失败，吊销记录可以清理
+            cursor.execute("DELETE FROM revoked_tokens WHERE expires_at < ?", (datetime.utcnow().isoformat(),))
+
+    def is_token_revoked(self, jti: str) -> bool:
+        """检查指定 jti 的 JWT 是否已被吊销"""
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                "SELECT 1 FROM revoked_tokens WHERE jti = ? AND expires_at > ?",
+                (jti, datetime.utcnow().isoformat()),
+            )
+            return cursor.fetchone() is not None
 
 
 if __name__ == "__main__":

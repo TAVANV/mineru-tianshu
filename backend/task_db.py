@@ -580,6 +580,30 @@ class TaskDB:
     # -------------------------------------------------------------------------
     # 核心修复：物理删除文件逻辑
     # -------------------------------------------------------------------------
+    def get_task_by_file_path(self, full_path: Path, root: Path, output: bool = False) -> Optional[Dict]:
+        """Exact canonical ownership lookup; handles nested ZIP/PDF results and legacy paths.
+
+        Unlike upstream's basename LIKE fallback, compare complete paths. Choose the
+        most specific result directory so a parent cannot mask a nested task owner.
+        """
+        full_path, root = Path(full_path).resolve(), Path(root).resolve()
+        if not full_path.is_relative_to(root):
+            return None
+        column = "result_path" if output else "file_path"
+        with self.get_cursor() as cursor:
+            cursor.execute(f"SELECT * FROM tasks WHERE {column} IS NOT NULL")
+            rows = cursor.fetchall()
+        matches = []
+        for row in rows:
+            if row[column] == "CLEARED":
+                continue
+            candidate = Path(row[column]).resolve()
+            if not candidate.is_relative_to(root):
+                continue
+            if (output and full_path.is_relative_to(candidate)) or (not output and full_path == candidate):
+                matches.append((len(candidate.parts), dict(row)))
+        return max(matches, key=lambda item: item[0])[1] if matches else None
+
     def _delete_task_files(self, task_row):
         """辅助方法：安全删除任务的源文件和结果目录"""
         task_id = task_row["task_id"]
