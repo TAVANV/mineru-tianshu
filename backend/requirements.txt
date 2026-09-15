@@ -104,3 +104,6 @@ soundfile>=0.13.0
 
 # 9. 去水印
 ultralytics>=8.3.0
+
+# EPUB XHTML conversion (also used by MarkItDown)
+markdownify>=0.13.1

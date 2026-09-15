@@ -112,6 +112,10 @@ class UserCreate(BaseModel):
     role: UserRole = UserRole.USER
 
 
+class RegisterRequest(UserCreate):
+    invite_code: Optional[str] = Field(None, max_length=100)
+
+
 class UserUpdate(BaseModel):
     """更新用户请求"""
 

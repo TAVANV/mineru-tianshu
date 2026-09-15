@@ -5,7 +5,7 @@ MinerU Tianshu - Authentication Dependencies
 FastAPI 依赖项,用于保护路由和验证用户权限
 """
 
-from fastapi import Depends, HTTPException, status, Security
+from fastapi import Request, Depends, HTTPException, status, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, APIKeyHeader
 from typing import Optional
 
@@ -108,7 +108,7 @@ async def get_current_user(
     return user
 
 
-async def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
+async def get_current_active_user(request: Request, current_user: User = Depends(get_current_user)) -> User:
     """
     获取当前激活的用户
 
@@ -123,6 +123,7 @@ async def get_current_active_user(current_user: User = Depends(get_current_user)
     """
     if not current_user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user")
+    request.state.audit_user = current_user
     return current_user
 
 

@@ -56,6 +56,7 @@ export default {
     systemConfig: '系统配置',
   },
   auth: {
+    inviteCode: '注册邀请码',
     username: '用户名',
     password: '密码',
     email: '邮箱',
@@ -90,6 +91,11 @@ export default {
     queueStats: '队列统计',
   },
   task: {
+    webhookUrl: '任务回调地址（可选）',
+    webhookHint: '留空使用管理员默认配置。自定义地址不携带默认回调的鉴权凭证；内网目标需加入白名单。',
+    cancelledLabel: '已取消',
+    cancelledHelp: '任务组已取消，不会重新派发。当前模型调用结束后释放资源。',
+    cancelGroupConfirm: '取消整个任务组及未完成的子任务？任务记录和文件将保留。',
     title: '任务',
     taskId: '任务 ID',
     fileName: '文件名',
@@ -182,7 +188,7 @@ export default {
     resetConfig: '恢复默认设置',
     priorityLabel: '任务优先级',
     priorityHint: '（0-100，数字越大越优先）',
-    supportedFormatsHint: '支持 PDF、图片、Word、Excel、PowerPoint、HTML、音频（MP3/WAV/M4A）、视频（MP4/AVI/MKV/MOV）、生物序列（FASTA/GenBank）等多种格式',
+    supportedFormatsHint: '支持 EPUB、ZIP、PDF、图片、Word、Excel、PowerPoint、HTML、音频（MP3/WAV/M4A）、视频（MP4/AVI/MKV/MOV）、生物序列（FASTA/GenBank）等多种格式',
     enableFormulaRecognition: '启用公式识别',
     enableTableRecognition: '启用表格识别',
     tableRecognitionDisabledHint: '禁用后，表格将显示为图片。',

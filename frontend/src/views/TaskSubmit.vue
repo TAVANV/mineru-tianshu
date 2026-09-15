@@ -253,6 +253,11 @@
                    </div>
                 </div>
 
+                <div>
+                  <label for="webhook_url" class="block text-xs font-bold text-gray-600 mb-2">{{ $t('task.webhookUrl') }}</label>
+                  <input id="webhook_url" v-model="config.webhook_url" type="url" class="w-full form-input-sm" placeholder="https://..." />
+                  <p class="text-xs text-gray-500 mt-1">{{ $t('task.webhookHint') }}</p>
+                </div>
                 <div v-if="showImageStorageOption">
                    <label class="block text-xs font-bold text-gray-600 uppercase tracking-wide mb-2">{{ $t('task.imageStorage') }}</label>
                    <div class="bg-white border border-gray-200 rounded p-3">
@@ -500,6 +505,7 @@ const defaultConfig = {
   convert_office_to_pdf: false,
 
   // 图片存储: 任务级 RustFS 开关 (undefined=跟随系统配置; true=上传对象存储; false=保留本地)
+  webhook_url: '',
   use_rustfs: undefined as boolean | undefined,
 
   remove_watermark: false,

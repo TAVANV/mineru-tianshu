@@ -120,6 +120,36 @@ auth_db = AuthDB()
 
 # 注册认证路由
 app.include_router(auth_router)
+from feature_routes import router as feature_router
+
+app.include_router(feature_router)
+
+
+@app.middleware("http")
+async def audit_mutations(request, call_next):
+    response = await call_next(request)
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        from auth.audit import record_audit
+
+        path = request.url.path
+        task_match = re.search(r"/tasks/([^/]+)", path)
+        resource = task_match.group(1) if task_match else None
+        action = re.sub(r"/tasks/[^/]+", "/tasks/{task_id}", path) if task_match else path
+        record_audit(
+            action,
+            user=getattr(request.state, "audit_user", None),
+            request=request,
+            resource_type="task" if task_match else "system",
+            resource_id=resource,
+            detail={
+                "method": request.method,
+                "status_code": response.status_code,
+                **getattr(request.state, "audit_detail", {}),
+            },
+            result="success" if response.status_code < 400 else "failure",
+        )
+    return response
+
 
 # ==============================================================================
 # 目录配置 (Output & Upload)
@@ -150,56 +180,20 @@ logger.info(f"📁 Upload directory: {UPLOAD_DIR}")
 
 # 注意：此函数已废弃，Worker 已自动上传图片到 RustFS 并替换 URL
 def process_markdown_images_legacy(md_content: str, image_dir: Path, result_path: str):
-    """
-    【向后兼容】处理 Markdown 中的图片引用
-    """
-    if "http://" in md_content or "https://" in md_content:
+    """Resolve local image references without altering remote URLs or escaped alt text."""
+    from utils.image_references import replace_image_references
+
+    if not image_dir.is_dir():
         return md_content
-
-    if not image_dir.exists():
-        return md_content
-
-    def replace_image_path(match):
-        full_match = match.group(0)
-        if "![" in full_match:
-            image_path = match.group(2)
-            alt_text = match.group(1)
-        else:
-            image_path = match.group(2)
-            alt_text = "Image"
-
-        if image_path.startswith("http"):
-            return full_match
-
-        try:
-            image_filename = Path(image_path).name
-            output_dir_str = str(OUTPUT_DIR).replace("\\", "/")
-            result_path_str = result_path.replace("\\", "/")
-
-            if result_path_str.startswith(output_dir_str):
-                relative_path = result_path_str[len(output_dir_str) :].lstrip("/")
-                encoded_relative_path = quote(relative_path, safe="/")
-                encoded_filename = quote(image_filename, safe="/")
-
-                static_url = f"/api/v1/files/output/{encoded_relative_path}/images/{encoded_filename}"
-
-                if "![" in full_match:
-                    return f"![{alt_text}]({static_url})"
-                else:
-                    return full_match.replace(image_path, static_url)
-        except Exception as e:
-            logger.error(f"❌ Failed to generate local URL: {e}")
-
-        return full_match
-
     try:
-        md_pattern = r"!\[([^\]]*)\]\(([^)]+)\)"
-        html_pattern = r'<img\s+([^>]*\s+)?src="([^"]+)"([^>]*)>'
-
-        new_content = re.sub(md_pattern, replace_image_path, md_content)
-        new_content = re.sub(html_pattern, replace_image_path, new_content)
-        return new_content
-    except Exception:
+        relative = Path(result_path).resolve().relative_to(OUTPUT_DIR.resolve())
+        mapping = {
+            file.name: "/api/v1/files/output/" + quote((relative / "images" / file.name).as_posix(), safe="/")
+            for file in image_dir.iterdir()
+            if file.is_file()
+        }
+        return replace_image_references(md_content, mapping)
+    except (OSError, ValueError):
         return md_content
 
 
@@ -281,8 +275,17 @@ async def submit_task(
         "不传=由 RUSTFS_ENABLED 环境变量决定（向后兼容）；true=强制上传；"
         "false=保留图片在本地，通过 /files/output 下载",
     ),
+    webhook_url: Optional[str] = Form(
+        None, max_length=2048, description="可选任务回调地址；私网目标需管理员配置 host:port 白名单"
+    ),
     current_user: User = Depends(require_permission(Permission.TASK_SUBMIT)),
 ):
+    from webhooks import subscription
+
+    try:
+        webhook_config = await anyio.to_thread.run_sync(lambda: subscription(webhook_url, db.db_path))
+    except (ValueError, OSError):
+        raise HTTPException(status_code=400, detail="Invalid webhook endpoint or host not allowed")
     try:
         unique_filename = f"{uuid.uuid4().hex}_{file.filename}"
         temp_file_path = UPLOAD_DIR / unique_filename
@@ -353,6 +356,7 @@ async def submit_task(
                 options=options,
                 priority=priority,
                 user_id=current_user.user_id,
+                webhook_config=webhook_config,
             )
         )
 
@@ -439,6 +443,7 @@ def get_task_status(
                 {
                     "task_id": child["task_id"],
                     "status": child["status"],
+                    "file_name": child["file_name"],
                     "chunk_info": json.loads(child.get("options", "{}")).get("chunk_info"),
                     "error_message": child.get("error_message"),
                 }
@@ -499,7 +504,7 @@ def get_task_status(
                         with open(md_file, "r", encoding="utf-8") as f:
                             md_content = f.read()
 
-                        if image_dir.exists() and ("http://" not in md_content and "https://" not in md_content):
+                        if image_dir.exists():
                             md_content = process_markdown_images_legacy(md_content, image_dir, task["result_path"])
 
                         response["data"]["markdown_file"] = md_file.name
@@ -509,7 +514,7 @@ def get_task_status(
                     if format in ["json", "both"] and json_files:
                         import json as json_lib
 
-                        json_file = json_files[0]
+                        json_file = next((f for f in json_files if f.name == "result.json"), json_files[0])
                         try:
                             with open(json_file, "r", encoding="utf-8") as f:
                                 json_content = json_lib.load(f)
@@ -597,12 +602,9 @@ def get_task_images(
     if md_file and md_file.exists():
         try:
             md_content = md_file.read_text(encoding="utf-8")
-            # 匹配 Markdown 语法: ![alt](url)
-            for match in re.finditer(r"!\[[^\]]*\]\(([^)]+)\)", md_content):
-                referenced_filenames.add(Path(match.group(1).split("?")[0]).name)
-            # 匹配 HTML img 标签: <img src="url">
-            for match in re.finditer(r'<img\s+[^>]*src="([^"]+)"[^>]*>', md_content):
-                referenced_filenames.add(Path(match.group(1).split("?")[0]).name)
+            from utils.image_references import image_filenames
+
+            referenced_filenames = image_filenames(md_content)
             logger.info(f"📄 Found {len(referenced_filenames)} referenced images in result.md")
         except Exception as e:
             logger.warning(f"⚠️  Failed to parse result.md for image refs: {e}")
@@ -698,11 +700,12 @@ def _purge_task_files(task, child_tasks):
     for t in [task] + (child_tasks or []):
         _remove_task_output(t)
 
-    tid = task.get("task_id")
-    if tid:
-        split_dir = OUTPUT_DIR / "splits" / tid
-        if split_dir.exists():
-            shutil.rmtree(split_dir, ignore_errors=True)
+    for item in [task] + (child_tasks or []):
+        tid = item.get("task_id")
+        if tid:
+            split_dir = OUTPUT_DIR / "splits" / tid
+            if split_dir.exists():
+                shutil.rmtree(split_dir, ignore_errors=True)
 
     for t in [task] + (child_tasks or []):
         fp = t.get("file_path")
@@ -732,14 +735,13 @@ def delete_task(task_id: str, current_user: User = Depends(get_current_active_us
             raise HTTPException(status_code=403, detail="Permission denied: You can only delete your own tasks")
 
     # 收集子任务（大 PDF 拆分会产生 parent_task_id 指向本任务的子任务）
-    children = db.get_child_tasks(task_id)
+    children = db.get_descendant_tasks(task_id)
 
     # 1. 物理删除：本任务 + 所有子任务的输出/衍生、splits 分片临时目录、上传源文件
     _purge_task_files(task, children)
 
     # 2. 从数据库彻底移除记录（级联删子任务：task_id 自身 或 parent_task_id 指向它）
-    with db.get_cursor() as cursor:
-        cursor.execute("DELETE FROM tasks WHERE task_id = ? OR parent_task_id = ?", (task_id, task_id))
+    db.delete_task_tree(task_id)
 
     logger.info(f"🗑️ Task completely deleted: {task_id} by user {current_user.username}")
     return {"success": True, "message": "Task and files completely deleted."}
@@ -757,18 +759,14 @@ def clear_failed_tasks_endpoint(current_user: User = Depends(require_permission(
 
     # 2. 逐个清理磁盘产物（含各自的子任务），放事务外避免 cursor 嵌套
     for task in failed_tasks:
-        children = db.get_child_tasks(task["task_id"])
+        children = db.get_descendant_tasks(task["task_id"])
         _purge_task_files(task, children)
 
     # 3. 批量从数据库删除（父 + 子级联）
     deleted_count = 0
-    with db.get_cursor() as cursor:
-        for task in failed_tasks:
-            cursor.execute(
-                "DELETE FROM tasks WHERE task_id = ? OR parent_task_id = ?",
-                (task["task_id"], task["task_id"]),
-            )
-            deleted_count += 1
+    for task in failed_tasks:
+        db.delete_task_tree(task["task_id"])
+        deleted_count += 1
 
     logger.info(f"🧹 Cleared {deleted_count} failed tasks from DB and Disk.")
     return {
@@ -797,13 +795,23 @@ def retry_task(task_id: str, current_user: User = Depends(get_current_active_use
         if task.get("user_id") != current_user.user_id:
             raise HTTPException(status_code=403, detail="Permission denied")
 
-    if db.retry_task(task_id):
-        # 清理旧输出（用 result_path，非 task_id）
-        _remove_task_output(task)
-
+    # 清理在任务重新变为 pending 之前完成，防止 Worker 已开始新一轮处理后输出被删除。
+    if db.retry_task(task_id, cleanup=lambda: _remove_task_output(task)):
         return {"success": True, "message": "Task submitted for retry"}
 
-    raise HTTPException(status_code=404, detail="Task not found")
+    raise HTTPException(status_code=409, detail="Retry requires a failed root task with no active children")
+
+
+@router.post("/tasks/{task_id}/cancel", tags=["任务管理"])
+def cancel_task_endpoint(task_id: str, current_user: User = Depends(get_current_active_user)):
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    if not current_user.has_permission(Permission.TASK_DELETE_ALL) and task.get("user_id") != current_user.user_id:
+        raise HTTPException(403, "Permission denied")
+    if not db.cancel_task(task_id):
+        raise HTTPException(409, "Task is no longer cancellable")
+    return {"success": True, "task_id": task_id, "status": "cancelled", "message": "Task group cancelled"}
 
 
 @router.post("/tasks/{task_id}/pause", tags=["任务管理"])
@@ -1048,7 +1056,19 @@ def list_engines():
                 "value": "auto",
                 "version": _pkg_version("markitdown"),
                 "description": "Office 文档和文本文件转换引擎（快速但图片提取可能不完整）",
-                "supported_formats": [".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt", ".html", ".txt", ".csv"],
+                "supported_formats": [
+                    ".docx",
+                    ".xlsx",
+                    ".pptx",
+                    ".doc",
+                    ".xls",
+                    ".ppt",
+                    ".html",
+                    ".txt",
+                    ".csv",
+                    ".epub",
+                    ".zip",
+                ],
             },
             {
                 "name": "LibreOffice + MinerU (完整)",

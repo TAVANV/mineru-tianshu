@@ -103,6 +103,10 @@
             />
           </div>
 
+          <div v-if="systemConfig.registration_invite_required">
+            <label for="invite_code" class="block text-sm font-medium text-gray-700 mb-1">{{ $t('auth.inviteCode') }} *</label>
+            <input id="invite_code" v-model="form.invite_code" type="password" required maxlength="100" class="w-full px-4 py-2 border border-gray-300 rounded-lg" />
+          </div>
           <!-- 注册按钮 -->
           <button
             type="submit"
@@ -155,6 +159,7 @@ const form = reactive({
   email: '',
   password: '',
   full_name: '',
+  invite_code: '',
 })
 
 const confirmPassword = ref('')

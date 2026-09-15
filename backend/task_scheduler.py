@@ -183,12 +183,32 @@ class TaskScheduler:
                     except Exception as e:
                         logger.error(f"Failed to resync Redis queue: {e}")
 
+                    # Notifications run independently so a slow receiver cannot stall recovery/heartbeats.
+                    if not hasattr(self, "_webhook_dispatch") or self._webhook_dispatch.done():
+                        from webhooks import dispatch
+
+                        async def deliver():
+                            try:
+                                await asyncio.to_thread(dispatch, self.db)
+                            except Exception as e:
+                                logger.warning(f"Webhook dispatch deferred: {type(e).__name__}")
+
+                        self._webhook_dispatch = asyncio.create_task(deliver())
+
                     # 4. 定期清理旧任务文件
                     cleanup_counter += 1
                     # 每24小时清理一次
                     cleanup_interval_cycles = (24 * 3600) / max(1, self.monitor_interval)
                     if cleanup_counter >= cleanup_interval_cycles:
                         cleanup_counter = 0
+                        try:
+                            from auth.audit import cleanup_expired_audit_logs
+                            from feature_config import load_config
+
+                            retention = int(load_config(self.db.db_path)["audit_retention_days"])
+                            await asyncio.to_thread(cleanup_expired_audit_logs, retention)
+                        except Exception as e:
+                            logger.warning(f"Audit cleanup deferred: {type(e).__name__}")
                         if self.cleanup_old_files_days > 0:
                             try:
                                 logger.info(f"🧹 Cleaning up tasks older than {self.cleanup_old_files_days} days...")

@@ -5,7 +5,6 @@
 from pathlib import Path
 from typing import Dict, Any, Optional
 from loguru import logger
-import re
 import json
 import os
 
@@ -26,7 +25,9 @@ class BaseOutputNormalizer:
         """
         self._rustfs_client = None
 
-    def normalize(self, output_dir: Path, use_rustfs: Optional[bool] = None) -> Dict[str, Any]:
+    def normalize(
+        self, output_dir: Path, use_rustfs: Optional[bool] = None, enable_caption: bool = True
+    ) -> Dict[str, Any]:
         """
         规范化输出目录（模板方法）
 
@@ -56,6 +57,16 @@ class BaseOutputNormalizer:
         result.setdefault("image_count", 0)
         result.setdefault("rustfs_enabled", False)
         result.setdefault("images_uploaded", False)
+
+        if enable_caption:
+            try:
+                from image_caption import ImageCaptionConfig, process_output_dir
+
+                config = ImageCaptionConfig.load()
+                if config:
+                    result["image_caption"] = process_output_dir(output_dir, config)
+            except Exception as e:
+                logger.warning(f"Image caption skipped: {type(e).__name__}")
 
         # 2. 自动上传图片到 RustFS 并替换 URL（基础功能，始终启用）
         if result["image_dir"] and result["image_count"] > 0:
@@ -170,112 +181,18 @@ class BaseOutputNormalizer:
             raise
 
     def _replace_markdown_urls(self, md_file: Path, url_mapping: Dict[str, str]):
-        """
-        替换 Markdown 中的图片路径为 RustFS URL
+        from utils.image_references import replace_image_references
 
-        Args:
-            md_file: Markdown 文件
-            url_mapping: {本地文件名: RustFS URL} 映射
-        """
-        try:
-            content = md_file.read_text(encoding="utf-8")
-            original_content = content
-            replaced_count = 0
-
-            logger.debug(f"🔍 Replacing URLs in {md_file.name}")
-            logger.debug(f"   URL mapping: {url_mapping}")
-
-            # 替换所有图片引用（统一转换为 HTML 格式，更通用）
-            for filename, url in url_mapping.items():
-                # 方式1: Markdown 格式 -> HTML 格式
-                # ![alt](images/xxx.jpg) -> <img src="https://..." alt="alt">
-                pattern1 = rf"!\[(.*?)\]\({self.STANDARD_IMAGE_DIR}/{re.escape(filename)}\)"
-                matches1 = re.findall(pattern1, content)
-                if matches1:
-                    logger.debug(f"   Found Markdown pattern: {pattern1}")
-                    logger.debug(f"   Matches: {matches1}")
-
-                # 转换为 HTML 格式（更通用，前端渲染友好）
-                def markdown_to_html(match):
-                    alt_text = match.group(1) or filename
-                    return f'<img src="{url}" alt="{alt_text}">'
-
-                new_content = re.sub(pattern1, markdown_to_html, content)
-                if new_content != content:
-                    replaced_count += 1
-                    logger.debug(f"   ✅ Replaced Markdown -> HTML: {filename} -> {url}")
-                content = new_content
-
-                # 方式2: HTML 格式 -> 更新 URL
-                # <img src="images/xxx.jpg"> -> <img src="https://...">
-                pattern2 = rf'<img([^>]*?)src=["\']({self.STANDARD_IMAGE_DIR}/{re.escape(filename)})["\']([^>]*?)>'
-                matches2 = re.findall(pattern2, content)
-                if matches2:
-                    logger.debug(f"   Found HTML pattern: {pattern2}")
-                    logger.debug(f"   Matches: {matches2}")
-
-                new_content = re.sub(pattern2, rf'<img\1src="{url}"\3>', content)
-                if new_content != content:
-                    replaced_count += 1
-                    logger.debug(f"   ✅ Replaced HTML: {filename} -> {url}")
-                content = new_content
-
-            if content != original_content:
-                md_file.write_text(content, encoding="utf-8")
-                logger.info(f"✅ Replaced {replaced_count} image URLs in {md_file.name}")
-            else:
-                logger.warning(f"⚠️  No replacements made in {md_file.name}")
-                logger.debug(f"   Content preview (first 500 chars):\n{original_content[:500]}")
-
-        except Exception as e:
-            logger.error(f"❌ Failed to replace URLs in Markdown: {e}")
-            raise
+        content = md_file.read_text(encoding="utf-8")
+        updated = replace_image_references(content, url_mapping, markdown_to_html=True)
+        if updated != content:
+            md_file.write_text(updated, encoding="utf-8")
 
     def _replace_json_urls(self, json_file: Path, url_mapping: Dict[str, str]):
-        """
-        替换 JSON 中的图片路径为 RustFS URL
+        from utils.image_references import replace_json_image_references
 
-        Args:
-            json_file: JSON 文件
-            url_mapping: {本地文件名: RustFS URL} 映射
-        """
-        try:
-            with open(json_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            replaced_count = 0
-            logger.debug(f"🔍 Replacing URLs in {json_file.name}")
-
-            # 递归替换 JSON 中的所有图片路径
-            def replace_paths(obj, path=""):
-                nonlocal replaced_count
-                if isinstance(obj, dict):
-                    for key, value in obj.items():
-                        if isinstance(value, str):
-                            # 检查是否是图片路径
-                            for filename, url in url_mapping.items():
-                                if filename in value and self.STANDARD_IMAGE_DIR in value:
-                                    old_value = obj[key]
-                                    obj[key] = url
-                                    replaced_count += 1
-                                    logger.debug(f"   ✅ Replaced JSON[{path}.{key}]: {old_value} -> {url}")
-                                    break
-                        else:
-                            replace_paths(value, f"{path}.{key}")
-                elif isinstance(obj, list):
-                    for i, item in enumerate(obj):
-                        replace_paths(item, f"{path}[{i}]")
-
-            replace_paths(data)
-
-            with open(json_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-
-            if replaced_count > 0:
-                logger.info(f"✅ Replaced {replaced_count} image URLs in {json_file.name}")
-            else:
-                logger.warning(f"⚠️  No replacements made in {json_file.name}")
-
-        except Exception as e:
-            logger.error(f"❌ Failed to replace URLs in JSON: {e}")
-            raise
+        data = json.loads(json_file.read_text(encoding="utf-8"))
+        json_file.write_text(
+            json.dumps(replace_json_image_references(data, url_mapping), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )

@@ -29,7 +29,9 @@ _standard_normalizer = StandardOutputNormalizer()
 _paddleocr_normalizer = PaddleOCROutputNormalizer()
 
 
-def normalize_output(output_dir: Path, handle_method="standard", use_rustfs: Optional[bool] = None) -> Dict[str, Any]:
+def normalize_output(
+    output_dir: Path, handle_method="standard", use_rustfs: Optional[bool] = None, enable_caption: bool = True
+) -> Dict[str, Any]:
     """
     便捷函数：规范化输出目录
 
@@ -55,10 +57,10 @@ def normalize_output(output_dir: Path, handle_method="standard", use_rustfs: Opt
     ## 基于handle_method选择规范化器
     if handle_method == "standard":
         logger.info("🤖 Using standard output normalize method")
-        return _standard_normalizer.normalize(output_dir, use_rustfs=use_rustfs)
+        return _standard_normalizer.normalize(output_dir, use_rustfs=use_rustfs, enable_caption=enable_caption)
     elif handle_method == "paddleocr-vl":
         logger.info("🤖 Using PaddleOCR-VL output normalize method")
-        return _paddleocr_normalizer.normalize(output_dir, use_rustfs=use_rustfs)
+        return _paddleocr_normalizer.normalize(output_dir, use_rustfs=use_rustfs, enable_caption=enable_caption)
     else:
         raise ValueError(f"Unknown output_normalize handle_method: {handle_method}")
 

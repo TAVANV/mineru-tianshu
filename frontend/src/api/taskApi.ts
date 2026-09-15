@@ -20,6 +20,7 @@ import type {
  */
 export async function submitTask(request: SubmitTaskRequest): Promise<SubmitTaskResponse> {
   const formData = new FormData()
+  if (request.webhook_url) formData.append('webhook_url', request.webhook_url)
   formData.append('file', request.file)
 
   // 基础参数
@@ -111,7 +112,7 @@ export async function getTaskStatus(
  * 取消任务
  */
 export async function cancelTask(taskId: string): Promise<ApiResponse> {
-  const response = await apiClient.delete<ApiResponse>(`/api/v1/tasks/${taskId}`)
+  const response = await apiClient.post<ApiResponse>(`/api/v1/tasks/${taskId}/cancel`)
   return response.data
 }
 

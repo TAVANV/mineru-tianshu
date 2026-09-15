@@ -112,7 +112,8 @@ export const useAuthStore = defineStore('auth', () => {
   /**
    * 登出
    */
-  function logout() {
+  function logout(report = true) {
+    if (report && token.value) void authApi.recordLogout(token.value).catch(() => {})
     token.value = null
     user.value = null
     localStorage.removeItem('auth_token')
@@ -133,7 +134,7 @@ export const useAuthStore = defineStore('auth', () => {
       console.error('Fetch user error:', error)
       // Token 可能已过期，清除登录状态
       if (error.response?.status === 401) {
-        logout()
+        logout(false)
       }
     }
   }

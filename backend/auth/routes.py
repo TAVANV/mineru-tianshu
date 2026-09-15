@@ -33,19 +33,31 @@ from .sso import get_sso_config, create_sso_provider, OIDC_AVAILABLE
 from .system_config import SystemConfig
 from storage.rustfs_client import get_rustfs_client
 
+from .models import RegisterRequest, UserRole
+import hmac
+
 # 创建路由
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
 
 
 @router.post("/register", response_model=User, status_code=status.HTTP_201_CREATED)
-async def register(user_data: UserCreate, auth_db: AuthDB = Depends(get_auth_db)):
+def register(user_data: RegisterRequest, request: Request, auth_db: AuthDB = Depends(get_auth_db)):
     """
     用户注册
 
     创建新用户账户。默认角色为 'user'，需要管理员才能创建其他角色。
     """
+    config = SystemConfig(auth_db.db_path)
+    if config.get_config("allow_registration") == "false":
+        raise HTTPException(status_code=403, detail="Registration is disabled")
+    required = (config.get_config("registration_invite_code") or "").strip()
+    if required and not hmac.compare_digest((user_data.invite_code or "").strip().encode(), required.encode()):
+        raise HTTPException(status_code=403, detail="Invalid invite code")
     try:
-        user = auth_db.create_user(user_data)
+        values = user_data.model_dump(exclude={"invite_code"})
+        values["role"] = UserRole.USER
+        user = auth_db.create_user(UserCreate(**values))
+        request.state.audit_user = user
         logger.info(f"✅ User registered: {user.username} ({user.email})")
         return user
     except ValueError as e:
@@ -53,7 +65,7 @@ async def register(user_data: UserCreate, auth_db: AuthDB = Depends(get_auth_db)
 
 
 @router.post("/login", response_model=Token)
-async def login(credentials: UserLogin, auth_db: AuthDB = Depends(get_auth_db)):
+def login(credentials: UserLogin, request: Request, auth_db: AuthDB = Depends(get_auth_db)):
     """
     用户登录
 
@@ -79,9 +91,16 @@ async def login(credentials: UserLogin, auth_db: AuthDB = Depends(get_auth_db)):
         expires_delta=timedelta(minutes=JWT_EXPIRE_MINUTES),
     )
 
+    request.state.audit_user = user
     logger.info(f"✅ User logged in: {user.username}")
 
     return Token(access_token=access_token, token_type="bearer", expires_in=JWT_EXPIRE_MINUTES * 60)
+
+
+@router.post("/logout")
+def logout(current_user: User = Depends(get_current_active_user)):
+    """Record a voluntary client logout without changing existing JWT semantics."""
+    return {"success": True}
 
 
 @router.get("/me", response_model=User)
@@ -449,6 +468,7 @@ async def get_system_config():
             "system_logo": configs.get("system_logo", ""),
             "show_github_star": configs.get("show_github_star", "true") == "true",
             "allow_registration": configs.get("allow_registration", "true") == "true",
+            "registration_invite_required": bool((configs.get("registration_invite_code") or "").strip()),
         },
     }
 

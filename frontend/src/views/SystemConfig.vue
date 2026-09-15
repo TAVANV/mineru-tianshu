@@ -178,6 +178,7 @@
         </div>
       </div>
     </div>
+    <OptionalFeatures />
   </div>
 </template>
 
@@ -186,6 +187,7 @@ import { ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { getSystemConfig, updateSystemConfig, uploadSystemLogo, type SystemConfig } from '@/api'
 import { toast } from '@/utils/toast'
+import OptionalFeatures from '@/components/OptionalFeatures.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 
 const { t } = useI18n()

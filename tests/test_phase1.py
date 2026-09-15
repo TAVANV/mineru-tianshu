@@ -101,6 +101,8 @@ def test_reconciliation_and_retry_resume(db, monkeypatch):
     assert first not in queue.queued
     assert db.resume_task(first) and first in queue.queued
     queue.queued.pop(second)
+    with db.get_cursor() as cursor:
+        cursor.execute("UPDATE tasks SET status='failed' WHERE task_id=?", (second,))
     assert db.retry_task(second) and second in queue.queued
 
 

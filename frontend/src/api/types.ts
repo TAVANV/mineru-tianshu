@@ -36,6 +36,7 @@ export interface LoginResponse {
 
 // 注册请求
 export interface RegisterRequest {
+  invite_code?: string
   username: string
   email: string
   password: string
@@ -130,6 +131,7 @@ export type ParseMethod = 'auto' | 'txt' | 'ocr'
 
 // 任务配置选项 (对应数据库存储的 JSON 结构)
 export interface TaskOptions {
+  webhook_url?: string
   lang: Language
   method: ParseMethod
   formula_enable: boolean
@@ -180,6 +182,7 @@ export interface TaskOptions {
 
 // 任务提交请求 (前端 Form 表单数据)
 export interface SubmitTaskRequest {
+  webhook_url?: string
   file: File
   backend?: Backend
   lang?: Language
@@ -269,6 +272,7 @@ export interface Task {
   is_parent?: boolean
   child_count?: number
   child_completed?: number
+  subtasks?: { task_id: string; file_name?: string; status: TaskStatus; error_message?: string }[]
   subtask_progress?: {
     total: number
     completed: number
@@ -383,6 +387,7 @@ export interface EnginesResponse {
 
 // 系统配置
 export interface SystemConfig {
+  registration_invite_required?: boolean
   system_name: string
   system_logo: string
   show_github_star: boolean

@@ -12,6 +12,7 @@
 
       <div class="flex items-center gap-3">
         <template v-if="task">
+            <button v-if="['pending', 'processing', 'paused'].includes(task.status)" @click="initiateAction('cancel')" :disabled="actionLoading" class="btn btn-secondary btn-sm">{{ $t('task.cancelTask') }}</button>
             <button v-if="task.status === 'failed'" @click="initiateAction('retry')" :disabled="actionLoading" class="btn btn-white text-blue-600 border-gray-200 hover:bg-blue-50 btn-sm flex items-center shadow-sm transition-all disabled:opacity-50">
               <RotateCw :class="{'animate-spin': actionLoading && currentAction === 'retry'}" class="w-4 h-4 mr-1.5" />
               <span>重试任务</span>
@@ -47,13 +48,22 @@
          <div class="card p-10 text-center shadow-sm">
             <h2 class="text-xl font-semibold text-gray-900 mb-2">处理中...</h2>
             <div class="mt-8 flex justify-center"><LoadingSpinner size="lg" /></div>
+            <div v-if="task.subtask_progress" class="mt-4 space-y-2 text-sm">
+              <p>{{ task.subtask_progress.completed }} / {{ task.subtask_progress.total }} ({{ task.subtask_progress.percentage }}%)</p>
+              <progress :value="task.subtask_progress.completed" :max="task.subtask_progress.total" class="w-full" />
+              <ul class="max-h-64 overflow-auto text-left divide-y">
+                <li v-for="child in task.subtasks" :key="child.task_id" class="py-2 flex justify-between gap-3">
+                  <span class="truncate">{{ child.file_name || child.task_id }}</span><StatusBadge :status="child.status" />
+                </li>
+              </ul>
+            </div>
          </div>
       </div>
       <div v-else-if="['failed', 'cancelled'].includes(task.status)" class="max-w-3xl mx-auto mt-10 space-y-6 px-4">
          <div class="card p-8 text-center border-red-100 bg-red-50/50">
             <div class="flex justify-center mb-4"><div class="p-3 bg-red-100 rounded-full text-red-500"><AlertCircle class="w-8 h-8" /></div></div>
-            <h2 class="text-xl font-semibold text-red-700 mb-2">任务失败</h2>
-            <div class="text-red-600 bg-white p-4 rounded-lg border border-red-200 font-mono text-sm text-left overflow-auto max-h-64 break-all shadow-sm">{{ task.error_message || '未知错误' }}</div>
+            <h2 class="text-xl font-semibold text-red-700 mb-2">{{ task.status === 'cancelled' ? $t('task.cancelledLabel') : '任务失败' }}</h2>
+            <div class="text-red-600 bg-white p-4 rounded-lg border border-red-200 font-mono text-sm text-left overflow-auto max-h-64 break-all shadow-sm">{{ task.status === 'cancelled' ? $t('task.cancelledHelp') : task.error_message || '未知错误' }}</div>
          </div>
       </div>
 
@@ -323,11 +333,13 @@ const showConfirm = ref(false)
 const confirmTitle = ref('')
 const confirmMessage = ref('')
 const confirmType = ref<'info' | 'warning' | 'danger'>('info')
-const currentAction = ref<'retry' | 'clearCache' | 'delete' | null>(null)
+const currentAction = ref<'retry' | 'clearCache' | 'delete' | 'cancel' | null>(null)
 
-function initiateAction(action: 'retry' | 'clearCache' | 'delete') {
+function initiateAction(action: 'retry' | 'clearCache' | 'delete' | 'cancel') {
   currentAction.value = action
-  if (action === 'retry') {
+  if (action === 'cancel') {
+    confirmTitle.value = t('task.cancelTask'); confirmMessage.value = t('task.cancelGroupConfirm'); confirmType.value = 'warning'
+  } else if (action === 'retry') {
     confirmTitle.value = '重试任务'; confirmMessage.value = '确定重试吗？'; confirmType.value = 'info'
   } else if (action === 'clearCache') {
     confirmTitle.value = '清理缓存'; confirmMessage.value = '确定清理吗？'; confirmType.value = 'warning'
@@ -341,7 +353,9 @@ async function executeAction() {
   if (!currentAction.value) return
   actionLoading.value = true
   try {
-    if (currentAction.value === 'retry') {
+    if (currentAction.value === 'cancel') {
+      await taskStore.cancelTask(taskId.value); await refreshTask();
+    } else if (currentAction.value === 'retry') {
       await taskStore.retryTask(taskId.value); await refreshTask(); startPolling();
     } else if (currentAction.value === 'clearCache') {
       await taskStore.clearTaskCache(taskId.value); await refreshTask();

@@ -306,6 +306,18 @@ class RedisTaskQueue:
             logger.error(f"❌ Failed to prune processing set: {e}")
             return 0
 
+    def remove_tasks(self, task_ids):
+        if not task_ids:
+            return
+        try:
+            pipe = self.client.pipeline()
+            pipe.zrem(self.config.queue_key, *task_ids)
+            pipe.hdel(self.config.processing_key, *task_ids)
+            pipe.delete(*(f"{self.config.task_data_prefix}{tid}" for tid in task_ids))
+            pipe.execute()
+        except Exception as e:
+            logger.warning(f"Redis cancellation cleanup deferred: {type(e).__name__}")
+
     def heartbeat(self, task_id: str, worker_id: str) -> bool:
         """
         更新任务心跳

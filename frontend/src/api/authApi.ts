@@ -115,3 +115,8 @@ export async function getSSOStatus(): Promise<{ enabled: boolean; type: string |
   )
   return response.data
 }
+
+/** Best-effort logout audit; local logout must remain immediate. */
+export async function recordLogout(token: string): Promise<void> {
+  await apiClient.post('/api/v1/auth/logout', {}, { headers: { Authorization: `Bearer ${token}` } })
+}
