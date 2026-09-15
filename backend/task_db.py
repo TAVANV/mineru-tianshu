@@ -71,8 +71,22 @@ class TaskDB:
               2. 连接使用完立即关闭（在 get_cursor 上下文管理器中）
               3. 不使用连接池，避免线程间共享同一连接
             - timeout=30.0 防止死锁，如果锁等待超过30秒会抛出异常
+
+        WAL 说明：
+            默认的 rollback journal 模式下，一次写会独占整个数据库文件，连读也被阻塞。
+            worker 持续写任务状态时，API 侧所有查询都会排队等锁 —— 而这些查询是在
+            事件循环里同步执行的，一旦等锁就会冻结整个 API 服务。
+            WAL 让读写互不阻塞，是本项目并发模型下的必需项。
+
+            journal_mode 是持久化在数据库文件里的属性，设置一次即长期生效，
+            每次连接重复设置无副作用。注意 WAL 不支持网络文件系统（NFS/CIFS），
+            数据库需放在本地盘上。
         """
         conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        # 保留原有提交持久性，避免为提速降低断电后的任务恢复保障。
+        conn.execute("PRAGMA synchronous=FULL")
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -197,6 +211,50 @@ class TaskDB:
             except Exception as e:
                 logger.warning(f"⚠️  Failed to enqueue to Redis, SQLite fallback active: {e}")
         return False
+
+    def sync_pending_to_redis(self) -> int:
+        """把 SQLite 里的 pending 任务补回 Redis 队列，返回补入的数量
+
+        Redis 只是加速层，SQLite 才是真相源。二者会在这些情况下发散：
+          - Redis 重启且数据卷被清空 / AOF 损坏 / key 被淘汰
+          - 入队时 Redis 短暂不可用（create 只记 warning 就继续）
+          - worker 在 BZPOPMIN 之后、SQLite 认领之前被杀
+
+        发散不会丢任务（get_next_task 找不到 Redis 任务时会回落到 SQLite 抢锁路径），
+        但那批任务从此绕开 Redis，恰好退化成我们要避免的锁竞争。这里做定期对账。
+
+        只补差集，不整体重入：enqueue 的 score 含时间戳，重复 ZADD 会刷新 score，
+        把同优先级下的 FIFO 顺序打乱。
+        """
+        if not REDIS_QUEUE_AVAILABLE:
+            return 0
+
+        redis_queue = get_redis_queue()
+        if not redis_queue:
+            return 0
+
+        queued = redis_queue.get_queued_ids()
+        if queued is None:
+            # 读不到队列时宁可不动，也好过误判成空队列后全量重入
+            return 0
+
+        synced = 0
+        with self.get_cursor() as cursor:
+            # 与 worker 的 SQLite 认领串行，防止清掉刚认领任务的 processing 记录。
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("SELECT task_id, priority, file_name, backend FROM tasks WHERE status = 'pending'")
+            pending = cursor.fetchall()
+            redis_queue.prune_processing([row["task_id"] for row in pending])
+        for row in pending:
+            if row["task_id"] not in queued:
+                synced += bool(
+                    self._enqueue_to_redis(
+                        row["task_id"],
+                        row["priority"],
+                        {"file_name": row["file_name"], "backend": row["backend"]},
+                    )
+                )
+        return synced
 
     def get_next_task(self, worker_id: str, max_retries: int = 3) -> Optional[Dict]:
         """
@@ -426,7 +484,7 @@ class TaskDB:
             if not success and status in ["completed", "failed"]:
                 from loguru import logger
 
-                logger.debug(f"Status update failed: task_id={task_id}, status={status}, " f"worker_id={worker_id}")
+                logger.debug(f"Status update failed: task_id={task_id}, status={status}, worker_id={worker_id}")
 
             # 通知 Redis 任务完成/失败（清理 processing set）
             if success and status in ["completed", "failed"]:
@@ -984,7 +1042,77 @@ class TaskDB:
             )
 
         logger.debug(f"📄 Created child task: {task_id} (parent: {parent_task_id})")
+        self._enqueue_to_redis(task_id, priority, {"file_name": file_name, "backend": backend})
         return task_id
+
+    def create_child_tasks_bulk(
+        self,
+        parent_task_id: str,
+        children: List[Dict],
+        backend: str = "pipeline",
+        priority: int = 0,
+        user_id: str = None,
+    ) -> List[str]:
+        """批量创建子任务（单事务）
+
+        逐个调用 create_child_task 会为每个子任务开一个独立的写事务，并且每次都要
+        更新同一个父任务行。PDF 按小页数切片时子任务可达上百个，那就是上百个背靠背
+        的写事务 —— 期间 API 侧的查询会反复撞上锁等待。这里合并为一个事务：
+        N 次 INSERT + 1 次父计数更新。
+
+        Args:
+            parent_task_id: 父任务 ID
+            children: [{"file_name": str, "file_path": str, "options": dict}, ...]
+            backend / priority / user_id: 所有子任务共用
+
+        Returns:
+            按入参顺序返回的子任务 ID 列表
+        """
+        if not children:
+            return []
+
+        task_ids = [str(uuid.uuid4()) for _ in children]
+
+        with self.get_cursor() as cursor:
+            cursor.executemany(
+                """
+                INSERT INTO tasks (
+                    task_id, parent_task_id, file_name, file_path,
+                    backend, options, status, priority, user_id
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+                [
+                    (
+                        task_id,
+                        parent_task_id,
+                        child["file_name"],
+                        child["file_path"],
+                        backend,
+                        json.dumps(child.get("options") or {}),
+                        priority,
+                        user_id,
+                    )
+                    for task_id, child in zip(task_ids, children)
+                ],
+            )
+
+            # 父任务的子任务计数一次性累加，而不是每个子任务更新一次
+            cursor.execute(
+                """
+                UPDATE tasks
+                SET child_count = child_count + ?
+                WHERE task_id = ?
+            """,
+                (len(children), parent_task_id),
+            )
+
+        # 入队放在事务提交之后：worker 一旦从 Redis 取到 ID 就会立刻回查 SQLite，
+        # 提交前入队会让它查不到行。
+        for task_id, child in zip(task_ids, children):
+            self._enqueue_to_redis(task_id, priority, {"file_name": child["file_name"], "backend": backend})
+
+        logger.debug(f"📄 Created {len(task_ids)} child tasks in one transaction (parent: {parent_task_id})")
+        return task_ids
 
     def on_child_task_completed(self, child_task_id: str) -> Optional[str]:
         """子任务完成回调"""
@@ -1156,7 +1284,30 @@ class TaskDB:
                 """,
                 (task_id,),
             )
-            return cursor.rowcount > 0
+            ok = cursor.rowcount > 0
+
+        if ok:
+            self._requeue_pending(task_id)
+        return ok
+
+    def _requeue_pending(self, task_id: str):
+        """把一个已经置回 pending 的任务重新放进 Redis 队列
+
+        不入队也不会丢任务（SQLite 抢锁路径兜底），但那样就绕开了 Redis，
+        正是我们要避免的锁竞争路径。在事务提交后调用。
+        """
+        if not REDIS_QUEUE_AVAILABLE:
+            return
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                "SELECT task_id, priority, file_name, backend FROM tasks WHERE task_id = ? AND status = 'pending'",
+                (task_id,),
+            )
+            row = cursor.fetchone()
+        if row:
+            self._enqueue_to_redis(
+                row["task_id"], row["priority"], {"file_name": row["file_name"], "backend": row["backend"]}
+            )
 
     def pause_task(self, task_id: str) -> bool:
         """
@@ -1186,7 +1337,11 @@ class TaskDB:
                 """,
                 (task_id,),
             )
-            return cursor.rowcount > 0
+            ok = cursor.rowcount > 0
+
+        if ok:
+            self._requeue_pending(task_id)
+        return ok
 
     def clear_task_cache(self, task_id: str) -> bool:
         """

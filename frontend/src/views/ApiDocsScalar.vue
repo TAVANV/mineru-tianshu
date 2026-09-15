@@ -264,7 +264,7 @@ function translateOpenApiSpec(spec: any, lang: string): any {
 // 加载并翻译 OpenAPI 规范
 async function loadOpenApiSpec() {
   try {
-    const response = await fetch(`${window.location.origin}/api/openapi.json`)
+    const response = await fetch(`${window.location.origin}/api/v1/openapi.json`)
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`)
     }
@@ -328,7 +328,7 @@ const scalarConfig = computed(() => ({
   // 服务器配置 - 提供前端代理和后端直连两种方式
   servers: [
     {
-      url: window.location.origin + '/api',
+      url: window.location.origin,
       description: '通过前端代理访问（推荐）',
     },
     {

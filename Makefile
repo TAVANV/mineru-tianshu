@@ -208,8 +208,8 @@ health: ## 检查所有服务健康状态
 backup-db: ## 备份数据库
 	@echo "$(BLUE)[INFO]$(NC) 备份数据库..."
 	@mkdir -p backups
-	@$(COMPOSE_CMD) exec -T backend cp mineru_tianshu.db mineru_tianshu.db.backup
-	@docker cp tianshu-backend:/app/backend/mineru_tianshu.db.backup ./backups/mineru_tianshu_$$(date +%Y%m%d_%H%M%S).db
+	@$(COMPOSE_CMD) exec -T backend python /app/backend/backup_db.py /tmp/mineru_tianshu.db.backup
+	@$(COMPOSE_CMD) cp backend:/tmp/mineru_tianshu.db.backup ./backups/mineru_tianshu_$$(date +%Y%m%d_%H%M%S).db
 	@echo "$(GREEN)[OK]$(NC) 数据库备份完成"
 
 clean: ## 清理所有数据（危险操作！）

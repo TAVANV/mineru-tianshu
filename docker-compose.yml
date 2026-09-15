@@ -21,7 +21,7 @@ services:
       - /etc/timezone:/etc/timezone:ro
     environment:
       - TZ=Asia/Shanghai
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
     networks:
       - tianshu-network
 
@@ -74,8 +74,6 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
-      cache_from:
-        - tianshu-backend:latest
     image: tianshu-backend:latest
     container_name: tianshu-backend
     user: root
@@ -363,8 +361,6 @@ services:
     build:
       context: .
       dockerfile: frontend/Dockerfile
-      cache_from:
-        - tianshu-frontend:latest
     image: tianshu-frontend:latest
     container_name: tianshu-frontend
     restart: unless-stopped

@@ -87,11 +87,11 @@ class RedisTaskQueue:
             raise RuntimeError("redis package not installed. Run: pip install redis")
 
         self.config = config or RedisConfig.from_env()
-        self._client: Optional[redis.Redis] = None
+        self._client: Optional["redis.Redis"] = None
         self._connected = False
 
     @property
-    def client(self) -> redis.Redis:
+    def client(self) -> "redis.Redis":
         """获取 Redis 客户端（延迟连接）"""
         if self._client is None:
             self._client = redis.Redis(
@@ -143,7 +143,7 @@ class RedisTaskQueue:
             pipe = self.client.pipeline()
 
             # 添加到优先级队列
-            pipe.zadd(self.config.queue_key, {task_id: score})
+            pipe.zadd(self.config.queue_key, {task_id: score}, nx=True)
 
             # 存储任务数据（可选，用于快速访问）
             if task_data:
@@ -277,6 +277,34 @@ class RedisTaskQueue:
         except Exception as e:
             logger.error(f"❌ Failed to mark task {task_id} as failed: {e}")
             return False
+
+    def get_queued_ids(self) -> Optional[set]:
+        """返回队列中现存的全部 task_id
+
+        用于与 SQLite 对账。返回 None 表示 Redis 读取失败，调用方应放弃本次对账
+        而不是把它当成空队列 —— 否则会把整个待处理队列重新入队。
+        """
+        try:
+            members = self.client.zrange(self.config.queue_key, 0, -1)
+            return {m.decode() if isinstance(m, bytes) else m for m in members}
+        except Exception as e:
+            logger.error(f"❌ Failed to read queue members: {e}")
+            return None
+
+    def prune_processing(self, task_ids) -> int:
+        """从 processing 集合中移除指定任务
+
+        worker 在 BZPOPMIN 之后、SQLite 认领之前被杀，会在 processing 里留下永不
+        清理的残留条目。对账时按 SQLite 的真实状态清掉它们。
+        """
+        task_ids = list(task_ids)
+        if not task_ids:
+            return 0
+        try:
+            return int(self.client.hdel(self.config.processing_key, *task_ids))
+        except Exception as e:
+            logger.error(f"❌ Failed to prune processing set: {e}")
+            return 0
 
     def heartbeat(self, task_id: str, worker_id: str) -> bool:
         """
@@ -443,12 +471,10 @@ def get_redis_queue() -> Optional[RedisTaskQueue]:
         try:
             _queue_instance = RedisTaskQueue()
             if _queue_instance.is_available():
-                logger.info(
-                    f"✅ Redis queue connected: " f"{_queue_instance.config.host}:{_queue_instance.config.port}"
-                )
+                logger.info(f"✅ Redis queue connected: {_queue_instance.config.host}:{_queue_instance.config.port}")
             else:
                 logger.warning("⚠️  Redis queue not available, falling back to SQLite")
-                _queue_instance = False  # 标记为已检查且不可用
+                # 保留客户端：启动时 Redis 暂不可用，恢复后对账仍能通过同一连接池补队列。
         except Exception as e:
             logger.error(f"❌ Failed to initialize Redis queue: {e}")
             _queue_instance = False  # 标记为已检查且初始化失败

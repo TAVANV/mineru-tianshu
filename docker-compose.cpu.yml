@@ -62,8 +62,6 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile.cpu
-      cache_from:
-        - tianshu-backend-cpu:latest
     image: tianshu-backend-cpu:latest
     container_name: tianshu-backend-cpu
     platform: linux/amd64
@@ -170,8 +168,6 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile.cpu
-      cache_from:
-        - tianshu-backend-cpu:latest
     image: tianshu-backend-cpu:latest
     container_name: tianshu-worker-cpu
     platform: linux/amd64
@@ -283,8 +279,6 @@ services:
     build:
       context: .
       dockerfile: frontend/Dockerfile
-      cache_from:
-        - tianshu-frontend:latest
     image: tianshu-frontend:latest
     container_name: tianshu-frontend-cpu
     platform: linux/amd64

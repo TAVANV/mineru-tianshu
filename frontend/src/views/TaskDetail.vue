@@ -26,7 +26,7 @@
             </button>
         </template>
 
-        <div v-if="task?.status === 'completed' && pdfUrl && task?.result_path !== 'CLEARED'" class="flex items-center bg-gray-100 rounded-lg p-1">
+        <div v-if="task?.status === 'completed' && (pdfUrl || imageUrl) && task?.result_path !== 'CLEARED'" class="flex items-center bg-gray-100 rounded-lg p-1">
           <button @click="setMode('single')" :class="['px-3 py-1.5 text-xs font-medium rounded-md transition-all flex items-center', layoutMode === 'single' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700']">
             <FileText class="w-3.5 h-3.5 mr-1.5" /> 单栏视图
           </button>
@@ -61,11 +61,13 @@
 
         <div v-if="showPdf" :class="['card p-0 flex flex-col h-full border border-gray-200 relative shadow-sm min-w-0 transition-all duration-300', layoutMode === 'split' ? 'flex-1 basis-1/2' : 'flex-1 basis-full']">
           <div class="bg-gray-50 px-3 py-2 border-b border-gray-200 flex justify-between items-center shrink-0">
-            <span class="text-xs font-semibold text-gray-500 uppercase tracking-wider">源文档预览 (悬浮出现互动热区)</span>
+            <span class="text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ imageUrl ? '源图片预览' : '源文档预览 (悬浮出现互动热区)' }}</span>
           </div>
 
-          <div class="flex-1 relative overflow-hidden min-h-0 bg-gray-200">
+          <div class="flex-1 relative overflow-auto min-h-0 bg-gray-200">
+            <img v-if="imageUrl" :src="imageUrl" :alt="task.file_name" class="max-w-full h-auto mx-auto" />
             <VirtualPdfViewer
+              v-if="!imageUrl && pdfUrl"
               ref="pdfViewerRef"
               :src="pdfUrl"
               :layout-data="layoutData"
@@ -173,8 +175,10 @@ const activeBlockId = ref<string | number | null>(null)
 const pdfViewerRef = ref<InstanceType<typeof VirtualPdfViewer> | null>(null)
 
 const pdfUrl = computed(() => task.value?.data?.pdf_path ? `/api/v1/files/output/${task.value.data.pdf_path}` : null)
-const showPdf = computed(() => layoutMode.value === 'split' || (layoutMode.value === 'single' && pdfUrl.value))
-const showMarkdown = computed(() => layoutMode.value === 'split' || layoutMode.value !== 'single')
+const imageUrl = computed(() => /\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(task.value?.file_name || '')
+  ? task.value?.source_url || null : null)
+const showPdf = computed(() => Boolean(imageUrl.value || pdfUrl.value))
+const showMarkdown = computed(() => layoutMode.value === 'split' || !showPdf.value)
 
 const layoutData = computed(() => {
   const jsonContent = task.value?.data?.json_content

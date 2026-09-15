@@ -175,6 +175,14 @@ class TaskScheduler:
                         except Exception as e:
                             logger.error(f"Failed to reset stale tasks: {e}")
 
+                    # SQLite 为准，补回 Redis 重启或入队失败遗漏的任务。
+                    try:
+                        resynced = await asyncio.to_thread(self.db.sync_pending_to_redis)
+                        if resynced:
+                            logger.warning(f"🔄 Re-enqueued {resynced} pending task(s) into Redis")
+                    except Exception as e:
+                        logger.error(f"Failed to resync Redis queue: {e}")
+
                     # 4. 定期清理旧任务文件
                     cleanup_counter += 1
                     # 每24小时清理一次

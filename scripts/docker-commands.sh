@@ -127,7 +127,7 @@ docker-compose exec backend df -h
 # ============================================================================
 
 # Backup database
-docker-compose exec backend cp mineru_tianshu.db mineru_tianshu.db.backup
+docker-compose exec -T backend python /app/backend/backup_db.py /tmp/mineru_tianshu.db.backup
 
 # Copy file from host to container
 docker cp local_file.txt mineru-backend:/app/

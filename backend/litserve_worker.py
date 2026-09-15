@@ -1138,23 +1138,26 @@ class MinerUWorkerAPI(ls.LitAPI):
 
             chunks = split_pdf_file(Path(file_path), split_dir, chunk_size, task_id)
 
+            children = []
             for chunk in chunks:
                 c_ops = options.copy()
                 c_ops["chunk_info"] = {k: chunk[k] for k in ["start_page", "end_page", "page_count"]}
-                self.task_db.create_child_task(
-                    parent_task_id=task_id,
-                    file_name=f"{Path(file_path).stem}_p{chunk['start_page']}-{chunk['end_page']}.pdf",
-                    file_path=chunk["path"],
-                    backend=task.get("backend", "auto"),
-                    options=c_ops,
-                    priority=task.get("priority", 0),
-                    user_id=task.get("user_id"),
+                children.append(
+                    {
+                        "file_name": f"{Path(file_path).stem}_p{chunk['start_page']}-{chunk['end_page']}.pdf",
+                        "file_path": chunk["path"],
+                        "options": c_ops,
+                    }
                 )
 
-            # 注意：不再二次调用 convert_to_parent_task。
-            # child_count 已由上面每次 create_child_task 累加到 len(chunks)；
-            # 二次调用会重置 child_completed=0，在多 Worker 场景下可能把
-            # 已完成子任务的计数误清零，导致父任务永远无法触发合并。
+            self.task_db.create_child_tasks_bulk(
+                parent_task_id=task_id,
+                children=children,
+                backend=task.get("backend", "auto"),
+                priority=task.get("priority", 0),
+                user_id=task.get("user_id"),
+            )
+            # 批量事务一次设置完整计数；不能再次初始化父任务，否则会清掉已完成计数。
             logger.info(f"✂️  Split into {len(chunks)} subtasks")
             return True
         except Exception as e:

@@ -29,7 +29,7 @@ def get_auth_db() -> AuthDB:
     return _auth_db
 
 
-async def get_current_user_from_token(
+def get_current_user_from_token(
     credentials: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
     auth_db: AuthDB = Depends(get_auth_db),
 ) -> Optional[User]:
@@ -56,7 +56,7 @@ async def get_current_user_from_token(
     return user
 
 
-async def get_current_user_from_apikey(
+def get_current_user_from_apikey(
     api_key: Optional[str] = Security(api_key_header),
     auth_db: AuthDB = Depends(get_auth_db),
 ) -> Optional[User]:

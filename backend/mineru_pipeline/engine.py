@@ -304,7 +304,7 @@ class MinerUPipelineEngine:
             if file_ext in [".png", ".jpg", ".jpeg"]:
                 logger.info("🖼️  Converting image to PDF...")
                 try:
-                    pdf_bytes = img2pdf.convert(file_bytes)
+                    pdf_bytes = img2pdf.convert(file_bytes, rotation=img2pdf.Rotation.ifvalid)
                 except Exception as e:
                     raise ValueError(f"Image conversion failed: {e}")
                 safe_file_name = "result.pdf"
