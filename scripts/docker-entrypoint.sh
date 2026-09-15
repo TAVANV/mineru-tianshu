@@ -86,10 +86,23 @@ setup_mineru_config() {
     # 该文件由 download_models.py 生成到共享卷 /app/models 中
     CONFIG_SRC="/app/models/mineru.json"
     CONFIG_FILENAME="${MINERU_TOOLS_CONFIG_JSON:-mineru.json}"
-    CONFIG_DEST="/root/${CONFIG_FILENAME}"
+    CONFIG_DEST="${TIANSHU_RUNTIME_HOME:-$HOME}/${CONFIG_FILENAME}"
 
     if [ -f "$CONFIG_SRC" ]; then
         cp "$CONFIG_SRC" "${CONFIG_DEST}"
+        python - "${CONFIG_DEST}" <<'PYCONFIG'
+import json, sys, os
+from pathlib import Path
+path = Path(sys.argv[1])
+config = json.loads(path.read_text())
+if config.get("models-dir", {}).get("pipeline") == "/app/models/PDF-Extract-Kit-1.0/models":
+    config["models-dir"]["pipeline"] = "/app/models/PDF-Extract-Kit-1.0"
+config.setdefault("model-source", "local")
+if os.getenv("MODEL_DOWNLOAD_SOURCE") == "local":
+    config["model-source"] = "local"
+config["config_version"] = "1.3.2"
+path.write_text(json.dumps(config, ensure_ascii=False, indent=4))
+PYCONFIG
         log_success "mineru.json distributed to ${CONFIG_DEST}"
     else
         if [ "${MODEL_DOWNLOAD_SOURCE:-auto}" = "local" ]; then
@@ -166,17 +179,23 @@ check_models() {
         failed=1
     fi
 
-    if [ -d "$MODEL_PATH/MinerU2.5-2509-1.2B" ]; then
+    if [ "${TIANSHU_DEPLOY_MODE:-full}" = "pipeline" ]; then
+        if [ "$offline_mode" -eq 1 ] && [ "$failed" -ne 0 ]; then exit 1; fi
+        return 0
+    fi
+    local vlm_path
+    vlm_path=$(python -c 'from model_layout import active_vlm_path; print(active_vlm_path())')
+    if [ -d "$vlm_path" ]; then
         log_success "MinerU VLM model found"
     else
-        log_warning "MinerU VLM model not found at $MODEL_PATH/MinerU2.5-2509-1.2B"
+        log_warning "MinerU VLM model not found at $vlm_path"
         failed=1
     fi
 
-    if [ -d "/root/.paddlex/official_models/PaddleOCR-VL-1.5-0.9B" ]; then
+    if [ -d "${PADDLEX_HOME:-/root/.paddlex}/official_models/PaddleOCR-VL-1.5-0.9B" ]; then
         log_success "PaddleOCR-VL model found"
     else
-        log_warning "PaddleOCR-VL model not found at /root/.paddlex/official_models/PaddleOCR-VL-1.5-0.9B"
+        log_warning "PaddleOCR-VL model not found at ${PADDLEX_HOME:-/root/.paddlex}/official_models/PaddleOCR-VL-1.5-0.9B"
         failed=1
     fi
 

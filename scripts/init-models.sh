@@ -60,17 +60,28 @@ main() {
     require_path "/app/models/PDF-Extract-Kit-1.0/models" "MinerU pipeline models" || failed=1
     require_path "/app/models/PDF-Extract-Kit-1.0/models/Layout/PP-DocLayoutV2/model.safetensors" "MinerU layout checkpoint" || failed=1
     require_path "/app/models/PDF-Extract-Kit-1.0/models/MFR/unimernet_hf_small_2503/model.safetensors" "MinerU MFR checkpoint" || failed=1
-    require_path "/app/models/PDF-Extract-Kit-1.0/models/OCR/paddleocr_torch/ch_PP-OCRv5_det_infer.pth" "MinerU OCR detection checkpoint" || failed=1
-    require_path "/app/models/PDF-Extract-Kit-1.0/models/OCR/paddleocr_torch/ch_PP-OCRv5_rec_infer.pth" "MinerU OCR recognition checkpoint" || failed=1
-    require_path "/app/models/MinerU2.5-2509-1.2B" "MinerU VLM model" || failed=1
-    require_path "/root/.paddlex/official_models/PaddleOCR-VL-1.5-0.9B" "PaddleOCR-VL 1.5 model" || failed=1
-    require_path "/root/.paddlex/official_models/PP-DocLayoutV3" "PaddleOCR-VL layout model" || failed=1
+    require_path "/app/models/PDF-Extract-Kit-1.0/models/OCR/paddleocr_torch/ch_PP-OCRv6_small_det_infer.safetensors" "MinerU OCR detection checkpoint" || failed=1
+    require_path "/app/models/PDF-Extract-Kit-1.0/models/OCR/paddleocr_torch/ch_PP-OCRv6_small_rec_infer.safetensors" "MinerU OCR recognition checkpoint" || failed=1
+    require_path "/app/models/PDF-Extract-Kit-1.0/models/OCR/paddleocr_torch/ch_PP-OCRv6_medium_rec_infer.safetensors" "MinerU OCR medium/seal checkpoint" || failed=1
+    require_path "/app/models/PDF-Extract-Kit-1.0/models/TabRec/SlanetPlus/slanet-plus.onnx" "MinerU table model" || failed=1
+    require_path "/app/models/PDF-Extract-Kit-1.0/models/TabRec/UnetStructure/unet.onnx" "MinerU table structure" || failed=1
+    require_path "/app/models/PDF-Extract-Kit-1.0/models/TabCls/paddle_table_cls/PP-LCNet_x1_0_table_cls.onnx" "MinerU table classifier" || failed=1
+    if [ "${TIANSHU_DEPLOY_MODE:-full}" = "pipeline" ]; then
+        [ "$failed" -eq 0 ] || exit 1
+        log_success "Pipeline-only model validation passed"
+        return
+    fi
+    local vlm_path
+    vlm_path=$(python -c 'from model_layout import active_vlm_path; print(active_vlm_path())')
+    require_path "$vlm_path" "MinerU VLM model" || failed=1
+    require_path "${PADDLEX_HOME:-/root/.paddlex}/official_models/PaddleOCR-VL-1.5-0.9B" "PaddleOCR-VL 1.5 model" || failed=1
+    require_path "${PADDLEX_HOME:-/root/.paddlex}/official_models/PP-DocLayoutV3" "PaddleOCR-VL layout model" || failed=1
     require_path "/app/models/SenseVoiceSmall" "SenseVoiceSmall audio model" || failed=1
     require_path "/app/models/speech_fsmn_vad_zh-cn-16k-common-pytorch" "FSMN VAD audio model" || failed=1
 
-    optional_path "/root/.paddlex/official_models/PP-LCNet_x1_0_doc_ori" "Paddle document orientation classifier"
-    optional_path "/root/.paddlex/official_models/UVDoc" "Paddle document unwarping model"
-    optional_path "/root/.paddlex/fonts/simfang.ttf" "PaddleX visualization font"
+    optional_path "${PADDLEX_HOME:-/root/.paddlex}/official_models/PP-LCNet_x1_0_doc_ori" "Paddle document orientation classifier"
+    optional_path "${PADDLEX_HOME:-/root/.paddlex}/official_models/UVDoc" "Paddle document unwarping model"
+    optional_path "${PADDLEX_HOME:-/root/.paddlex}/fonts/simfang.ttf" "PaddleX visualization font"
     optional_path "/app/models/Paraformer" "Paraformer speaker diarization model"
     optional_path "/app/models/punc_ct-transformer_zh-cn-common-vocab272727-pytorch" "CT punctuation model"
     optional_path "/app/models/speech_campplus_sv_zh-cn_16k-common" "CAM++ speaker model"

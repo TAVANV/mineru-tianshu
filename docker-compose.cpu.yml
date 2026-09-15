@@ -62,6 +62,10 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile.cpu
+      args:
+        PIP_MIRROR: ${PIP_MIRROR:-https://mirrors.aliyun.com/pypi/simple/}
+        PIP_TIMEOUT: ${PIP_TIMEOUT:-600}
+        PIP_RETRIES: ${PIP_RETRIES:-10}
     image: tianshu-backend-cpu:latest
     container_name: tianshu-backend-cpu
     platform: linux/amd64
@@ -99,6 +103,7 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
 
       # JWT 认证
+      - UPLOAD_VALIDATE_CONTENT=${UPLOAD_VALIDATE_CONTENT:-false}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
       - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
@@ -119,6 +124,7 @@ services:
 
       # 模型路径
       - MODEL_PATH=/app/models
+      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - OUTPUT_PATH=/app/data/output
       - UPLOAD_PATH=/app/data/uploads
 
@@ -168,6 +174,10 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile.cpu
+      args:
+        PIP_MIRROR: ${PIP_MIRROR:-https://mirrors.aliyun.com/pypi/simple/}
+        PIP_TIMEOUT: ${PIP_TIMEOUT:-600}
+        PIP_RETRIES: ${PIP_RETRIES:-10}
     image: tianshu-backend-cpu:latest
     container_name: tianshu-worker-cpu
     platform: linux/amd64
@@ -213,6 +223,7 @@ services:
 
       # 模型路径
       - MODEL_PATH=/app/models
+      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - OUTPUT_PATH=/app/data/output
       - UPLOAD_PATH=/app/data/uploads
 

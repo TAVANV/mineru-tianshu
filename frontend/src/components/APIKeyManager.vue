@@ -1,5 +1,6 @@
 <template>
   <div class="space-y-6">
+    <KeyWebhookDialog v-if="webhookTarget" :key-id="webhookTarget.key_id" :key-name="webhookTarget.name" @close="webhookTarget = null" @saved="loadAPIKeys" />
     <!-- 标题和创建按钮 -->
     <div class="flex justify-between items-center">
       <h3 class="text-lg font-semibold text-gray-900">{{ $t('apiKey.title') }}</h3>
@@ -31,6 +32,7 @@
           <div class="flex-1">
             <div class="flex items-center gap-3">
               <h4 class="text-base font-medium text-gray-900">{{ key.name }}</h4>
+              <span v-if="key.webhook_enabled" class="text-xs text-primary-600">{{ $t('apiKey.webhookTitle') }}</span>
               <span
                 :class="isExpired(key.expires_at) ? 'bg-red-100 text-red-800' : 'bg-green-100 text-green-800'"
                 class="px-2 py-0.5 text-xs font-medium rounded"
@@ -55,6 +57,10 @@
             </div>
           </div>
 
+          <button @click="webhookTarget = key" class="ml-4 p-2 text-primary-600 hover:bg-blue-50 rounded-lg" :title="$t('apiKey.webhookTitle')">
+            <Webhook class="w-4 h-4" />
+            <span class="sr-only">{{ $t('apiKey.webhookTitle') }}</span>
+          </button>
           <button
             @click="confirmDelete(key)"
             class="ml-4 p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
@@ -196,7 +202,8 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { Key, Calendar, Clock, Trash2, CheckCircle, Copy } from 'lucide-vue-next'
+import KeyWebhookDialog from './KeyWebhookDialog.vue'
+import { Webhook, Key, Calendar, Clock, Trash2, CheckCircle, Copy } from 'lucide-vue-next'
 import * as authApi from '@/api/authApi'
 import type { APIKeyResponse } from '@/api/types'
 import { formatDate } from '@/utils/format'
@@ -210,6 +217,7 @@ const creating = ref(false)
 const apiKeys = ref<any[]>([])
 const showCreateDialog = ref(false)
 const newToken = ref<string | null>(null)
+const webhookTarget = ref<any | null>(null)
 const deleteTarget = ref<any | null>(null)
 
 const scopePreset = ref('all')

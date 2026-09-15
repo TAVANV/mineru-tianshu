@@ -69,6 +69,8 @@ export interface APIKeyResponse {
 
 // API Key 信息 (列表项)
 export interface APIKeyInfo {
+  webhook_enabled?: boolean | number
+  webhook_url?: string
   key_id: string
   name: string
   prefix: string
@@ -229,6 +231,7 @@ export interface SubmitTaskRequest {
 
   // Office 转换参数
   convert_office_to_pdf?: boolean
+  office_parser?: 'compatible' | 'mineru'
 
   // 任务级 RustFS 对象存储开关
   // undefined=跟随 RUSTFS_ENABLED 环境变量(向后兼容); true=强制上传图片到对象存储; false=保留图片在本地
@@ -408,3 +411,34 @@ export interface SystemConfigUpdateRequest {
   show_github_star?: boolean
   allow_registration?: boolean
 }
+
+export interface APIKeyWebhookConfig {
+  enabled: boolean
+  url: string
+  secret: string
+  auth_type: 'none' | 'bearer' | 'basic' | 'api_key'
+  auth_token: string
+  auth_username: string
+  auth_password: string
+  auth_header_name: string
+  auth_header_value: string
+}
+
+export interface APIKeyWebhookResponse {
+  success: boolean
+  webhook: APIKeyWebhookConfig
+}
+
+// 管理员视角的全量 API Key 列表项（附归属用户）
+export interface AdminAPIKeyInfo extends APIKeyInfo {
+  username: string
+}
+
+export interface AdminAPIKeyListResponse {
+  success: boolean
+  count: number
+  api_keys: AdminAPIKeyInfo[]
+}
+
+
+export interface WebhookTestResult { success: boolean; status_code?: number; error?: string }

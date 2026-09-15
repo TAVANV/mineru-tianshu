@@ -14,8 +14,10 @@ MinerU Tianshu - MCP Server
 """
 
 import asyncio
+from contextvars import ContextVar
 import base64
 import hmac
+import hashlib
 import ipaddress
 import json
 import os
@@ -31,6 +33,8 @@ import aiohttp
 import uvicorn
 from loguru import logger
 from mcp.server import Server
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken
 from mcp.server.sse import SseServerTransport
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import TextContent, Tool
@@ -57,9 +61,24 @@ TIANSHU_API_KEY = os.getenv("TIANSHU_API_KEY", "")
 MCP_API_KEYS = [key.strip() for key in os.getenv("MCP_API_KEYS", "").split(",") if key.strip()]
 
 
+MCP_API_KEY_MAP = json.loads(os.getenv("MCP_API_KEY_MAP") or "{}")
+if not isinstance(MCP_API_KEY_MAP, dict) or not all(
+    isinstance(k, str) and k and isinstance(v, str) and v for k, v in MCP_API_KEY_MAP.items()
+):
+    raise ValueError("MCP_API_KEY_MAP must map access keys to backend service keys")
+_service_key = ContextVar("mcp_service_key", default=None)
+
+
+def _mcp_identity(key: str):
+    # Supply the SDK principal so SSE session ownership is enforced on /messages.
+    # Never retain the raw access credential in the principal object.
+    return AuthenticatedUser(AccessToken(token="", client_id=hashlib.sha256(key.encode()).hexdigest(), scopes=[]))
+
+
 def _api_headers() -> dict:
     """访问后端 API 时携带的服务凭据请求头"""
-    return {"X-API-Key": TIANSHU_API_KEY} if TIANSHU_API_KEY else {}
+    key = _service_key.get() or TIANSHU_API_KEY
+    return {"X-API-Key": key} if key else {}
 
 
 def _error_response(message: str) -> list[TextContent]:
@@ -125,8 +144,15 @@ class MCPAuthMiddleware:
             if authorization.lower().startswith("bearer "):
                 provided = authorization[len("bearer ") :].strip()
 
-        if provided and any(hmac.compare_digest(provided.encode(), key.encode()) for key in MCP_API_KEYS):
-            await self.app(scope, receive, send)
+        if provided and any(
+            hmac.compare_digest(provided.encode(), key.encode()) for key in [*MCP_API_KEYS, *MCP_API_KEY_MAP]
+        ):
+            scope["user"] = _mcp_identity(provided)
+            token = _service_key.set(MCP_API_KEY_MAP.get(provided) or TIANSHU_API_KEY)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                _service_key.reset(token)
             return
 
         logger.warning(f"🔒 Unauthorized MCP access from {scope.get('client')}")
@@ -859,7 +885,7 @@ async def main():
     host = os.getenv("MCP_HOST", "127.0.0.1")
     port = int(os.getenv("MCP_PORT", "8002"))
 
-    if not MCP_API_KEYS:
+    if not MCP_API_KEYS and not MCP_API_KEY_MAP:
         logger.warning("⚠️ MCP_API_KEYS 未配置：/sse 与 /messages 将对所有请求返回 401")
 
     starlette_app = create_app(host)

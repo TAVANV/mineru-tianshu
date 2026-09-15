@@ -1,3 +1,5 @@
+> 后续兼容补齐与 MinerU 升级已进入[第四批说明](phase4-compatible-upstream-completion.md)；本文保留第三批交付时的范围记录。
+
 # 第三批：认证、文件、MCP 防护与 vLLM 运行时
 
 ## 分支与来源

@@ -1,0 +1,39 @@
+# Optional host-UID runtime for the base/pipeline deployment. Never applied by default.
+x-user-environment: &user-environment
+  HOME: /app/runtime-home
+  USER: tianshu
+  TIANSHU_RUNTIME_HOME: /app/runtime-home
+  HF_HOME: /app/models/huggingface_cache
+  MODELSCOPE_CACHE: /app/models/modelscope_cache
+  PADDLEX_HOME: /app/models/paddlex_cache
+  TORCH_HOME: /app/models/torch_cache
+  ULTRALYTICS_CONFIG_DIR: /app/models/ultralytics_cfg
+services:
+  backend:
+    user: "${TIANSHU_UID:-10001}:${TIANSHU_GID:-10001}"
+    environment: *user-environment
+    volumes:
+      - ./data/runtime-home:/app/runtime-home:rw
+  worker:
+    user: "${TIANSHU_UID:-10001}:${TIANSHU_GID:-10001}"
+    group_add: ["${DOCKER_GID:-0}"]
+    environment: *user-environment
+    volumes:
+      - ./data/runtime-home:/app/runtime-home:rw
+  scheduler:
+    user: "${TIANSHU_UID:-10001}:${TIANSHU_GID:-10001}"
+    environment: *user-environment
+    volumes:
+      - ./data/runtime-home:/app/runtime-home:rw
+  mcp-server:
+    user: "${TIANSHU_UID:-10001}:${TIANSHU_GID:-10001}"
+    environment:
+      <<: *user-environment
+      UPLOAD_PATH: /app/runtime-home/mcp-uploads
+    volumes:
+      - ./data/runtime-home:/app/runtime-home:rw
+  init-models:
+    user: "${TIANSHU_UID:-10001}:${TIANSHU_GID:-10001}"
+    environment: *user-environment
+    volumes:
+      - ./data/runtime-home:/app/runtime-home:rw

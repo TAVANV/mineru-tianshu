@@ -1,11 +1,14 @@
 """Durable, at-least-once task notifications with bounded retries and pinned DNS."""
 
+import base64
+import re
 import hashlib
 import hmac
 import http.client
 import ipaddress
 import json
 import socket
+import sqlite3
 import ssl
 import time
 import uuid
@@ -63,22 +66,62 @@ def validate_url(url, allowed_hosts=""):
     return parsed, addresses[0]
 
 
-def subscription(override_url=None, db_path=None):
+def validate_key_webhook(config, db_path=None):
+    from feature_config import load_config
+
+    if config.get("webhook_enabled"):
+        validate_url(config.get("webhook_url", ""), load_config(db_path)["webhook_allowed_hosts"])
+    auth = {k.removeprefix("webhook_"): v for k, v in config.items()}
+    build_auth_headers(auth)
+
+
+def key_subscription(row, values):
+    if not row or not row.get("webhook_enabled"):
+        return None
+    config = {k.removeprefix("webhook_"): (v or "") for k, v in row.items() if k.startswith("webhook_")}
+    return config | {
+        "timeout": int(values["webhook_timeout"]),
+        "max_attempts": int(values["webhook_max_attempts"]),
+        "source": "api_key",
+        "api_key_id": row["key_id"],
+    }
+
+
+def subscription(override_url=None, db_path=None, api_key_id=None):
     from feature_config import load_config
 
     values = load_config(db_path)
-    url = override_url or (values["webhook_url"] if values["webhook_enabled"] == "true" else "")
+    key_config = None
+    if api_key_id:
+        # Authentication has already migrated this database. Avoid re-running AuthDB
+        # schema/bootstrap work for every submitted task.
+        if db_path is None:
+            from auth.system_config import SystemConfig
+
+            db_path = SystemConfig().db_path
+        with sqlite3.connect(db_path, timeout=30) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute("SELECT * FROM api_keys WHERE key_id=?", (api_key_id,)).fetchone()
+        key_config = key_subscription(dict(row) if row else None, values)
+    default_url = values["webhook_url"] if values["webhook_enabled"] == "true" else ""
+    url = override_url or (key_config["url"] if key_config else default_url)
     if not url:
         return None
     if override_url:
         validate_url(url, values["webhook_allowed_hosts"])
-    same_target = url == values["webhook_url"]
+    if key_config and url == key_config["url"]:
+        return key_config | {"source": "task" if override_url else "api_key"}
+    # Do not inherit credentials from a global callback when a key-bound callback
+    # was overridden, even if the new URL happens to match the global URL.
+    same_global = not key_config and url == values["webhook_url"]
     return {
         "url": url,
-        "secret": values["webhook_secret"] if same_target else "",
-        "authorization": values["webhook_authorization"] if same_target else "",
+        "secret": values["webhook_secret"] if same_global else "",
+        "authorization": values["webhook_authorization"] if same_global else "",
         "timeout": int(values["webhook_timeout"]),
         "max_attempts": int(values["webhook_max_attempts"]),
+        "source": "task" if override_url else "global",
+        "api_key_id": api_key_id,
     }
 
 
@@ -90,6 +133,7 @@ def send(config, body, event_id, allowed_hosts):
         headers["X-Tianshu-Signature"] = (
             "sha256=" + hmac.new(config["secret"].encode(), body, hashlib.sha256).hexdigest()
         )
+    headers.update(build_auth_headers(config))
     if config.get("authorization"):
         headers["Authorization"] = config["authorization"]
     # Connect to the validated address, while retaining the original HTTP Host and TLS name.
@@ -106,6 +150,7 @@ def send(config, body, event_id, allowed_hosts):
         response = connection.getresponse()
         if not 200 <= response.status < 300:
             raise RuntimeError(f"HTTP {response.status}")
+        return response.status
     finally:
         connection.close()
 
@@ -149,3 +194,45 @@ def dispatch(db, limit=20):
                 (state, attempt, time.time() + min(3600, 2 ** min(attempt, 11) * 5), error, row["id"], token),
             )
     return delivered
+
+
+def build_auth_headers(auth: dict) -> dict:
+    """按 auth_type 构造出站鉴权头；none 或配置不完整时不附加任何头
+
+    api_key 的自定义头名只放行字母数字和连字符，防止注入非法头名。
+    """
+    if not auth:
+        return {}
+    for key, value in auth.items():
+        if key.startswith("auth_") and isinstance(value, str) and any(c in value for c in ("\r", "\n", "\x00")):
+            raise ValueError("Invalid authentication header")
+    auth_type = auth.get("auth_type", "none")
+    if auth_type == "bearer":
+        token = (auth.get("auth_token") or "").strip()
+        return {"Authorization": f"Bearer {token}"} if token else {}
+    if auth_type == "basic":
+        username = auth.get("auth_username") or ""
+        password = auth.get("auth_password") or ""
+        if not (username or password):
+            return {}
+        encoded = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        return {"Authorization": f"Basic {encoded}"}
+    if auth_type == "api_key":
+        name = (auth.get("auth_header_name") or "").strip()
+        value = (auth.get("auth_header_value") or "").strip()
+        reserved = {
+            "host",
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "content-type",
+            "x-tianshu-signature",
+            "x-tianshu-event-id",
+            "proxy-authorization",
+        }
+        if name.lower() in reserved or not re.fullmatch(r"[A-Za-z0-9-]+", name):
+            raise ValueError("Invalid or reserved header name")
+        if not value:
+            return {}
+        return {name: value}
+    return {}

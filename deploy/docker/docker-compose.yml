@@ -105,6 +105,7 @@ services:
       - HOST=0.0.0.0
       - API_PORT=8000
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - UPLOAD_VALIDATE_CONTENT=${UPLOAD_VALIDATE_CONTENT:-false}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
       - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
@@ -113,6 +114,7 @@ services:
       - WORKER_URL=${WORKER_URL:-http://worker:8001}
       - MAX_FILE_SIZE=${MAX_FILE_SIZE:-0}
       - MODEL_PATH=/app/models
+      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - OUTPUT_PATH=/app/data/output
       - UPLOAD_PATH=/app/data/uploads
       - DATABASE_PATH=${DATABASE_PATH:-/app/data/db/mineru_tianshu.db}
@@ -202,6 +204,7 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - WORKER_GPUS=${WORKER_GPUS:-2}
       - MODEL_PATH=/app/models
+      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - OUTPUT_PATH=/app/data/output
       - UPLOAD_PATH=/app/data/uploads
       - DATABASE_PATH=${DATABASE_PATH:-/app/data/db/mineru_tianshu.db}
@@ -293,6 +296,7 @@ services:
       - OUTPUT_PATH=/app/data/output
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # entrypoint 对非 worker/mcp 服务强制校验 JWT_SECRET_KEY，缺失会 exit 1 导致重启循环
+      - UPLOAD_VALIDATE_CONTENT=${UPLOAD_VALIDATE_CONTENT:-false}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       # scheduler 不挂模型，设 auto 避免 MODEL_DOWNLOAD_SOURCE=local 触发离线模型校验而退出
       - MODEL_DOWNLOAD_SOURCE=auto
@@ -321,8 +325,14 @@ services:
       - TZ=Asia/Shanghai
       - HOST=0.0.0.0
       - MCP_PORT=8002
+      - MCP_HOST=0.0.0.0
+      - MCP_API_KEYS=${MCP_API_KEYS:-}
+      - TIANSHU_API_KEY=${TIANSHU_API_KEY:-}
+      - MCP_API_KEY_MAP=${MCP_API_KEY_MAP:-}
+      - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-localhost:*,127.0.0.1:*}
+      - MCP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - API_URL=${API_URL:-http://backend:8000}
+      - API_BASE_URL=${API_URL:-http://backend:8000}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
       interval: 30s

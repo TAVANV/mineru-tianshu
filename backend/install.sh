@@ -89,7 +89,7 @@ echo "✓ Transformers dependencies installed"
 echo ""
 echo "[Step 7/10] Installing MinerU with dependencies..."
 cd "$(dirname "$0")" || exit
-pip install "mineru[core]" \
+pip install "mineru[pipeline,vlm,s3]==3.4.5" \
     -i https://pypi.tuna.tsinghua.edu.cn/simple \
     --default-timeout=600 \
     --retries 5

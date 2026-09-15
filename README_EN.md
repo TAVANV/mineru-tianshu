@@ -1,3 +1,5 @@
+> Custom branch: see the [phase 4 upgrade guide](docs/phase4-compatible-upstream-completion.md) for MinerU 3.4.5, incremental offline model preparation, and compatibility details. This code integration does not download model weights.
+
 <div align="center">
 
 # Tianshu 天枢

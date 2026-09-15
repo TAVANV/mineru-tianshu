@@ -5,55 +5,55 @@
         <button
           @click="expandAll"
           class="toolbar-btn"
-          title="展开所有"
+          :title="uiText('legacyUi.text0')"
         >
           <ChevronDown class="w-4 h-4" />
-          <span class="hidden sm:inline">展开所有</span>
+          <span class="hidden sm:inline">{{ uiText('legacyUi.text0') }}</span>
         </button>
         <button
           @click="collapseAll"
           class="toolbar-btn"
-          title="收起所有"
+          :title="uiText('legacyUi.text1')"
         >
           <ChevronRight class="w-4 h-4" />
-          <span class="hidden sm:inline">收起所有</span>
+          <span class="hidden sm:inline">{{ uiText('legacyUi.text1') }}</span>
         </button>
         <button
           @click="expandLevel(2)"
           class="toolbar-btn"
-          title="展开到第2层"
+          :title="uiText('legacyUi.text4')"
         >
           <Layers class="w-4 h-4" />
-          <span class="hidden sm:inline">展开2层</span>
+          <span class="hidden sm:inline">{{ uiText('legacyUi.text2') }}</span>
         </button>
         <div class="toolbar-divider"></div>
         <button
           @click="copyToClipboard"
           class="toolbar-btn"
           :class="{ 'text-green-600': copied }"
-          title="复制JSON"
+          :title="uiText('legacyUi.text5')"
         >
           <Check v-if="copied" class="w-4 h-4" />
           <Copy v-else class="w-4 h-4" />
-          <span class="hidden sm:inline">{{ copied ? '已复制' : '复制' }}</span>
+          <span class="hidden sm:inline">{{ copied ? uiText('legacyUi.text10') : uiText('legacyUi.text11') }}</span>
         </button>
         <button
           @click="downloadJson"
           class="toolbar-btn"
-          title="下载JSON文件"
+          :title="uiText('legacyUi.text6')"
         >
           <Download class="w-4 h-4" />
-          <span class="hidden sm:inline">下载</span>
+          <span class="hidden sm:inline">{{ uiText('legacyUi.text3') }}</span>
         </button>
         <div class="toolbar-divider"></div>
         <button
           @click="toggleRawView"
           class="toolbar-btn"
           :class="{ 'bg-primary-100 text-primary-700': showRaw }"
-          title="切换原始视图"
+          :title="uiText('legacyUi.text7')"
         >
           <Code class="w-4 h-4" />
-          <span class="hidden sm:inline">{{ showRaw ? '树形' : '原始' }}</span>
+          <span class="hidden sm:inline">{{ showRaw ? uiText('legacyUi.text9') : uiText('legacyUi.text8') }}</span>
         </button>
       </div>
       <div class="toolbar-right">
@@ -81,6 +81,8 @@
 </template>
 
 <script setup lang="ts">
+import { useI18n as useUiI18n } from 'vue-i18n'
+const { t: uiText } = useUiI18n()
 import { ref, computed, onMounted } from 'vue'
 import { ChevronDown, ChevronRight, Copy, Check, Download, Layers, Code } from 'lucide-vue-next'
 import JsonNode from './JsonNode.vue'
@@ -192,7 +194,7 @@ async function copyToClipboard() {
     copied.value = true
     setTimeout(() => { copied.value = false }, 2000)
   } catch (err) {
-    alert('复制失败，请手动选择文本复制')
+    alert(uiText('legacyUi.text12'))
   }
 }
 

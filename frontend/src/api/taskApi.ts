@@ -40,6 +40,7 @@ export async function submitTask(request: SubmitTaskRequest): Promise<SubmitTask
   if (request.server_url) formData.append('server_url', request.server_url)
 
   // Office 转换
+  if (request.office_parser) formData.append('office_parser', request.office_parser)
   if (request.convert_office_to_pdf !== undefined) {
     formData.append('convert_office_to_pdf', String(request.convert_office_to_pdf))
   }

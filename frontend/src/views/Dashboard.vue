@@ -128,7 +128,7 @@
                   class="text-primary-600 hover:text-primary-700 flex items-center"
                 >
                   <Eye class="w-4 h-4 mr-1" />
-                  查看
+                  {{ $t('legacyUi.extra6') }}
                 </router-link>
               </td>
             </tr>
@@ -139,7 +139,7 @@
 
       <div v-if="recentTasks.length > 0" class="mt-4 text-center">
         <router-link to="/tasks" class="text-sm text-primary-600 hover:text-primary-700">
-          查看全部任务 →
+          {{ $t('legacyUi.extra7') }}
         </router-link>
       </div>
     </div>

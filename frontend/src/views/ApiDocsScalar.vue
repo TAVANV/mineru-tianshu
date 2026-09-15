@@ -168,11 +168,100 @@ const apiTranslations: Record<string, string> = {
 }
 
 // 翻译函数
+Object.assign(apiTranslations, {
+  "修改当前用户密码": "Change current password",
+  "用户需要提供旧密码和新密码。SSO 用户不能修改密码。": "Provide the current and new passwords. SSO users cannot change passwords here.",
+  "读取 Key 级 webhook 回调配置": "Read API Key callback configuration",
+  "使用该 Key 提交的任务进入终态时，向此地址推送通知（优先于全局 webhook）。": "Send terminal task notifications to this key's callback, ahead of the global default.",
+  "敏感字段只回显掩码。": "Sensitive values are returned as masks.",
+  "更新 Key 级 webhook 回调配置（Key 所有者自助，管理员可改任意 Key）": "Update a key's callback configuration (owner or administrator)",
+  "敏感字段传掩码或缺省表示保持原值，传空字符串表示清除。": "Omit sensitive fields or send their mask to keep existing values; send an empty string to clear them.",
+  "用该 Key 已保存的回调配置立即投递一条 webhook.test 事件": "Send a test notification using the key's saved callback configuration",
+  "不走投递队列表，同步投递并返回结果；目标 URL 同样过 SSRF 校验。": "Deliver immediately and return the result, with the same destination validation as queued deliveries.",
+  "列出全部 API Key（仅管理员）": "List all API Keys (administrator only)",
+  "含归属用户名与 webhook 回调配置摘要，用于管理员掌握各对接方的回调配置情况。": "Includes owner names and callback summaries for administrators.",
+  "获取系统配置": "Get system configuration",
+  "公开接口，无需认证。返回系统名称、Logo、GitHub Star 显示、注册开关等配置。": "Public endpoint returning system branding, registration availability and display settings.",
+  "更新系统配置 (管理员)": "Update system configuration (administrator)",
+  "需要管理员权限。可以更新系统名称、Logo、GitHub Star 显示、注册开关等配置。": "Administrators can update branding, registration availability and display settings.",
+  "请求体示例:": "Example request body:",
+  "上传系统 Logo (管理员)": "Upload system logo (administrator)",
+  "需要管理员权限。上传 Logo 图片文件到 RustFS，支持 PNG、JPG、SVG 等格式。": "Administrators can upload a logo to RustFS, including PNG, JPG and SVG files.",
+  "【已废弃】图片已自动上传到 RustFS": "Deprecated: image storage is handled by the configured processing workflow",
+  "【重构】彻底删除任务及其本地文件": "Permanently delete a task and its local files",
+  "不仅取消 pending 的任务，还会物理抹除文件和数据库记录。": "Removes files and database records, rather than only cancelling a pending task.",
+  "获取任务解析结果中实际被引用的图片列表": "List images referenced by the task's parsed result",
+  "返回图片文件名和下载 URL，供外部系统（如 SuperRAG）下载图片到本地存储。": "Return filenames and authenticated download URLs for downstream image handoff.",
+  "仅在任务状态为 completed 时返回图片信息。": "Image information is available when the task is completed.",
+  "下载 URL 格式：/api/v1/files/output/{相对路径}": "Download URL: /api/v1/files/output/{relative-path}",
+  "【重构】一键清理所有失败的任务，包含物理清除文件": "Delete all failed tasks and their local files",
+  "重试失败的任务": "Retry a failed task",
+  "暂停任务": "Pause a task",
+  "恢复任务": "Resume a task",
+  "清理任务缓存：仅删除 output 文件夹": "Clear cached output while retaining the task and source file",
+  "筛选状态": "Filter by status",
+  "页码": "Page number",
+  "每页数量": "Items per page",
+  "筛选后端引擎": "Filter by backend",
+  "搜索文件名或任务ID": "Search filename or task ID",
+  "提供上传源文件的访问服务": "Serve an authenticated source-file download or preview",
+  "创建 API Key 请求": "API Key creation request",
+  "API Key 创建响应 (只返回一次完整 key)": "API Key creation response (the full key is shown once)",
+  "Key 级 webhook 回调配置（敏感字段回传掩码表示不修改）": "Key callback configuration; sending masks preserves sensitive values",
+  "处理后端: pipeline, hybrid-auto-engine, vlm-auto-engine, hybrid-http-client, vlm-http-client, paddleocr-vl, etc.": "Processing backend: pipeline, hybrid-auto-engine, vlm-auto-engine, hybrid-http-client, vlm-http-client, paddleocr-vl, etc.",
+  "语言: ch/en/auto...": "Language: ch/en/auto...",
+  "起始页码（从0开始）": "Starting page (zero-based)",
+  "结束页码": "Ending page",
+  "[兼容旧版] 是否强制使用OCR": "Legacy option: force OCR",
+  "远程服务器地址 (仅 Client 模式需要)": "Remote server URL (client modes)",
+  "绘制布局边框 (_layout.pdf)": "Draw layout boxes (_layout.pdf)",
+  "绘制文本边框 (_span.pdf)": "Draw text boxes (_span.pdf)",
+  "输出 Markdown": "Write Markdown output",
+  "输出中间 JSON": "Write intermediate JSON",
+  "输出模型原始数据": "Write raw model output",
+  "输出内容列表": "Write the content list",
+  "保存原始/截取 PDF": "Save the source or selected-page PDF",
+  "[兼容旧版] 是否绘制布局边框": "Legacy option: draw layout boxes",
+  "[兼容旧版] 是否绘制文本Span边框": "Legacy option: draw text span boxes",
+  "是否启用说话人分离": "Enable speaker diarization",
+  "是否启用水印去除": "Enable watermark removal",
+  "水印检测置信度阈值": "Watermark detection confidence threshold",
+  "水印掩码膨胀大小": "Watermark mask dilation size",
+  "是否将 Office 文件转换为 PDF 后再处理": "Convert Office documents to PDF before processing",
+  "文档方向分类": "Classify document orientation",
+  "文档去弯曲": "Unwarp document images",
+  "是否启用版面分析": "Enable layout analysis",
+  "是否启用图表识别": "Enable chart recognition",
+  "是否启用印章识别": "Enable seal recognition",
+  "是否对图像块进行OCR": "Run OCR on image blocks",
+  "是否合并表格": "Merge tables",
+  "是否重构标题层级": "Reconstruct heading levels",
+  "版面形状模式": "Layout shape mode",
+  "提示词标签": "Prompt label",
+  "重复惩罚": "Repetition penalty",
+  "温度": "Temperature",
+  "最小像素": "Minimum image pixels",
+  "最大像素": "Maximum image pixels",
+  "是否启用版面 NMS": "Enable layout NMS",
+  "是否重构页面": "Reconstruct pages",
+  "忽略的标签 (逗号分隔)": "Ignored labels (comma-separated)",
+  "是否上传图片到 RustFS 对象存储（任务级开关）。不传=由 RUSTFS_ENABLED 环境变量决定（向后兼容）；true=强制上传；false=保留图片在本地，通过 /files/output 下载": "Task-level RustFS option: omitted follows RUSTFS_ENABLED; true uploads images; false keeps local images available through authenticated /files/output downloads.",
+  "可选任务回调地址；私网目标需管理员配置 host:port 白名单": "Optional task callback URL; private destinations require an administrator host:port allowlist entry.",
+  "修改密码请求": "Password change request",
+  "JWT Token 响应": "JWT response",
+  "用户模型": "User model",
+  "创建用户请求": "User creation request",
+  "用户登录请求": "Login request",
+  "用户角色枚举": "User roles",
+  "更新用户请求": "User update request",
+  "可选功能": "Optional features"
+})
+
 function translateText(text: string, lang: string): string {
   if (lang === 'zh-CN' || !text) {
     return text
   }
-  return apiTranslations[text] || text
+  return apiTranslations[text] || text.split('\n').map(line => apiTranslations[line.trim()] || line).join('\n')
 }
 
 // 递归翻译 OpenAPI schema
@@ -258,6 +347,16 @@ function translateOpenApiSpec(spec: any, lang: string): any {
     })
   }
 
+  // Include referenced component schemas; preserve protocol defaults, enum values and examples.
+  const translateMetadata = (value: any) => {
+    if (!value || typeof value !== 'object') return
+    for (const [key, child] of Object.entries(value)) {
+      if (['default', 'enum', 'const', 'example', 'examples'].includes(key)) continue
+      if (['title', 'summary', 'description'].includes(key) && typeof child === 'string') value[key] = translateText(child, lang)
+      else translateMetadata(child)
+    }
+  }
+  translateMetadata(translated)
   return translated
 }
 
@@ -272,7 +371,7 @@ async function loadOpenApiSpec() {
     openApiSpec.value = translateOpenApiSpec(spec, locale.value)
     isLoading.value = false
   } catch (error: any) {
-    loadError.value = `无法访问 OpenAPI 文档: ${error.message}`
+    loadError.value = `${t('apiDocs.loadError')}: ${error.message}`
     isLoading.value = false
     console.error('OpenAPI 文档加载失败:', error)
   }

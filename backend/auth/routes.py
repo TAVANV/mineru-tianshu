@@ -20,6 +20,7 @@ from .models import (
     Token,
     APIKeyCreate,
     APIKeyResponse,
+    APIKeyWebhookUpdate,
     Permission,
 )
 from .auth_db import AuthDB
@@ -262,6 +263,156 @@ async def delete_api_key(
 
     logger.info(f"✅ API Key deleted: {key_id} by user {current_user.username}")
     return {"success": True, "message": "API Key deleted successfully"}
+
+
+# ==================== Key 级 Webhook 回调配置 ====================
+
+# 敏感字段掩码：接口只回显掩码，前端发回掩码表示不修改
+_KEY_WEBHOOK_MASK = "********"
+
+
+def _serialize_key_webhook(row: dict) -> dict:
+    """Key 级 webhook 配置脱敏序列化（敏感字段只回显掩码）"""
+
+    def mask(value) -> str:
+        return _KEY_WEBHOOK_MASK if value else ""
+
+    return {
+        "enabled": bool(row.get("webhook_enabled")),
+        "url": row.get("webhook_url") or "",
+        "secret": mask(row.get("webhook_secret")),
+        "auth_type": row.get("webhook_auth_type") or "none",
+        "auth_token": mask(row.get("webhook_auth_token")),
+        "auth_username": row.get("webhook_auth_username") or "",
+        "auth_password": mask(row.get("webhook_auth_password")),
+        "auth_header_name": row.get("webhook_auth_header_name") or "X-API-Key",
+        "auth_header_value": mask(row.get("webhook_auth_header_value")),
+    }
+
+
+def _get_key_webhook_row(auth_db: AuthDB, key_id: str, current_user: User) -> dict:
+    """读取 Key 配置行并校验归属：非所有者且非管理员一律 404，不暴露 Key 存在性"""
+    if current_user.api_key_scopes is not None:
+        raise HTTPException(status_code=403, detail="Use a login session to configure callbacks")
+    row = auth_db.get_api_key_webhook(key_id)
+    if not row or (
+        row["user_id"] != current_user.user_id and not current_user.has_permission(Permission.APIKEY_LIST_ALL)
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="API Key not found")
+    return row
+
+
+@router.get("/apikeys/{key_id}/webhook")
+def get_api_key_webhook(
+    key_id: str,
+    current_user: User = Depends(require_permission(Permission.APIKEY_LIST_OWN)),
+    auth_db: AuthDB = Depends(get_auth_db),
+):
+    """
+    读取 Key 级 webhook 回调配置
+
+    使用该 Key 提交的任务进入终态时，向此地址推送通知（优先于全局 webhook）。
+    敏感字段只回显掩码。
+    """
+    row = _get_key_webhook_row(auth_db, key_id, current_user)
+    return {"success": True, "webhook": _serialize_key_webhook(row)}
+
+
+@router.put("/apikeys/{key_id}/webhook")
+def update_api_key_webhook(
+    key_id: str,
+    body: APIKeyWebhookUpdate,
+    request: Request,
+    current_user: User = Depends(require_permission(Permission.APIKEY_CREATE)),
+    auth_db: AuthDB = Depends(get_auth_db),
+):
+    """
+    更新 Key 级 webhook 回调配置（Key 所有者自助，管理员可改任意 Key）
+
+    敏感字段传掩码或缺省表示保持原值，传空字符串表示清除。
+    """
+    row = _get_key_webhook_row(auth_db, key_id, current_user)
+
+    url = body.url.strip()
+    if body.enabled and not url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Webhook URL is required when enabled")
+
+    def resolve(new, old):
+        # None（缺省）或掩码表示保持原值
+        return old if new is None or new == _KEY_WEBHOOK_MASK else new
+
+    config = {
+        "webhook_enabled": 1 if body.enabled else 0,
+        "webhook_url": url,
+        "webhook_secret": resolve(body.secret, row.get("webhook_secret")),
+        "webhook_auth_type": body.auth_type,
+        "webhook_auth_token": resolve(body.auth_token, row.get("webhook_auth_token")),
+        "webhook_auth_username": resolve(body.auth_username, row.get("webhook_auth_username")),
+        "webhook_auth_password": resolve(body.auth_password, row.get("webhook_auth_password")),
+        "webhook_auth_header_name": resolve(body.auth_header_name, row.get("webhook_auth_header_name")),
+        "webhook_auth_header_value": resolve(body.auth_header_value, row.get("webhook_auth_header_value")),
+    }
+
+    from webhooks import validate_key_webhook
+
+    try:
+        validate_key_webhook(config, auth_db.db_path)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid callback URL or authentication configuration") from exc
+    # 管理员可改任意 Key，普通用户限定自己的 Key
+    owner_scope = None if current_user.has_permission(Permission.APIKEY_LIST_ALL) else current_user.user_id
+    auth_db.update_api_key_webhook(key_id, config, user_id=owner_scope)
+
+    logger.info(f"✅ API Key webhook updated: {key_id} by user {current_user.username} (enabled={body.enabled})")
+    request.state.audit_detail = {"key_id": key_id, "enabled": body.enabled}
+    return {"success": True, "webhook": _serialize_key_webhook(auth_db.get_api_key_webhook(key_id))}
+
+
+@router.post("/apikeys/{key_id}/webhook/test")
+def test_api_key_webhook(
+    key_id: str,
+    current_user: User = Depends(require_permission(Permission.APIKEY_CREATE)),
+    auth_db: AuthDB = Depends(get_auth_db),
+):
+    """
+    用该 Key 已保存的回调配置立即投递一条 webhook.test 事件
+
+    不走投递队列表，同步投递并返回结果；目标 URL 同样过 SSRF 校验。
+    """
+    import json
+    import uuid
+    from webhooks import key_subscription, send
+    from feature_config import load_config
+
+    row = _get_key_webhook_row(auth_db, key_id, current_user)
+    config = key_subscription(row, load_config(auth_db.db_path))
+    if not config or not config["url"]:
+        raise HTTPException(400, "Enable and save a callback first")
+    event_id = uuid.uuid4().hex
+    try:
+        status_code = send(
+            config,
+            json.dumps({"event_id": event_id, "status": "test"}).encode(),
+            event_id,
+            load_config(auth_db.db_path)["webhook_allowed_hosts"],
+        )
+    except Exception:
+        raise HTTPException(400, "Callback failed; check endpoint, allowlist and credentials")
+    return {"success": True, "status_code": status_code}
+
+
+@router.get("/admin/apikeys")
+def list_all_api_keys(
+    current_user: User = Depends(require_permission(Permission.APIKEY_LIST_ALL)),
+    auth_db: AuthDB = Depends(get_auth_db),
+):
+    """
+    列出全部 API Key（仅管理员）
+
+    含归属用户名与 webhook 回调配置摘要，用于管理员掌握各对接方的回调配置情况。
+    """
+    keys = auth_db.list_all_api_keys()
+    return {"success": True, "count": len(keys), "api_keys": keys}
 
 
 # ==================== 用户管理 (需要管理员权限) ====================

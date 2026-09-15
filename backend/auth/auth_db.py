@@ -19,6 +19,19 @@ from loguru import logger
 from .models import User, UserCreate, UserRole
 
 
+API_KEY_WEBHOOK_COLUMNS = {
+    "webhook_enabled": "ALTER TABLE api_keys ADD COLUMN webhook_enabled INTEGER DEFAULT 0",
+    "webhook_url": "ALTER TABLE api_keys ADD COLUMN webhook_url TEXT",
+    "webhook_secret": "ALTER TABLE api_keys ADD COLUMN webhook_secret TEXT",
+    "webhook_auth_type": "ALTER TABLE api_keys ADD COLUMN webhook_auth_type TEXT",
+    "webhook_auth_token": "ALTER TABLE api_keys ADD COLUMN webhook_auth_token TEXT",
+    "webhook_auth_username": "ALTER TABLE api_keys ADD COLUMN webhook_auth_username TEXT",
+    "webhook_auth_password": "ALTER TABLE api_keys ADD COLUMN webhook_auth_password TEXT",
+    "webhook_auth_header_name": "ALTER TABLE api_keys ADD COLUMN webhook_auth_header_name TEXT",
+    "webhook_auth_header_value": "ALTER TABLE api_keys ADD COLUMN webhook_auth_header_value TEXT",
+}
+
+
 class AuthDB:
     """认证数据库管理类"""
 
@@ -159,6 +172,11 @@ class AuthDB:
             except sqlite3.OperationalError:
                 # 字段已存在，忽略
                 pass
+
+            columns = {r[1] for r in cursor.execute("PRAGMA table_info(api_keys)")}
+            for column, ddl in API_KEY_WEBHOOK_COLUMNS.items():
+                if column not in columns:
+                    cursor.execute(ddl)
 
             # 创建默认管理员账户 (如果不存在)
             cursor.execute("SELECT COUNT(*) as count FROM users WHERE role = 'admin'")
@@ -463,6 +481,7 @@ class AuthDB:
             cursor.execute("UPDATE api_keys SET last_used = CURRENT_TIMESTAMP WHERE key_id = ?", (row["key_id"],))
 
             user = self._row_to_user(row)
+            user.api_key_id = row["key_id"]
             # 反序列化 API Key 作用域并挂到 User 上，供 has_permission 做细粒度限制
             scopes_raw = row["scopes"]
             if scopes_raw is not None:
@@ -478,11 +497,12 @@ class AuthDB:
             return user
 
     def list_api_keys(self, user_id: str) -> List[Dict]:
-        """列出用户的所有 API Key"""
+        """列出用户的所有 API Key（含 webhook 配置摘要，供列表页展示回调状态）"""
         with self.get_cursor() as cursor:
             cursor.execute(
                 """
-                SELECT key_id, name, prefix, is_active, created_at, expires_at, last_used
+                SELECT key_id, name, prefix, is_active, created_at, expires_at, last_used,
+                       webhook_enabled, webhook_url
                 FROM api_keys
                 WHERE user_id = ?
                 ORDER BY created_at DESC
@@ -593,6 +613,41 @@ class AuthDB:
                 (jti, datetime.utcnow().isoformat()),
             )
             return cursor.fetchone() is not None
+
+    def list_all_api_keys(self) -> List[Dict]:
+        """列出全部 API Key（管理员概览），附归属用户名与 webhook 配置摘要"""
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT ak.key_id, ak.name, ak.prefix, ak.is_active, ak.created_at, ak.expires_at, ak.last_used,
+                       ak.webhook_enabled, ak.webhook_url, u.username
+                FROM api_keys ak
+                JOIN users u ON ak.user_id = u.user_id
+                ORDER BY ak.created_at DESC
+            """
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_api_key_webhook(self, key_id: str) -> Optional[Dict]:
+        """读取 Key 级 webhook 配置（含密钥原文，仅投递与配置回读使用，接口层负责脱敏）"""
+        with self.get_cursor() as cursor:
+            cursor.execute("SELECT * FROM api_keys WHERE key_id = ?", (key_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def update_api_key_webhook(self, key_id: str, config: Dict, user_id: Optional[str] = None) -> bool:
+        """更新 Key 级 webhook 配置；传入 user_id 时限定只能修改自己的 Key"""
+        columns = list(API_KEY_WEBHOOK_COLUMNS)
+        assignments = ", ".join(f"{c} = ?" for c in columns)
+        values = [config.get(c) for c in columns]
+        sql = f"UPDATE api_keys SET {assignments} WHERE key_id = ?"
+        values.append(key_id)
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            values.append(user_id)
+        with self.get_cursor() as cursor:
+            cursor.execute(sql, values)
+            return cursor.rowcount > 0
 
 
 if __name__ == "__main__":

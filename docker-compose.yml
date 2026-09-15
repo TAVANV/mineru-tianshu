@@ -62,6 +62,8 @@ services:
       - /etc/timezone:/etc/timezone:ro
     environment:
       - TZ=Asia/Shanghai
+      - HF_HOME=/app/models/huggingface_cache
+      - MODELSCOPE_CACHE=/app/models/modelscope_cache
       - MODEL_DOWNLOAD_SOURCE=${MODEL_DOWNLOAD_SOURCE:-auto}
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
     networks:
@@ -74,6 +76,10 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
+      args:
+        PIP_MIRROR: ${PIP_MIRROR:-https://mirrors.aliyun.com/pypi/simple/}
+        PIP_TIMEOUT: ${PIP_TIMEOUT:-600}
+        PIP_RETRIES: ${PIP_RETRIES:-10}
     image: tianshu-backend:latest
     container_name: tianshu-backend
     user: root
@@ -97,10 +103,13 @@ services:
       - API_PORT=8000
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - UPLOAD_VALIDATE_CONTENT=${UPLOAD_VALIDATE_CONTENT:-false}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
       - WORKER_URL=${WORKER_URL:-http://worker:8001}
       - MODEL_PATH=/app/models
+      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - OUTPUT_PATH=/app/data/output
       - UPLOAD_PATH=/app/data/uploads
       - DATABASE_PATH=${DATABASE_PATH:-/app/data/db/mineru_tianshu.db}
@@ -110,6 +119,8 @@ services:
       - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
       - RUSTFS_BUCKET=${RUSTFS_BUCKET:-ts-img}
       - RUSTFS_PUBLIC_URL=${RUSTFS_PUBLIC_URL}
+      - HF_HOME=/app/models/huggingface_cache
+      - MODELSCOPE_CACHE=/app/models/modelscope_cache
       - MODEL_DOWNLOAD_SOURCE=${MODEL_DOWNLOAD_SOURCE:-auto}
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
     deploy:
@@ -147,6 +158,8 @@ services:
       - TZ=Asia/Shanghai
       - DATABASE_PATH=/app/data/db/mineru_tianshu.db
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - UPLOAD_VALIDATE_CONTENT=${UPLOAD_VALIDATE_CONTENT:-false}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
     depends_on:
       - backend
@@ -206,15 +219,18 @@ services:
   vllm-mineru:
     image: vllm/vllm-openai:nightly
     container_name: tianshu-vllm-mineru
+    entrypoint: ["python", "/opt/tianshu-vllm-entrypoint.py"]
     restart: no
     profiles: ["manual"]
     ports:
       - "30024:30024"
     volumes:
       - ./models:/models:ro
+      - ./scripts/vllm-model-entrypoint.py:/opt/tianshu-vllm-entrypoint.py:ro
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     environment:
+      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - TZ=Asia/Shanghai
       - CUDA_VISIBLE_DEVICES=${VLLM_MINERU_DEVICE:-0}
       - GLOG_minloglevel=2
@@ -222,7 +238,6 @@ services:
       - PYTHONWARNINGS=ignore
     # ⬇️ [优化] 显存降至 0.6，防止卡顿；限制单次处理 1 张图
     command: >
-      --model /models/MinerU2.5-2509-1.2B
       --served-model-name MinerU-1.2B
       --trust-remote-code
       --host 0.0.0.0
@@ -282,14 +297,17 @@ services:
       - WORKER_PORT=8001
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # ⬇️ [核心优化] 强制单任务串行
-      - MAX_CONCURRENT_TASKS=1
+      - MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-1}
       - WORKER_GPUS=1
       - MAX_BATCH_SIZE=1
       - MODEL_PATH=/app/models
+      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - OUTPUT_PATH=/app/data/output
       - UPLOAD_PATH=/app/data/uploads
       - DATABASE_PATH=${DATABASE_PATH:-/app/data/db/mineru_tianshu.db}
       - TIMEOUT=${WORKER_TIMEOUT:-300}
+      - HF_HOME=/app/models/huggingface_cache
+      - MODELSCOPE_CACHE=/app/models/modelscope_cache
       - MODEL_DOWNLOAD_SOURCE=${MODEL_DOWNLOAD_SOURCE:-auto}
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
       - HF_TOKEN=${HF_TOKEN:-}
@@ -353,6 +371,7 @@ services:
       - API_BASE_URL=${API_URL:-http://backend:8000}
       - MCP_HOST=0.0.0.0
       - MCP_API_KEYS=${MCP_API_KEYS:-}
+      - MCP_API_KEY_MAP=${MCP_API_KEY_MAP:-}
       - TIANSHU_API_KEY=${TIANSHU_API_KEY:-}
       - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-localhost:*,127.0.0.1:*}
       - MCP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS:-}

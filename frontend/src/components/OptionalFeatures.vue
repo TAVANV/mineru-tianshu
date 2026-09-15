@@ -35,7 +35,7 @@
       </form>
       <div class="overflow-x-auto">
         <table class="w-full text-sm text-left"><thead><tr><th class="p-2">{{ text('时间', 'Time') }}</th><th class="p-2">{{ text('操作 / 任务', 'Action / Task') }}</th><th class="p-2">{{ text('状态', 'Status') }}</th></tr></thead>
-          <tbody><tr v-for="row in records[kind]" :key="row.id" class="border-t"><td class="p-2 whitespace-nowrap">{{ row.created_at }}</td><td class="p-2 break-all">{{ row.action || row.task_id }} <span class="text-gray-500">{{ row.username || '' }}</span></td><td class="p-2">{{ row.result || row.state }} {{ row.attempt ? `(${row.attempt})` : '' }}</td></tr></tbody>
+          <tbody><tr v-for="row in records[kind]" :key="row.id" class="border-t"><td class="p-2 whitespace-nowrap">{{ row.created_at }}</td><td class="p-2 break-all">{{ row.action || row.task_id }} <span class="text-gray-500">{{ row.username || '' }} {{ kind === 'deliveries' ? (row.source || 'global') : '' }} {{ row.api_key_id || '' }}</span></td><td class="p-2">{{ row.result || row.state }} {{ row.attempt ? `(${row.attempt})` : '' }}</td></tr></tbody>
         </table>
       </div>
       <p v-if="!records[kind].length" class="text-sm text-gray-500 py-3">{{ text('暂无记录', 'No records') }}</p>

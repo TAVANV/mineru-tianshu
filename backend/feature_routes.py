@@ -52,7 +52,7 @@ def deliveries(
     with TaskDB().get_cursor() as c:
         total = c.execute("SELECT COUNT(*) FROM webhook_deliveries").fetchone()[0]
         rows = c.execute(
-            "SELECT id,task_id,state,attempt,created_at,last_error,task_status FROM webhook_deliveries ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
+            "SELECT id,task_id,state,attempt,created_at,last_error,task_status,json_extract(config,'$.source') AS source,json_extract(config,'$.api_key_id') AS api_key_id FROM webhook_deliveries ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
             (page_size, (page - 1) * page_size),
         ).fetchall()
     return {"success": True, "items": [dict(r) for r in rows], "total": total}

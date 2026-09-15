@@ -1,6 +1,8 @@
 /**
  * Vue Router 配置
  */
+import { watch } from 'vue'
+import i18n from '@/locales'
 import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore, useSystemStore } from '@/stores'
 
@@ -86,6 +88,17 @@ const router = createRouter({
   ]
 })
 
+const titleKeys: Record<string, string> = {
+  login: 'common.login', register: 'common.register', dashboard: 'nav.dashboard',
+  'task-list': 'nav.taskList', 'task-submit': 'nav.submitTask', 'task-detail': 'task.taskDetail',
+  'queue-management': 'nav.queueManagement', profile: 'common.profile',
+  'user-management': 'nav.userManagement', 'system-config': 'nav.systemConfig', 'api-docs': 'nav.apiDocs',
+}
+watch(i18n.global.locale, () => {
+  const key = titleKeys[String(router.currentRoute.value.name)]
+  if (key) useSystemStore().updatePageTitle(i18n.global.t(key))
+})
+
 // 全局导航守卫
 router.beforeEach(async (to, _from, next) => {
   const authStore = useAuthStore()
@@ -98,7 +111,7 @@ router.beforeEach(async (to, _from, next) => {
 
   // 设置页面标题
   if (to.meta.title) {
-    systemStore.updatePageTitle(to.meta.title as string)
+    systemStore.updatePageTitle(i18n.global.t(titleKeys[String(to.name)] || to.meta.title as string))
   } else {
     document.title = systemStore.config.system_name
   }

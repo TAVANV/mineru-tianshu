@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import tarfile
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from urllib.request import urlretrieve
@@ -48,8 +49,12 @@ MODELS = {
         "verify": [
             "models/Layout/PP-DocLayoutV2/model.safetensors",
             "models/MFR/unimernet_hf_small_2503/model.safetensors",
-            "models/OCR/paddleocr_torch/ch_PP-OCRv5_det_infer.pth",
-            "models/OCR/paddleocr_torch/ch_PP-OCRv5_rec_infer.pth",
+            "models/OCR/paddleocr_torch/ch_PP-OCRv6_small_det_infer.safetensors",
+            "models/OCR/paddleocr_torch/ch_PP-OCRv6_small_rec_infer.safetensors",
+            "models/OCR/paddleocr_torch/ch_PP-OCRv6_medium_rec_infer.safetensors",
+            "models/TabRec/SlanetPlus/slanet-plus.onnx",
+            "models/TabRec/UnetStructure/unet.onnx",
+            "models/TabCls/paddle_table_cls/PP-LCNet_x1_0_table_cls.onnx",
         ],
     },
     "mineru_vlm": {
@@ -58,6 +63,16 @@ MODELS = {
         "model_id": "opendatalab/MinerU2.5-2509-1.2B",
         "target_dir": "MinerU2.5-2509-1.2B",
         "required": True,
+        "verify_glob": ["*.safetensors"],
+    },
+    "mineru_vlm_pro": {
+        "name": "MinerU 2.5 Pro VLM (1.2B)",
+        "source": "modelscope",
+        "model_id": "OpenDataLab/MinerU2.5-Pro-2605-1.2B",
+        "target_dir": "MinerU2.5-Pro-2605-1.2B",
+        "required": True,
+        "default": False,  # Additive download; old --models mineru_vlm keeps its meaning.
+        "verify": ["config.json"],
         "verify_glob": ["*.safetensors"],
     },
     "paddleocr_vl_1_5": {
@@ -231,7 +246,7 @@ def safe_extract_tar(tar_path: Path, target: Path) -> None:
                     link_path.relative_to(target_resolved)
                 except ValueError:
                     raise RuntimeError(f"Unsafe tar link target: {member.name} -> {member.linkname}")
-        tar.extractall(target)
+        tar.extractall(target, filter="data")
 
 
 def flatten_single_child_dir(target: Path) -> None:
@@ -261,7 +276,14 @@ def download_url_file(config: dict, output_path: Path) -> Path | None:
     target = output_path / config["target_file"]
     ensure_dir(target.parent)
     logger.info(f"    Downloading file: {config['url']}")
-    urlretrieve(config["url"], target)
+    partial = target.with_name(target.name + ".download")
+    try:
+        urlretrieve(config["url"], partial)
+        if not partial.stat().st_size:
+            raise ValueError("Downloaded file is empty")
+        os.replace(partial, target)
+    finally:
+        partial.unlink(missing_ok=True)
     return target
 
 
@@ -291,6 +313,15 @@ def verify_model(output_path: Path, name: str, config: dict) -> tuple[bool, str]
     for pattern in config.get("verify_glob", []):
         if not list(target.rglob(pattern)):
             return False, f"missing files matching {pattern} in {target}"
+
+    index = target / "model.safetensors.index.json"
+    if index.is_file():
+        shards = json.loads(index.read_text()).get("weight_map", {})
+        if not shards or any(
+            not (target / filename).is_file() or (target / filename).stat().st_size == 0
+            for filename in set(shards.values())
+        ):
+            return False, "Missing or empty model weight shards"
 
     if name == "yolo11" and not list(target.rglob("*.pt")):
         return False, f"missing .pt files in {target}"
@@ -344,17 +375,43 @@ def verify_post_steps(output_path: Path, config: dict) -> tuple[bool, str]:
     return True, "post steps verified"
 
 
-def generate_mineru_json(output_path: Path) -> None:
+def atomic_json(path: Path, config: dict) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False, encoding="utf-8"
+    ) as stream:
+        temp = Path(stream.name)
+        try:
+            json.dump(config, stream, ensure_ascii=False, indent=4)
+            stream.flush()
+            os.fsync(stream.fileno())
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def generate_mineru_json(output_path: Path, vlm_model: str | None = None, runtime_root: str = "/app/models") -> None:
     config_path = output_path / "mineru.json"
-    config = {
-        "models-dir": {
-            "pipeline": "/app/models/PDF-Extract-Kit-1.0",
-            "vlm": "/app/models/MinerU2.5-2509-1.2B",
-        },
-        "config_version": "1.3.1",
-    }
-    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=4), encoding="utf-8")
-    logger.success(f"✅ mineru.json created at: {config_path}")
+    config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    model_dirs = config.setdefault("models-dir", {})
+    if not isinstance(model_dirs, dict):
+        raise ValueError("Unsupported legacy models-dir; migrate the custom config explicitly")
+    if model_dirs.get("pipeline") == "/app/models/PDF-Extract-Kit-1.0/models":
+        model_dirs["pipeline"] = "/app/models/PDF-Extract-Kit-1.0"
+    model_dirs.setdefault("pipeline", str(Path(runtime_root) / "PDF-Extract-Kit-1.0"))
+    model_dirs.setdefault("vlm", str(Path(runtime_root) / MODELS["mineru_vlm"]["target_dir"]))
+    if vlm_model:
+        verified, reason = verify_model(output_path, vlm_model, MODELS[vlm_model])
+        if not verified:
+            raise ValueError(f"Cannot activate an unverified VLM: {reason}")
+        model_dirs["vlm"] = str(Path(runtime_root) / MODELS[vlm_model]["target_dir"])
+    # MinerU 3.4 would otherwise migrate an old config to an online model source.
+    config.update({"model-source": "local", "config_version": "1.3.2"})
+    atomic_json(config_path, config)
+    logger.success(f"✅ mineru.json ready at: {config_path}")
 
 
 def generate_ultralytics_settings(output_path: Path) -> None:
@@ -386,12 +443,13 @@ def verify_mineru_json(output_path: Path) -> tuple[bool, str]:
         return False, f"invalid JSON in {config_path}: {exc}"
 
     models_dir = config.get("models-dir", {})
-    expected = {
-        "pipeline": "/app/models/PDF-Extract-Kit-1.0",
-        "vlm": "/app/models/MinerU2.5-2509-1.2B",
-    }
-    if models_dir != expected:
-        return False, f"unexpected models-dir in {config_path}: {models_dir}"
+    if not isinstance(models_dir, dict) or not all(
+        isinstance(models_dir.get(k), str) and models_dir[k] for k in ("pipeline", "vlm")
+    ):
+        return False, "models-dir must contain pipeline and vlm paths"
+    # Existing 1.3.1 offline packs remain valid: runtime distribution adds model-source=local.
+    if config.get("model-source", "local") != "local":
+        return False, "Offline configuration must use local models"
 
     return True, "verified"
 
@@ -414,7 +472,7 @@ def verify_ultralytics_settings(output_path: Path) -> tuple[bool, str]:
 
 def selected_model_map(selected_models: str | None) -> dict:
     if not selected_models:
-        return MODELS
+        return {k: v for k, v in MODELS.items() if v.get("default", True)}
     selected = {m.strip() for m in selected_models.split(",") if m.strip()}
     unknown = selected - set(MODELS)
     if unknown:
@@ -474,21 +532,30 @@ def main(
     force: bool = False,
     verify_only: bool = False,
     strict: bool = False,
+    vlm_model: str | None = None,
+    runtime_root: str = "/app/models",
 ) -> int:
     logger.info("=" * 60)
     logger.info("🚀 Tianshu Offline Model Preparation")
     logger.info("=" * 60)
 
+    if vlm_model not in (None, "mineru_vlm", "mineru_vlm_pro"):
+        raise ValueError("Unknown VLM model selection")
     models = selected_model_map(selected_models)
     output_path = Path(output_dir).resolve()
     ensure_dir(output_path)
+    if not verify_only:
+        with tempfile.TemporaryFile(dir=output_path):
+            pass  # Fail before network access if the mounted directory is not writable.
     ensure_standard_layout(output_path)
     logger.info(f"📁 Output directory: {output_path}")
+    manifest_path = output_path / "manifest.json"
+    previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     manifest = {
         "created": datetime.now().isoformat(),
         "output_dir": str(output_path),
         "verify_only": verify_only,
-        "models": {},
+        "models": previous.get("models", {}).copy(),
         "total_size_mb": 0,
     }
 
@@ -534,13 +601,13 @@ def main(
             if strict:
                 total_fail += 1
     elif not verify_only:
-        generate_mineru_json(output_path)
+        generate_mineru_json(output_path, vlm_model if total_fail == 0 else None, runtime_root)
 
     if not verify_only:
         generate_ultralytics_settings(output_path)
 
     manifest["total_size_mb"] = round(get_size_mb(output_path), 2)
-    (output_path / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_json(manifest_path, manifest)
 
     logger.info("=" * 60)
     logger.info(f"📊 Total size: {manifest['total_size_mb']:.1f} MB | Required failures: {total_fail}")
@@ -554,9 +621,29 @@ if __name__ == "__main__":
     parser.add_argument("--force", action="store_true", help="Re-download even if files exist")
     parser.add_argument("--verify-only", action="store_true", help="Only verify the model layout")
     parser.add_argument("--strict", action="store_true", help="Fail when any selected model is missing or invalid")
+    parser.add_argument(
+        "--vlm-model",
+        choices=["mineru_vlm", "mineru_vlm_pro"],
+        help="Explicitly activate a verified VLM; omitted preserves the current selection",
+    )
+    parser.add_argument(
+        "--runtime-model-root",
+        default="/app/models",
+        help="Model root inside the runtime (use a local absolute path for native macOS)",
+    )
     args = parser.parse_args()
 
     try:
-        sys.exit(main(args.output, args.models, args.force, args.verify_only, args.strict))
+        sys.exit(
+            main(
+                args.output,
+                args.models,
+                args.force,
+                args.verify_only,
+                args.strict,
+                args.vlm_model,
+                args.runtime_model_root,
+            )
+        )
     except KeyboardInterrupt:
         sys.exit(130)

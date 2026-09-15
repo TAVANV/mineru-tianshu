@@ -259,6 +259,10 @@ class MinerUWorkerAPI(ls.LitAPI):
         if "cuda" in str(device):
             self.accelerator = "cuda"
             self.engine_device = "cuda:0"
+        elif "mps" in str(device):
+            self.accelerator = "mps"
+            self.engine_device = "cpu"  # Paddle/audio/video remain on their supported CPU path.
+            os.environ.setdefault("MINERU_DEVICE_MODE", "mps")
         else:
             self.accelerator = "cpu"
             self.engine_device = "cpu"
@@ -293,6 +297,8 @@ class MinerUWorkerAPI(ls.LitAPI):
                     os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = str(vram)
                 except Exception:
                     os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "8"
+            elif self.accelerator == "mps":
+                os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "8"
             else:
                 os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "1"
 
@@ -437,6 +443,9 @@ class MinerUWorkerAPI(ls.LitAPI):
         if not current or current["status"] != "processing" or current.get("is_parent"):
             return
         try:
+            from runtime_modes import validate_pipeline_task
+
+            validate_pipeline_task(file_path, backend)
             if Path(file_path).suffix.lower() == ".zip":
                 self._split_archive(task_id, file_path, task, options)
                 return
@@ -491,6 +500,9 @@ class MinerUWorkerAPI(ls.LitAPI):
                 convert_epub(file_path, out)
                 normalize_output(out, use_rustfs=options.get("use_rustfs"))
                 result = {"result_path": str(out), "content": (out / "result.md").read_text(encoding="utf-8")}
+            elif file_ext in [".docx", ".xlsx", ".pptx"] and options.get("office_parser", "compatible") == "mineru":
+                options["parse_mode"] = "pipeline"
+                result = self._process_with_mineru(file_path, options)
             elif backend == "sensevoice":
                 if not SENSEVOICE_AVAILABLE:
                     raise ValueError("SenseVoice not available")
@@ -656,7 +668,7 @@ class MinerUWorkerAPI(ls.LitAPI):
             from mineru_pipeline import MinerUPipelineEngine
 
             self.mineru_pipeline_engine = MinerUPipelineEngine(
-                device=self.engine_device, vlm_api_base=self.mineru_vllm_api
+                device="mps" if self.accelerator == "mps" else self.engine_device, vlm_api_base=self.mineru_vllm_api
             )
 
         output_dir = Path(self.output_dir) / Path(file_path).stem
@@ -694,8 +706,8 @@ class MinerUWorkerAPI(ls.LitAPI):
         }
 
     def _process_with_paddleocr_vl(self, file_path: str, options: dict) -> dict:
-        if self.accelerator == "cpu":
-            raise RuntimeError("PaddleOCR-VL requires GPU")
+        if self.accelerator != "cuda":
+            raise RuntimeError("PaddleOCR-VL requires CUDA")
 
         if self.paddleocr_vl_engine is None:
             from paddleocr_vl import PaddleOCRVLEngine
@@ -718,8 +730,8 @@ class MinerUWorkerAPI(ls.LitAPI):
         }
 
     def _process_with_paddleocr_vl_vllm(self, file_path: str, options: dict) -> dict:
-        if self.accelerator == "cpu":
-            raise RuntimeError("PaddleOCR-VL-VLLM requires GPU")
+        if self.accelerator != "cuda":
+            raise RuntimeError("PaddleOCR-VL-VLLM requires CUDA")
 
         if self.paddleocr_vl_vllm_engine is None:
             from paddleocr_vl_vllm import PaddleOCRVLVLLMEngine
@@ -875,6 +887,8 @@ class MinerUWorkerAPI(ls.LitAPI):
         Returns:
             {result_path, content, chunks, images, rustfs_urls}
         """
+        if options.get("office_parser", "compatible") == "mineru":
+            return self._process_with_mineru(file_path, options | {"parse_mode": "pipeline"})
         from utils.office_to_markdown import office_to_markdown
         from utils.markdown_image_extractor import chunk_markdown_by_heading
 
@@ -1407,6 +1421,11 @@ def start_litserve_workers(
             distribution("torch")
             if check_cuda_with_nvidia_smi() > 0:
                 return "cuda"
+            import platform
+            import torch
+
+            if platform.machine() in ("arm64", "arm") and torch.backends.mps.is_available():
+                return "mps"
         except Exception:
             pass
         return "cpu"

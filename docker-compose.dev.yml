@@ -24,6 +24,10 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
+      args:
+        PIP_MIRROR: ${PIP_MIRROR:-https://mirrors.aliyun.com/pypi/simple/}
+        PIP_TIMEOUT: ${PIP_TIMEOUT:-600}
+        PIP_RETRIES: ${PIP_RETRIES:-10}
       target: dependencies  # 只构建到依赖阶段，代码通过挂载
     image: tianshu-backend:dev
     container_name: tianshu-backend-dev
@@ -72,6 +76,7 @@ services:
 
       # 模型路径
       - MODEL_PATH=/app/models
+      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - OUTPUT_PATH=/app/output
 
       # 模型下载配置
@@ -102,6 +107,10 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
+      args:
+        PIP_MIRROR: ${PIP_MIRROR:-https://mirrors.aliyun.com/pypi/simple/}
+        PIP_TIMEOUT: ${PIP_TIMEOUT:-600}
+        PIP_RETRIES: ${PIP_RETRIES:-10}
       target: dependencies
     image: tianshu-backend:dev
     container_name: tianshu-worker-dev
@@ -143,6 +152,7 @@ services:
 
       # 模型路径
       - MODEL_PATH=/app/models
+      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - OUTPUT_PATH=/app/output
 
       # 模型下载配置
@@ -171,6 +181,10 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
+      args:
+        PIP_MIRROR: ${PIP_MIRROR:-https://mirrors.aliyun.com/pypi/simple/}
+        PIP_TIMEOUT: ${PIP_TIMEOUT:-600}
+        PIP_RETRIES: ${PIP_RETRIES:-10}
       target: dependencies
     image: tianshu-backend:dev
     container_name: tianshu-mcp-dev
@@ -191,6 +205,7 @@ services:
       - API_BASE_URL=http://backend-dev:8000
       - MCP_HOST=0.0.0.0
       - MCP_API_KEYS=${MCP_API_KEYS:-}
+      - MCP_API_KEY_MAP=${MCP_API_KEY_MAP:-}
       - TIANSHU_API_KEY=${TIANSHU_API_KEY:-}
       - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-localhost:*,127.0.0.1:*}
       - MCP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS:-}

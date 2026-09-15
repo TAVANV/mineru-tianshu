@@ -62,3 +62,10 @@ docker-images
 docker-images-cpu
 models-offline
 cpu-deployment
+
+# Locally supplied large dependency wheels
+backend/wheels/*.whl
+.venv-native/
+
+# Local browser verification artifacts
+.playwright-cli/

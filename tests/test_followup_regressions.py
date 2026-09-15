@@ -109,6 +109,7 @@ def test_recovery_state_and_descendant_deletion_roll_back_together(db, monkeypat
 
 @pytest.mark.parametrize("nested", [False, True])
 def test_accepted_old_failure_callback_cannot_cross_root_retry(db, tmp_path, monkeypatch, nested):
+    monkeypatch.setenv("UPLOAD_PATH", str(tmp_path))
     root = hook_task(db)
     db.convert_to_parent_task(root)
     parent = root

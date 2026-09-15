@@ -1,17 +1,21 @@
 <template>
-  <div class="max-w-4xl mx-auto">
+  <div class="max-w-6xl mx-auto">
     <div class="mb-8">
       <h1 class="text-3xl font-bold text-gray-900">{{ $t('systemConfig.title') }}</h1>
       <p class="mt-2 text-sm text-gray-600">{{ $t('systemConfig.description') }}</p>
     </div>
 
+    <nav class="flex flex-wrap gap-2 mb-6 border-b pb-3" :aria-label="$t('common.settings')">
+      <button v-for="tab in ['all', 'general', 'features', 'integrations']" :key="tab" @click="section = tab"
+        :aria-pressed="section === tab" :class="section === tab ? 'btn btn-primary' : 'btn btn-secondary'">{{ $t(`settingsNav.${tab}`) }}</button>
+    </nav>
     <!-- 加载状态 -->
     <div v-if="loading" class="flex justify-center py-12">
       <LoadingSpinner />
     </div>
 
     <!-- 配置表单 -->
-    <div v-else class="bg-white rounded-lg shadow-md p-6">
+    <div v-else v-show="section === 'all' || section === 'general'" class="bg-white rounded-lg shadow-md p-6">
       <form @submit.prevent="handleSubmit" class="space-y-6">
         <!-- 系统名称 -->
         <div>
@@ -178,7 +182,8 @@
         </div>
       </div>
     </div>
-    <OptionalFeatures />
+    <OptionalFeatures v-show="section === 'all' || section === 'features'" />
+    <IntegrationKeys v-show="section === 'all' || section === 'integrations'" />
   </div>
 </template>
 
@@ -187,11 +192,13 @@ import { ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { getSystemConfig, updateSystemConfig, uploadSystemLogo, type SystemConfig } from '@/api'
 import { toast } from '@/utils/toast'
+import IntegrationKeys from '@/components/IntegrationKeys.vue'
 import OptionalFeatures from '@/components/OptionalFeatures.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 
 const { t } = useI18n()
 
+const section = ref('all')
 const loading = ref(true)
 const saving = ref(false)
 const uploading = ref(false)

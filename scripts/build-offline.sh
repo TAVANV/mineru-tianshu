@@ -127,6 +127,7 @@ main() {
 
     DOCKER_BUILDKIT=1 docker buildx build \
         --platform "linux/$PLATFORM" \
+        --build-arg "PIP_MIRROR=${PIP_MIRROR:-https://mirrors.aliyun.com/pypi/simple/}" \
         --file backend/Dockerfile.offline \
         --tag tianshu-backend:latest \
         --load \

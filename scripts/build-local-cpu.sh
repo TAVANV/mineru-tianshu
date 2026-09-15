@@ -82,7 +82,8 @@ echo ""
 # --load: 构建完成后加载到本地 Docker
 docker buildx build \
     --platform linux/amd64 \
-    --file backend/Dockerfile.cpu \
+    --build-arg "PIP_MIRROR=${PIP_MIRROR:-https://mirrors.aliyun.com/pypi/simple/}" \
+        --file backend/Dockerfile.cpu \
     --tag tianshu-backend-cpu:latest \
     --load \
     .

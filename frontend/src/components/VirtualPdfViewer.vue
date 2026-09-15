@@ -8,9 +8,9 @@
       <div class="bg-red-50 p-4 rounded-full mb-3 text-red-500">
         <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
       </div>
-      <div class="text-gray-900 font-semibold text-lg mb-1">PDF 加载失败</div>
+      <div class="text-gray-900 font-semibold text-lg mb-1">{{ uiText('legacyUi.text15') }}</div>
       <div class="text-gray-500 text-xs break-all max-w-md bg-gray-50 p-2 rounded border border-gray-100 mb-4">{{ error }}</div>
-      <button @click="retry" class="px-5 py-2 bg-primary-600 hover:bg-primary-700 text-white rounded-lg transition shadow-sm text-sm font-medium">重新加载</button>
+      <button @click="retry" class="px-5 py-2 bg-primary-600 hover:bg-primary-700 text-white rounded-lg transition shadow-sm text-sm font-medium">{{ uiText('legacyUi.text16') }}</button>
     </div>
 
     <div ref="scrollContainer" class="flex-1 overflow-y-auto w-full custom-scrollbar relative outline-none" @scroll="onScroll" tabindex="0">
@@ -61,6 +61,8 @@
 </template>
 
 <script setup lang="ts">
+import { useI18n as useUiI18n } from 'vue-i18n'
+const { t: uiText } = useUiI18n()
 import { ref, computed, watch, nextTick, onUnmounted, onMounted } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorker from 'pdfjs-dist/build/pdf.worker?url'
@@ -248,7 +250,7 @@ const loadPdf = async (url: string) => {
     progress.value = 80
     await buildPageSkeletons()
   } catch (err: any) {
-    error.value = 'PDF解析失败，请检查文件格式。'
+    error.value = uiText('legacyUi.text17')
   } finally {
     loading.value = false; progress.value = 100
   }

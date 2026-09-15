@@ -27,6 +27,7 @@
   watermark_models/      -> /root/.cache/watermark_models/     <- YOLO / LaMa(LAMA_MODEL)
 """
 
+import argparse
 import os
 import sys
 import json
@@ -37,22 +38,27 @@ from pathlib import Path
 # ------------------------------------------------------------------------------
 # 0. 目录与环境
 # ------------------------------------------------------------------------------
-ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else "/data/modelfiles").resolve()
+ROOT = Path("/data/modelfiles")
 PADDLEX = ROOT / "paddlex_cache"
 MSCOPE = ROOT / "modelscope_cache"
 WMARK = ROOT / "watermark_models"
 ULTRA = ROOT / "ultralytics_cfg"
+ACTIVE_VLM = None
 
-for p in [ROOT, PADDLEX / "official_models", PADDLEX / "fonts", MSCOPE, WMARK, ULTRA]:
-    p.mkdir(parents=True, exist_ok=True)
 
-# 国内镜像（按需改/删）
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-# 音频：funasr 只认 MODELSCOPE_CACHE —— 关键！
-os.environ["MODELSCOPE_CACHE"] = str(MSCOPE)
-# PaddleX：模型落到 PADDLEX_HOME/official_models
-os.environ["PADDLEX_HOME"] = str(PADDLEX)
-os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+def configure_root(root):
+    global ROOT, PADDLEX, MSCOPE, WMARK, ULTRA
+    ROOT = Path(root).resolve()
+    PADDLEX, MSCOPE, WMARK, ULTRA = [
+        ROOT / name for name in ("paddlex_cache", "modelscope_cache", "watermark_models", "ultralytics_cfg")
+    ]
+    for path in [ROOT, PADDLEX / "official_models", PADDLEX / "fonts", MSCOPE, WMARK, ULTRA]:
+        path.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    os.environ["MODELSCOPE_CACHE"] = str(MSCOPE)
+    os.environ["PADDLEX_HOME"] = str(PADDLEX)
+    os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+
 
 _ok, _fail = [], []
 # 收集"墙外源、下载失败需手动放置"的文件，末尾统一给出放置指引
@@ -66,7 +72,14 @@ def _fetch_or_keep(dst, url, hint=""):
         print(f"   ✓ 已就位: {dst}")
         return True
     try:
-        urllib.request.urlretrieve(url, str(dst))
+        partial = dst.with_name(dst.name + ".download")
+        try:
+            urllib.request.urlretrieve(url, str(partial))
+            if not partial.stat().st_size:
+                raise ValueError("Downloaded file is empty")
+            os.replace(partial, dst)
+        finally:
+            partial.unlink(missing_ok=True)
         print(f"   -> 下载完成: {dst}")
         return True
     except Exception as e:
@@ -170,15 +183,17 @@ def dl_extras():
 # ------------------------------------------------------------------------------
 def gen_mineru_json():
     step("Generate mineru.json (container paths)")
-    cfg = {
-        "models-dir": {
-            "pipeline": "/app/models/PDF-Extract-Kit-1.0/models",
-            "vlm": "/app/models/MinerU2.5-2509-1.2B",
-        },
-        "config_version": "1.3.1",
-    }
-    (ROOT / "mineru.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=4))
+    from download_models import generate_mineru_json
+
+    generate_mineru_json(ROOT, ACTIVE_VLM)
     print(f"   -> {ROOT / 'mineru.json'}")
+
+
+def dl_mineru_pro():
+    from download_models import main as prepare
+
+    if prepare(str(ROOT), selected_models="mineru_vlm_pro", strict=True, vlm_model=ACTIVE_VLM):
+        raise RuntimeError("New VLM preparation failed; existing model selection is unchanged")
 
 
 # ------------------------------------------------------------------------------
@@ -194,11 +209,31 @@ TASKS = [
 ]
 
 
-def main():
+def main(argv=None):
+    global ACTIVE_VLM
+    parser = argparse.ArgumentParser(
+        description="Prepare the existing external-model layout; new VLM downloads are opt-in"
+    )
+    parser.add_argument("root", nargs="?", default="/data/modelfiles")
+    parser.add_argument(
+        "--only",
+        choices=["mineru-vlm-pro"],
+        help="Download only the additional Pro model; leave audio/Paddle caches intact",
+    )
+    parser.add_argument(
+        "--vlm-model", choices=["mineru_vlm", "mineru_vlm_pro"], help="Explicitly activate a verified VLM"
+    )
+    args = parser.parse_args(argv)
+    configure_root(args.root)
+    ACTIVE_VLM = args.vlm_model
+    _ok.clear()
+    _fail.clear()
+    _manual.clear()
+    tasks = [("MinerU Pro VLM", dl_mineru_pro)] if args.only else TASKS
     print(f"📁 模型根目录: {ROOT}")
     print(f"   MODELSCOPE_CACHE = {MSCOPE}")
     print(f"   PADDLEX_HOME     = {PADDLEX}")
-    for name, fn in TASKS:
+    for name, fn in tasks:
         try:
             fn()
             _ok.append(name)
@@ -225,13 +260,17 @@ def main():
         print("   ⚠️ LaMa github 直链国内可加代理前缀: https://mirror.ghproxy.com/")
         print("!" * 70)
 
+    active_vlm_dir = "MinerU2.5-2509-1.2B"
+    config_path = ROOT / "mineru.json"
+    if config_path.exists():
+        active_vlm_dir = Path(json.loads(config_path.read_text())["models-dir"]["vlm"]).name
     print(
         f"""
 下一步：docker-compose 按下面挂载（worker 和 backend 服务都加），保证路径一致：
 
     volumes:
       - {ROOT}/PDF-Extract-Kit-1.0:/app/models/PDF-Extract-Kit-1.0:ro
-      - {ROOT}/MinerU2.5-2509-1.2B:/app/models/MinerU2.5-2509-1.2B:ro
+      - {ROOT}/{active_vlm_dir}:/app/models/{active_vlm_dir}:ro
       - {ROOT}/mineru.json:/app/models/mineru.json:ro
       - {ROOT}/paddlex_cache:/root/.paddlex:rw
       - {ROOT}/modelscope_cache:/root/.cache/modelscope:rw
@@ -241,6 +280,7 @@ def main():
     environment:
       - MODEL_DOWNLOAD_SOURCE=local
       - MINERU_MODEL_SOURCE=local
+      - MINERU_VLM_MODEL_DIR={active_vlm_dir}
       - HF_OFFLINE=1
       - HF_HUB_OFFLINE=1
       - TRANSFORMERS_OFFLINE=1
@@ -254,7 +294,7 @@ def main():
 
 验证（起容器前在宿主机确认这些文件/目录存在）：
       ls {ROOT}/PDF-Extract-Kit-1.0/models/
-      ls {ROOT}/MinerU2.5-2509-1.2B/*.safetensors
+      ls {ROOT}/{active_vlm_dir}/*.safetensors
       ls {ROOT}/paddlex_cache/official_models/        # 应有 PaddleOCR-VL-1.5-0.9B 及若干 PP-*
       ls {ROOT}/modelscope_cache/hub/iic/             # 应有 5 个音频模型
       ls {ROOT}/watermark_models/yolo11x_watermark.pt {ROOT}/watermark_models/big-lama.pt

@@ -168,8 +168,15 @@ class TaskDB:
         with self.get_cursor() as cursor:
             cursor.execute("BEGIN IMMEDIATE")
             columns = {row[1] for row in cursor.execute("PRAGMA table_info(tasks)")}
+            if "api_key_id" not in columns:
+                cursor.execute("ALTER TABLE tasks ADD COLUMN api_key_id TEXT")
             if "merge_claimed" not in columns:
                 cursor.execute("ALTER TABLE tasks ADD COLUMN merge_claimed INTEGER NOT NULL DEFAULT 0")
+
+        from file_access_index import init_schema as init_file_access
+
+        with self.get_cursor() as cursor:
+            init_file_access(cursor)
 
         from webhooks import init_schema
 
@@ -185,6 +192,7 @@ class TaskDB:
         priority: int = 0,
         user_id: str = None,
         webhook_config: dict = None,
+        api_key_id: str = None,
     ) -> str:
         """
         创建新任务
@@ -193,10 +201,10 @@ class TaskDB:
         with self.get_cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO tasks (task_id, file_name, file_path, backend, options, priority, user_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tasks (task_id, file_name, file_path, backend, options, priority, user_id, api_key_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-                (task_id, file_name, file_path, backend, json.dumps(options or {}), priority, user_id),
+                (task_id, file_name, file_path, backend, json.dumps(options or {}), priority, user_id, api_key_id),
             )
 
             if webhook_config:
@@ -581,38 +589,26 @@ class TaskDB:
     # 核心修复：物理删除文件逻辑
     # -------------------------------------------------------------------------
     def get_task_by_file_path(self, full_path: Path, root: Path, output: bool = False) -> Optional[Dict]:
-        """Exact canonical ownership lookup; handles nested ZIP/PDF results and legacy paths.
+        from file_access_index import lookup
 
-        Unlike upstream's basename LIKE fallback, compare complete paths. Choose the
-        most specific result directory so a parent cannot mask a nested task owner.
-        """
-        full_path, root = Path(full_path).resolve(), Path(root).resolve()
-        if not full_path.is_relative_to(root):
-            return None
-        column = "result_path" if output else "file_path"
-        with self.get_cursor() as cursor:
-            cursor.execute(f"SELECT * FROM tasks WHERE {column} IS NOT NULL")
-            rows = cursor.fetchall()
-        matches = []
-        for row in rows:
-            if row[column] == "CLEARED":
-                continue
-            candidate = Path(row[column]).resolve()
-            if not candidate.is_relative_to(root):
-                continue
-            if (output and full_path.is_relative_to(candidate)) or (not output and full_path == candidate):
-                matches.append((len(candidate.parts), dict(row)))
-        return max(matches, key=lambda item: item[0])[1] if matches else None
+        return lookup(self, full_path, root, output)
 
     def _delete_task_files(self, task_row):
         """辅助方法：安全删除任务的源文件和结果目录"""
         task_id = task_row["task_id"]
+        project = Path(__file__).resolve().parent.parent
+        output_root = Path(os.getenv("OUTPUT_PATH", str(project / "data/output"))).resolve()
+        upload_root = Path(os.getenv("UPLOAD_PATH", str(project / "input"))).resolve()
 
         # 1. 删除上传的源文件
         if task_row["file_path"]:
             try:
                 fp = Path(task_row["file_path"])
-                if fp.exists() and fp.is_file():
+                resolved = fp.resolve()
+                if (
+                    any(resolved != root and resolved.is_relative_to(root) for root in (upload_root, output_root))
+                    and fp.is_file()
+                ):
                     fp.unlink()
                     logger.debug(f"Deleted source file for task {task_id}")
             except Exception as e:
@@ -622,7 +618,8 @@ class TaskDB:
         if task_row["result_path"]:
             try:
                 rp = Path(task_row["result_path"])
-                if rp.exists() and rp.is_dir():
+                resolved = rp.resolve()
+                if resolved != output_root and resolved.is_relative_to(output_root) and rp.is_dir():
                     shutil.rmtree(rp)
                     logger.debug(f"Deleted result dir for task {task_id}")
             except Exception as e:

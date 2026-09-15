@@ -16,7 +16,7 @@ import shutil  # ✅ 用于删除非空目录
 import mimetypes  # ✅ 用于自动识别文件类型
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 from urllib.parse import quote, unquote, parse_qsl, urlencode
 
 import anyio
@@ -258,6 +258,9 @@ async def submit_task(
     remove_watermark: bool = Form(False, description="是否启用水印去除"),
     watermark_conf_threshold: float = Form(0.35, description="水印检测置信度阈值"),
     watermark_dilation: int = Form(10, description="水印掩码膨胀大小"),
+    office_parser: Literal["compatible", "mineru"] = Form(
+        "compatible", description="Office parser; compatible preserves existing custom processing"
+    ),
     convert_office_to_pdf: bool = Form(False, description="是否将 Office 文件转换为 PDF 后再处理"),
     useDocOrientationClassify: bool = Form(False, description="文档方向分类"),
     useDocUnwarping: bool = Form(False, description="文档去弯曲"),
@@ -293,12 +296,17 @@ async def submit_task(
     from webhooks import subscription
 
     try:
-        webhook_config = await anyio.to_thread.run_sync(lambda: subscription(webhook_url, db.db_path))
+        webhook_config = await anyio.to_thread.run_sync(
+            lambda: subscription(webhook_url, db.db_path, getattr(current_user, "api_key_id", None))
+        )
     except (ValueError, OSError):
         raise HTTPException(status_code=400, detail="Invalid webhook endpoint or host not allowed")
     try:
         safe_filename = sanitize_filename(file.filename)
-    except FilenameValidationError as exc:
+        from runtime_modes import validate_pipeline_task
+
+        validate_pipeline_task(safe_filename, backend)
+    except (FilenameValidationError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     try:
         unique_filename = f"{uuid.uuid4().hex}_{safe_filename}"
@@ -311,11 +319,20 @@ async def submit_task(
                 chunk = await file.read(1 << 20)
                 if not chunk:
                     break
+                if uploaded_bytes == 0 and os.getenv("UPLOAD_VALIDATE_CONTENT", "false").lower() == "true":
+                    from utils.upload_validation import validate_signature
+
+                    try:
+                        validate_signature(safe_filename, chunk)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=400, detail=str(exc))
                 uploaded_bytes += len(chunk)
                 if max_bytes > 0 and uploaded_bytes > max_bytes:
                     raise HTTPException(status_code=413, detail="File too large")
                 await temp_file.write(chunk)
 
+        if uploaded_bytes == 0 and os.getenv("UPLOAD_VALIDATE_CONTENT", "false").lower() == "true":
+            raise HTTPException(status_code=400, detail="Empty file")
         options = {
             "lang": lang,
             "method": method,
@@ -343,6 +360,7 @@ async def submit_task(
             "watermark_conf_threshold": watermark_conf_threshold,
             "watermark_dilation": watermark_dilation,
             "convert_office_to_pdf": convert_office_to_pdf,
+            "office_parser": office_parser,
             "useDocOrientationClassify": useDocOrientationClassify,
             "useDocUnwarping": useDocUnwarping,
             "useLayoutDetection": useLayoutDetection,
@@ -376,6 +394,7 @@ async def submit_task(
                 priority=priority,
                 user_id=current_user.user_id,
                 webhook_config=webhook_config,
+                api_key_id=getattr(current_user, "api_key_id", None),
             )
         )
 
@@ -702,6 +721,10 @@ def _remove_task_output(task):
 
     for d in targets:
         try:
+            resolved = d.resolve()
+            if resolved == OUTPUT_DIR.resolve() or not resolved.is_relative_to(OUTPUT_DIR.resolve()):
+                logger.warning("Skipping task output outside the output directory")
+                continue
             if d.is_dir():
                 shutil.rmtree(d, ignore_errors=True)
             elif d.exists():
@@ -725,7 +748,7 @@ def _purge_task_files(task, child_tasks):
         tid = item.get("task_id")
         if tid:
             split_dir = OUTPUT_DIR / "splits" / tid
-            if split_dir.exists():
+            if split_dir.resolve().is_relative_to(OUTPUT_DIR.resolve()) and split_dir.exists():
                 shutil.rmtree(split_dir, ignore_errors=True)
 
     for t in [task] + (child_tasks or []):
@@ -733,7 +756,14 @@ def _purge_task_files(task, child_tasks):
         if fp:
             p = Path(fp)
             try:
-                if p.exists() and p.is_file():
+                resolved = p.resolve()
+                if (
+                    any(
+                        resolved != root.resolve() and resolved.is_relative_to(root.resolve())
+                        for root in (UPLOAD_DIR, OUTPUT_DIR)
+                    )
+                    and p.is_file()
+                ):
                     p.unlink()
             except Exception as e:
                 logger.warning(f"⚠️ Failed to delete source file {p}: {e}")

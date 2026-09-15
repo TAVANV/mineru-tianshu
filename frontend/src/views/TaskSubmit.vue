@@ -246,6 +246,12 @@
                           <input v-model="config.convert_office_to_pdf" type="checkbox" class="form-checkbox text-primary-600 rounded border-gray-300 h-4 w-4" />
                           <span class="ml-2 text-sm font-medium text-gray-800">{{ $t('task.officeToPdf') }}</span>
                         </label>
+                        <label class="block mt-3 text-sm">{{ $t('task.officeParser') }}
+                          <select v-model="config.office_parser" class="mt-1 block w-full rounded border-gray-300">
+                            <option value="compatible">{{ $t('task.officeCompatible') }}</option>
+                            <option value="mineru">{{ $t('task.officeNative') }}</option>
+                          </select>
+                        </label>
                         <p class="pl-6 mt-1 text-xs text-gray-500">
                           {{ $t('task.officeToPdfHint') }}
                         </p>
@@ -355,7 +361,7 @@
                         </div>
                         <div class="col-span-2">
                           <label class="block text-[10px] text-gray-500 mb-1">{{ $t('task.markdownIgnoreLabels') }}</label>
-                          <input v-model="config.markdownIgnoreLabels" type="text" class="w-full form-input-sm" placeholder="逗号分隔" />
+                          <input v-model="config.markdownIgnoreLabels" type="text" class="w-full form-input-sm" :placeholder="uiText('legacyUi.text52')" />
                         </div>
                       </div>
                    </div>
@@ -457,6 +463,8 @@
 </template>
 
 <script setup lang="ts">
+import { useI18n as useUiI18n } from 'vue-i18n'
+const { t: uiText } = useUiI18n()
 import { ref, reactive, computed, watch, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
@@ -503,6 +511,7 @@ const defaultConfig = {
 
   // 预处理
   convert_office_to_pdf: false,
+  office_parser: 'compatible' as 'compatible' | 'mineru',
 
   // 图片存储: 任务级 RustFS 开关 (undefined=跟随系统配置; true=上传对象存储; false=保留本地)
   webhook_url: '',

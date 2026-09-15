@@ -5,6 +5,10 @@
 # ============================================================================
 
 FROM nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04 AS base
+ARG PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple/
+ARG PIP_TIMEOUT=600
+ARG PIP_RETRIES=10
+ENV PIP_DEFAULT_TIMEOUT=${PIP_TIMEOUT} PIP_RETRIES=${PIP_RETRIES}
 
 # 1. [网络优化] 阿里云源 + 抗干扰配置
 RUN sed -i 's/archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list.d/ubuntu.sources && \
@@ -41,19 +45,22 @@ RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade --ignore-installed pip "setuptools>=75.0.0" wheel \
-    -i https://mirrors.aliyun.com/pypi/simple/ --break-system-packages
+    -i ${PIP_MIRROR} --break-system-packages
 
 # -----------------------------------------------------------------------------
 # Stage 2: Dependencies Installation
 # -----------------------------------------------------------------------------
 FROM base AS dependencies
+ARG PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple/
+COPY backend/wheels/ /opt/tianshu-wheels/
+ENV PIP_FIND_LINKS=/opt/tianshu-wheels
 WORKDIR /tmp
 COPY backend/requirements.txt /tmp/requirements.txt
 ARG PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple/
 
 # Step 1: [地基] 锁定科学计算基础包
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "numpy==1.26.4" "pandas>=1.3.0" "psutil" "py-cpuinfo" -i ${PIP_MIRROR} --break-system-packages
+    pip install "numpy==1.26.4" "scipy>=1.13,<1.15" "pandas>=1.3.0" "psutil" "py-cpuinfo" -i ${PIP_MIRROR} --break-system-packages
 
 # Step 2: [框架A] PyTorch 2.10.0+cu130
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -67,20 +74,20 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # 加入了日志中提示缺失的所有包
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install "huggingface-hub<1.0" \
-                "mineru[all]>=3.0.9" \
+                "mineru[pipeline,vlm,s3]==3.4.5" \
                 "paddleocr[all]>=3.4.0" \
                 "paddlex>=3.4.1" \
                 "transformers==4.57.6" \
                 "openai>=1.50.0" \
                 "boto3>=1.34.0" \
                 "botocore>=1.34.0" \
-                "pypdf>=5.1.0" \
+                "pypdf>=5.6.0" \
                 "reportlab" \
                 "pdfminer.six>=20251230" \
                 "albumentations>=1.4.11" \
-                "opencv-python>=4.11.0.86" \
+                "opencv-python==4.11.0.86" \
                 "scikit-image>=0.25.0" \
-                "mineru-vl-utils" \
+                "mineru-vl-utils>=1.0.5,<2" \
                 "qwen-vl-utils" \
                 "doclayout-yolo==0.0.4" \
                 "prettytable" \
@@ -102,7 +109,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Step 6: [扩展] FlashAttention (必须在 torch 版本确认后最后安装)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp312-cp312-linux_x86_64.whl --break-system-packages
+    if ls /opt/tianshu-wheels/flash_attn-*.whl > /dev/null 2>&1; then \
+        pip install /opt/tianshu-wheels/flash_attn-*.whl --break-system-packages; \
+    else \
+        pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp312-cp312-linux_x86_64.whl --break-system-packages; \
+    fi
 
 # Step 7: [最终验证]
 RUN python -c "import torch; import flash_attn; import pypdf; import boto3; import botocore; import openai; print('✅ All Backend Dependencies Verified')" && \

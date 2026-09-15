@@ -3,10 +3,10 @@
     <div class="flex items-center justify-between mb-4 px-1 flex-shrink-0">
       <div class="flex items-center gap-4">
         <button @click="$router.back()" class="text-sm text-gray-600 hover:text-gray-900 flex items-center transition-colors">
-          <ArrowLeft class="w-4 h-4 mr-1" /> 返回
+          <ArrowLeft class="w-4 h-4 mr-1" /> {{ $t('legacyUi.extra0') }}
         </button>
         <div class="h-4 w-px bg-gray-300"></div>
-        <h1 class="text-xl font-bold text-gray-900 truncate max-w-md" :title="task?.file_name">{{ task?.file_name || '任务详情' }}</h1>
+        <h1 class="text-xl font-bold text-gray-900 truncate max-w-md" :title="task?.file_name">{{ task?.file_name || uiText('legacyUi.text42') }}</h1>
         <StatusBadge v-if="task" :status="task.status" />
       </div>
 
@@ -15,24 +15,24 @@
             <button v-if="['pending', 'processing', 'paused'].includes(task.status)" @click="initiateAction('cancel')" :disabled="actionLoading" class="btn btn-secondary btn-sm">{{ $t('task.cancelTask') }}</button>
             <button v-if="task.status === 'failed'" @click="initiateAction('retry')" :disabled="actionLoading" class="btn btn-white text-blue-600 border-gray-200 hover:bg-blue-50 btn-sm flex items-center shadow-sm transition-all disabled:opacity-50">
               <RotateCw :class="{'animate-spin': actionLoading && currentAction === 'retry'}" class="w-4 h-4 mr-1.5" />
-              <span>重试任务</span>
+              <span>{{ uiText('legacyUi.text32') }}</span>
             </button>
             <button v-if="['completed', 'failed'].includes(task.status) && task.result_path !== 'CLEARED'" @click="initiateAction('clearCache')" :disabled="actionLoading" class="btn btn-white text-orange-600 border-gray-200 hover:bg-orange-50 btn-sm flex items-center shadow-sm transition-all disabled:opacity-50">
               <Eraser :class="{'animate-pulse': actionLoading && currentAction === 'clearCache'}" class="w-4 h-4 mr-1.5" />
-              <span>清理缓存</span>
+              <span>{{ uiText('legacyUi.text33') }}</span>
             </button>
-            <button @click="initiateAction('delete')" :disabled="actionLoading" class="btn btn-white text-red-600 border-gray-200 hover:bg-red-50 btn-sm flex items-center shadow-sm transition-all disabled:opacity-50" title="彻底删除任务及文件">
+            <button @click="initiateAction('delete')" :disabled="actionLoading" class="btn btn-white text-red-600 border-gray-200 hover:bg-red-50 btn-sm flex items-center shadow-sm transition-all disabled:opacity-50" :title="uiText('legacyUi.text35')">
               <Trash2 class="w-4 h-4 mr-1.5" />
-              <span class="hidden sm:inline">彻底删除</span>
+              <span class="hidden sm:inline">{{ uiText('legacyUi.text34') }}</span>
             </button>
         </template>
 
         <div v-if="task?.status === 'completed' && (pdfUrl || imageUrl) && task?.result_path !== 'CLEARED'" class="flex items-center bg-gray-100 rounded-lg p-1">
           <button @click="setMode('single')" :class="['px-3 py-1.5 text-xs font-medium rounded-md transition-all flex items-center', layoutMode === 'single' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700']">
-            <FileText class="w-3.5 h-3.5 mr-1.5" /> 单栏视图
+            <FileText class="w-3.5 h-3.5 mr-1.5" /> {{ $t('legacyUi.extra1') }}
           </button>
           <button @click="setMode('split')" :class="['px-3 py-1.5 text-xs font-medium rounded-md transition-all flex items-center', layoutMode === 'split' ? 'bg-white text-primary-600 shadow-sm' : 'text-gray-500 hover:text-gray-700']">
-            <Columns class="w-3.5 h-3.5 mr-1.5" /> 双栏视图
+            <Columns class="w-3.5 h-3.5 mr-1.5" /> {{ $t('legacyUi.extra2') }}
           </button>
         </div>
 
@@ -40,13 +40,13 @@
       </div>
     </div>
 
-    <div v-if="loading && !task" class="flex-1 flex items-center justify-center"><LoadingSpinner size="lg" text="加载中..." /></div>
+    <div v-if="loading && !task" class="flex-1 flex items-center justify-center"><LoadingSpinner size="lg" :text="uiText('legacyUi.text14')" /></div>
     <div v-else-if="error" class="card bg-red-50 border-red-200 mx-1 p-4 mb-4"><div class="flex items-center text-red-800"><AlertCircle class="w-6 h-6 mr-3" /> {{ error }}</div></div>
 
     <div v-else-if="task" class="flex-1 min-h-0 relative">
       <div v-if="['pending', 'processing', 'paused'].includes(task.status)" class="max-w-3xl mx-auto mt-16 space-y-6 px-4">
          <div class="card p-10 text-center shadow-sm">
-            <h2 class="text-xl font-semibold text-gray-900 mb-2">处理中...</h2>
+            <h2 class="text-xl font-semibold text-gray-900 mb-2">{{ uiText('legacyUi.text38') }}</h2>
             <div class="mt-8 flex justify-center"><LoadingSpinner size="lg" /></div>
             <div v-if="task.subtask_progress" class="mt-4 space-y-2 text-sm">
               <p>{{ task.subtask_progress.completed }} / {{ task.subtask_progress.total }} ({{ task.subtask_progress.percentage }}%)</p>
@@ -62,8 +62,8 @@
       <div v-else-if="['failed', 'cancelled'].includes(task.status)" class="max-w-3xl mx-auto mt-10 space-y-6 px-4">
          <div class="card p-8 text-center border-red-100 bg-red-50/50">
             <div class="flex justify-center mb-4"><div class="p-3 bg-red-100 rounded-full text-red-500"><AlertCircle class="w-8 h-8" /></div></div>
-            <h2 class="text-xl font-semibold text-red-700 mb-2">{{ task.status === 'cancelled' ? $t('task.cancelledLabel') : '任务失败' }}</h2>
-            <div class="text-red-600 bg-white p-4 rounded-lg border border-red-200 font-mono text-sm text-left overflow-auto max-h-64 break-all shadow-sm">{{ task.status === 'cancelled' ? $t('task.cancelledHelp') : task.error_message || '未知错误' }}</div>
+            <h2 class="text-xl font-semibold text-red-700 mb-2">{{ task.status === 'cancelled' ? $t('task.cancelledLabel') : uiText('legacyUi.text41') }}</h2>
+            <div class="text-red-600 bg-white p-4 rounded-lg border border-red-200 font-mono text-sm text-left overflow-auto max-h-64 break-all shadow-sm">{{ task.status === 'cancelled' ? $t('task.cancelledHelp') : task.error_message || uiText('legacyUi.text45') }}</div>
          </div>
       </div>
 
@@ -71,7 +71,7 @@
 
         <div v-if="showPdf" :class="['card p-0 flex flex-col h-full border border-gray-200 relative shadow-sm min-w-0 transition-all duration-300', layoutMode === 'split' ? 'flex-1 basis-1/2' : 'flex-1 basis-full']">
           <div class="bg-gray-50 px-3 py-2 border-b border-gray-200 flex justify-between items-center shrink-0">
-            <span class="text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ imageUrl ? '源图片预览' : '源文档预览 (悬浮出现互动热区)' }}</span>
+            <span class="text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ imageUrl ? uiText('legacyUi.text46') : uiText('legacyUi.text47') }}</span>
           </div>
 
           <div class="flex-1 relative overflow-auto min-h-0 bg-gray-200">
@@ -89,15 +89,15 @@
         <div v-if="showMarkdown" :class="['card p-0 flex flex-col h-full shadow-sm border border-gray-200 min-w-0 transition-all duration-300', layoutMode === 'split' ? 'flex-1 basis-1/2' : 'flex-1 basis-full']">
           <div class="bg-gray-50 px-3 py-2 border-b border-gray-200 flex justify-between items-center shrink-0">
             <div class="flex items-center bg-gray-200 rounded p-0.5">
-              <button @click="activeTab = 'markdown'" :class="['tab-btn', activeTab==='markdown' ? 'active' : '']">完整文档</button>
+              <button @click="activeTab = 'markdown'" :class="['tab-btn', activeTab==='markdown' ? 'active' : '']">{{ uiText('legacyUi.text39') }}</button>
               <button @click="activeTab = 'sync'" :class="['tab-btn flex items-center gap-1', activeTab==='sync' ? 'active' : '']">
-                双向定位
+                {{ $t('legacyUi.extra3') }}
                 <span v-if="activeBlockId" class="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
               </button>
               <button @click="activeTab = 'json'" :class="['tab-btn', activeTab==='json' ? 'active' : '']">JSON</button>
             </div>
             <button @click="downloadMarkdown" class="text-xs text-primary-600 hover:underline flex items-center">
-              <Download class="w-3 h-3 mr-1"/> 下载文件
+              <Download class="w-3 h-3 mr-1"/> {{ $t('legacyUi.extra4') }}
             </button>
           </div>
 
@@ -113,7 +113,7 @@
             <div v-else-if="activeTab === 'sync'" class="w-full max-w-[800px] mx-auto">
               <div v-if="layoutData.length > 0" class="flex flex-col gap-3">
                 <div class="text-xs text-gray-500 bg-blue-50 p-2.5 rounded-lg mb-3 border border-blue-100">
-                  💡 此视图用于与左侧 PDF 进行行级别的双向点击定位。如果需要阅读带有精美排版和公式的全局文档，请切换至上方【完整文档】标签。
+                  {{ $t('legacyUi.extra8') }}
                 </div>
 
                 <div
@@ -125,10 +125,10 @@
                            activeBlockId === block.id
                              ? 'bg-yellow-50 border-yellow-400 shadow-sm ring-2 ring-yellow-200'
                              : 'bg-white border-gray-100 hover:bg-gray-50 hover:border-gray-300']"
-                  title="点击在左侧 PDF 中定位"
+                  :title="uiText('legacyUi.text48')"
                 >
-                  <div v-if="block.type === 'image'" class="text-blue-500 text-xs font-semibold mb-1 flex items-center gap-1 select-none"><Image class="w-3.5 h-3.5"/> [提取图片]</div>
-                  <div v-else-if="block.type === 'table'" class="text-green-500 text-xs font-semibold mb-1 flex items-center gap-1 select-none"><Table class="w-3.5 h-3.5"/> [提取表格]</div>
+                  <div v-if="block.type === 'image'" class="text-blue-500 text-xs font-semibold mb-1 flex items-center gap-1 select-none"><Image class="w-3.5 h-3.5"/> {{ uiText('legacyUi.text36') }}</div>
+                  <div v-else-if="block.type === 'table'" class="text-green-500 text-xs font-semibold mb-1 flex items-center gap-1 select-none"><Table class="w-3.5 h-3.5"/> {{ uiText('legacyUi.text37') }}</div>
                   <div v-else-if="block.type === 'doc_title'" class="text-lg font-bold text-gray-900 mb-1 border-b pb-1">{{ block.text }}</div>
 
                   <div v-if="block.type === 'table'" class="w-full overflow-x-auto mt-2 markdown-table-override">
@@ -137,7 +137,7 @@
                   <div v-else-if="block.type !== 'doc_title'" class="whitespace-pre-wrap font-mono text-gray-600">{{ block.text }}</div>
                 </div>
               </div>
-              <div v-else class="text-gray-500 text-sm italic text-center mt-10">未能提取到结构化版面数据。</div>
+              <div v-else class="text-gray-500 text-sm italic text-center mt-10">{{ uiText('legacyUi.text40') }}</div>
             </div>
 
             <div v-else class="h-full w-full flex-1 flex min-h-0">
@@ -155,6 +155,8 @@
 </template>
 
 <script setup lang="ts">
+import { useI18n as useUiI18n } from 'vue-i18n'
+const { t: uiText } = useUiI18n()
 import { authenticatedFileUrl } from '@/api/fileUrl'
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
@@ -341,11 +343,11 @@ function initiateAction(action: 'retry' | 'clearCache' | 'delete' | 'cancel') {
   if (action === 'cancel') {
     confirmTitle.value = t('task.cancelTask'); confirmMessage.value = t('task.cancelGroupConfirm'); confirmType.value = 'warning'
   } else if (action === 'retry') {
-    confirmTitle.value = '重试任务'; confirmMessage.value = '确定重试吗？'; confirmType.value = 'info'
+    confirmTitle.value = uiText('legacyUi.text32'); confirmMessage.value = uiText('legacyUi.text50'); confirmType.value = 'info'
   } else if (action === 'clearCache') {
-    confirmTitle.value = '清理缓存'; confirmMessage.value = '确定清理吗？'; confirmType.value = 'warning'
+    confirmTitle.value = uiText('legacyUi.text33'); confirmMessage.value = uiText('legacyUi.text49'); confirmType.value = 'warning'
   } else if (action === 'delete') {
-    confirmTitle.value = '删除任务'; confirmMessage.value = '彻底删除该任务及文件？不可恢复。'; confirmType.value = 'danger'
+    confirmTitle.value = uiText('legacyUi.text43'); confirmMessage.value = uiText('legacyUi.text44'); confirmType.value = 'danger'
   }
   showConfirm.value = true
 }

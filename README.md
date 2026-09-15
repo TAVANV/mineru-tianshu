@@ -1,3 +1,5 @@
+> 定制分支：MinerU 3.4.5、新模型增量准备及兼容补齐说明见 [第四批升级指南](docs/phase4-compatible-upstream-completion.md)。本次代码集成不执行模型下载。
+
 <div align="center">
 
 # Tianshu 天枢

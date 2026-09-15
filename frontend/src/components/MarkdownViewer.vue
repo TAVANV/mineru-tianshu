@@ -1,19 +1,21 @@
 <template>
   <div class="markdown-viewer prose prose-sm max-w-none">
     <div v-if="loading" class="text-center py-8">
-      <LoadingSpinner text="加载中..." />
+      <LoadingSpinner :text="uiText('legacyUi.text14')" />
     </div>
     <div v-else-if="error" class="text-center py-8 text-red-600">
       <p>{{ error }}</p>
     </div>
     <div v-else-if="!content" class="text-center py-8 text-gray-500">
-      <p>暂无内容</p>
+      <p>{{ uiText('legacyUi.text13') }}</p>
     </div>
     <div v-else v-html="renderedContent" class="markdown-content"></div>
   </div>
 </template>
 
 <script setup lang="ts">
+import { useI18n as useUiI18n } from 'vue-i18n'
+const { t: uiText } = useUiI18n()
 import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import { authenticatedFileUrl } from '@/api/fileUrl'
 import DOMPurify from 'dompurify'

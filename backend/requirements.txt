@@ -4,6 +4,7 @@
 
 # 1. 基础科学计算与底层支撑
 numpy==1.26.4
+scipy>=1.13,<1.15
 pandas>=1.3.0
 opencv-python==4.11.0.86
 opencv-python-headless==4.11.0.86
@@ -19,12 +20,13 @@ thop>=0.1.1
 biopython>=1.80
 
 # 2. MinerU 3.0+ & VLM 必需依赖
-# mineru[all] 包含 pipeline/vlm/hybrid 所有后端
-mineru[all]>=3.0.9
+# 仅安装天枢实际使用的解析/S3能力；core/all 额外引入 Gradio，会与安全版 Starlette 冲突。
+# vLLM 仍由已有独立容器提供；不移除 PaddleOCR 工作流。
+mineru[pipeline,vlm,s3]==3.4.5
 # 以下为 mineru 依赖树中的关键包，显式声明以确保版本锁定
 boto3>=1.34.0
 botocore>=1.34.0
-pypdf>=5.1.0
+pypdf>=5.6.0
 json-repair>=0.46.2
 # fast-langdetect: mineru 3.0 仍约束 <0.3.0
 fast-langdetect>=0.2.3,<0.3.0
@@ -36,7 +38,7 @@ tifffile<2026
 albumentations>=1.4.11
 reportlab
 pdfminer.six>=20251230
-mineru-vl-utils>=0.1.19.1
+mineru-vl-utils>=1.0.5,<2
 qwen-vl-utils<1,>=0.0.14
 
 # 3. Web 服务与 API 架构

@@ -132,6 +132,7 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
 
       # JWT 认证
+      - UPLOAD_VALIDATE_CONTENT=${UPLOAD_VALIDATE_CONTENT:-false}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
       - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
@@ -150,6 +151,7 @@ services:
 
       # 模型路径
       - MODEL_PATH=/app/models
+      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - OUTPUT_PATH=/app/data/output
       - UPLOAD_PATH=/app/data/uploads
 
@@ -257,6 +259,7 @@ services:
 
       # 模型路径
       - MODEL_PATH=/app/models
+      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - OUTPUT_PATH=/app/data/output
       - UPLOAD_PATH=/app/data/uploads
 
@@ -362,6 +365,7 @@ services:
       - API_BASE_URL=${API_URL:-http://backend:8000}
       - MCP_HOST=0.0.0.0
       - MCP_API_KEYS=${MCP_API_KEYS:-}
+      - MCP_API_KEY_MAP=${MCP_API_KEY_MAP:-}
       - TIANSHU_API_KEY=${TIANSHU_API_KEY:-}
       - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-localhost:*,127.0.0.1:*}
       - MCP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS:-}
