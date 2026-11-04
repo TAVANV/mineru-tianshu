@@ -1,19 +1,17 @@
 <template>
-  <div class="max-w-5xl mx-auto px-4 py-6 animate-fade-in">
-    <div class="mb-6 flex justify-between items-end">
-      <div>
-        <h1 class="text-2xl font-bold text-gray-900 tracking-tight">{{ $t('task.submitTask') }}</h1>
-        <p class="mt-1 text-sm text-gray-500">{{ $t('task.processingOptions') }}</p>
-      </div>
-      <button
-        @click="resetConfig"
-        class="text-xs text-gray-500 hover:text-primary-600 underline transition-colors flex items-center"
-        :title="$t('task.resetConfig')"
-      >
-        <RotateCcw class="w-3 h-3 mr-1" />
-        {{ $t('common.reset') }}
-      </button>
-    </div>
+  <div class="w-full animate-fade-in">
+    <PageHeader :title="$t('task.submitTask')" :description="$t('task.processingOptions')">
+      <template #actions>
+        <button
+          @click="resetConfig"
+          class="text-xs text-gray-500 hover:text-primary-600 underline transition-colors flex items-center"
+          :title="$t('task.resetConfig')"
+        >
+          <RotateCcw class="w-3 h-3 mr-1" />
+          {{ $t('common.reset') }}
+        </button>
+      </template>
+    </PageHeader>
 
     <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
 
@@ -105,11 +103,6 @@
                     <optgroup label="MinerU (Remote Client)">
                       <option value="hybrid-http-client">{{ $t('task.backendHybridHttpClient') }}</option>
                       <option value="vlm-http-client">{{ $t('task.backendVlmHttpClient') }}</option>
-                    </optgroup>
-
-                    <optgroup :label="$t('task.groupPaddleOCR')">
-                      <option value="paddleocr-vl">{{ $t('task.backendPaddleOcrVl1509b') }}</option>
-                      <option value="paddleocr-vl-vllm">{{ $t('task.backendPaddleOCRVLLM') }}</option>
                     </optgroup>
 
                     <optgroup :label="$t('task.groupAudioVideo')">
@@ -209,6 +202,26 @@
               </button>
 
               <div v-show="showAdvanced" class="px-4 pb-4 pt-2 space-y-5 animate-fade-in-down">
+                <div>
+                  <label for="image-storage" class="block text-xs font-bold text-gray-600 mb-2">{{ $t('task.imageStorage') }}</label>
+                  <select id="image-storage" v-model="config.use_rustfs" class="form-input-sm w-full bg-white">
+                    <option :value="null">{{ $t('task.imageStorageDefault') }}</option>
+                    <option :value="true">{{ $t('task.imageStorageRustfs') }}</option>
+                    <option :value="false">{{ $t('task.imageStorageLocal') }}</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="block text-xs font-bold text-gray-600 uppercase tracking-wide mb-2">{{ $t('task.documentPassword') }}</label>
+                  <input
+                    v-model="config.password"
+                    type="password"
+                    autocomplete="off"
+                    class="form-input-sm w-full bg-white"
+                    :placeholder="$t('task.documentPasswordPlaceholder')"
+                  />
+                  <p class="mt-1 text-[10px] text-gray-400">{{ $t('task.documentPasswordHint') }}</p>
+                </div>
+
                 <div v-if="isMinerUBackend">
                   <label class="block text-xs font-bold text-gray-600 uppercase tracking-wide mb-2">{{ $t('task.pageRange') }}</label>
                   <div class="flex items-center space-x-3 bg-white p-3 rounded border border-gray-200">
@@ -225,7 +238,7 @@
                   <p class="mt-1 text-[10px] text-gray-400">{{ $t('task.pageRangeHint') }}</p>
                 </div>
 
-                <div v-if="['pipeline', 'paddleocr-vl', 'paddleocr-vl-vllm', 'auto'].includes(config.backend)">
+                <div v-if="['pipeline', 'auto'].includes(config.backend)">
                    <label class="block text-xs font-bold text-gray-600 uppercase tracking-wide mb-2">{{ $t('task.preprocessing') }}</label>
                    <div class="grid grid-cols-1 gap-3">
                       <div class="border border-gray-200 rounded p-3 bg-white">
@@ -241,38 +254,6 @@
                         </div>
                       </div>
 
-                      <div v-if="['auto', 'pipeline'].includes(config.backend)" class="border border-gray-200 rounded p-3 bg-white">
-                         <label class="flex items-center cursor-pointer">
-                          <input v-model="config.convert_office_to_pdf" type="checkbox" class="form-checkbox text-primary-600 rounded border-gray-300 h-4 w-4" />
-                          <span class="ml-2 text-sm font-medium text-gray-800">{{ $t('task.officeToPdf') }}</span>
-                        </label>
-                        <label class="block mt-3 text-sm">{{ $t('task.officeParser') }}
-                          <select v-model="config.office_parser" class="mt-1 block w-full rounded border-gray-300">
-                            <option value="compatible">{{ $t('task.officeCompatible') }}</option>
-                            <option value="mineru">{{ $t('task.officeNative') }}</option>
-                          </select>
-                        </label>
-                        <p class="pl-6 mt-1 text-xs text-gray-500">
-                          {{ $t('task.officeToPdfHint') }}
-                        </p>
-                      </div>
-                   </div>
-                </div>
-
-                <div>
-                  <label for="webhook_url" class="block text-xs font-bold text-gray-600 mb-2">{{ $t('task.webhookUrl') }}</label>
-                  <input id="webhook_url" v-model="config.webhook_url" type="url" class="w-full form-input-sm" placeholder="https://..." />
-                  <p class="text-xs text-gray-500 mt-1">{{ $t('task.webhookHint') }}</p>
-                </div>
-                <div v-if="showImageStorageOption">
-                   <label class="block text-xs font-bold text-gray-600 uppercase tracking-wide mb-2">{{ $t('task.imageStorage') }}</label>
-                   <div class="bg-white border border-gray-200 rounded p-3">
-                      <select v-model="config.use_rustfs" class="w-full form-input-sm">
-                         <option :value="undefined">{{ $t('task.imageStorageDefault') }}</option>
-                         <option :value="true">{{ $t('task.imageStorageUpload') }}</option>
-                         <option :value="false">{{ $t('task.imageStorageLocal') }}</option>
-                      </select>
-                      <p class="mt-1.5 text-xs text-gray-500">{{ imageStorageHint }}</p>
                    </div>
                 </div>
 
@@ -285,84 +266,6 @@
                       </div>
                       <div v-if="config.backend === 'sensevoice'">
                          <label class="flex items-center cursor-pointer"><input v-model="config.enable_speaker_diarization" type="checkbox" class="mr-2 rounded text-blue-600"/> <span class="text-sm">{{ $t('task.enableSpeakerDiarization') }}</span></label>
-                      </div>
-                   </div>
-                </div>
-
-                <div v-if="['paddleocr-vl', 'paddleocr-vl-vllm'].includes(config.backend)">
-                   <label class="block text-xs font-bold text-green-600 uppercase tracking-wide mb-2">
-                     {{ $t('task.paddleOCROptions') }}
-                   </label>
-                   <div class="bg-green-50 border border-green-100 rounded p-3 space-y-3">
-                      <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
-                        <label class="flex items-center cursor-pointer">
-                          <input v-model="config.useDocOrientationClassify" type="checkbox" class="mr-2 rounded text-green-600"/>
-                          <span class="text-xs text-gray-700">{{ $t('task.useDocOrientationClassify') }}</span>
-                        </label>
-                        <label class="flex items-center cursor-pointer">
-                          <input v-model="config.useDocUnwarping" type="checkbox" class="mr-2 rounded text-green-600"/>
-                          <span class="text-xs text-gray-700">{{ $t('task.useDocUnwarping') }}</span>
-                        </label>
-                        <label class="flex items-center cursor-pointer">
-                          <input v-model="config.useLayoutDetection" type="checkbox" class="mr-2 rounded text-green-600"/>
-                          <span class="text-xs text-gray-700">{{ $t('task.useLayoutDetection') }}</span>
-                        </label>
-                        <label class="flex items-center cursor-pointer">
-                          <input v-model="config.useChartRecognition" type="checkbox" class="mr-2 rounded text-green-600"/>
-                          <span class="text-xs text-gray-700">{{ $t('task.useChartRecognition') }}</span>
-                        </label>
-                        <label class="flex items-center cursor-pointer">
-                          <input v-model="config.useSealRecognition" type="checkbox" class="mr-2 rounded text-green-600"/>
-                          <span class="text-xs text-gray-700">{{ $t('task.useSealRecognition') }}</span>
-                        </label>
-                        <label class="flex items-center cursor-pointer">
-                          <input v-model="config.useOcrForImageBlock" type="checkbox" class="mr-2 rounded text-green-600"/>
-                          <span class="text-xs text-gray-700">{{ $t('task.useOcrForImageBlock') }}</span>
-                        </label>
-                        <label class="flex items-center cursor-pointer">
-                          <input v-model="config.layoutNms" type="checkbox" class="mr-2 rounded text-green-600"/>
-                          <span class="text-xs text-gray-700">{{ $t('task.layoutNms') }}</span>
-                        </label>
-                        <label class="flex items-center cursor-pointer">
-                          <input v-model="config.restructurePages" type="checkbox" class="mr-2 rounded text-green-600"/>
-                          <span class="text-xs text-gray-700">{{ $t('task.restructurePages') }}</span>
-                        </label>
-                      </div>
-
-                      <hr class="border-green-200 border-dashed" />
-
-                      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
-                        <div>
-                          <label class="block text-[10px] text-gray-500 mb-1">{{ $t('task.temperature') }}</label>
-                          <input v-model.number="config.temperature" type="number" step="0.1" class="w-full form-input-sm" />
-                        </div>
-                        <div>
-                          <label class="block text-[10px] text-gray-500 mb-1">{{ $t('task.topP') }}</label>
-                          <input v-model.number="config.topP" type="number" step="0.1" class="w-full form-input-sm" />
-                        </div>
-                        <div>
-                          <label class="block text-[10px] text-gray-500 mb-1">{{ $t('task.repetitionPenalty') }}</label>
-                          <input v-model.number="config.repetitionPenalty" type="number" step="0.1" class="w-full form-input-sm" />
-                        </div>
-                        <div>
-                          <label class="block text-[10px] text-gray-500 mb-1">{{ $t('task.layoutShapeMode') }}</label>
-                          <select v-model="config.layoutShapeMode" class="w-full form-input-sm">
-                             <option value="auto">auto</option>
-                             <option value="optimize">optimize</option>
-                          </select>
-                        </div>
-                        <div class="col-span-2">
-                          <label class="block text-[10px] text-gray-500 mb-1">{{ $t('task.minMaxPixels') }}</label>
-                          <div class="flex items-center space-x-1">
-                            <input v-model.number="config.minPixels" type="number" class="w-full form-input-sm" />
-                            <span class="text-gray-400">-</span>
-                            <input v-model.number="config.maxPixels" type="number" class="w-full form-input-sm" />
-                          </div>
-                        </div>
-                        <div class="col-span-2">
-                          <label class="block text-[10px] text-gray-500 mb-1">{{ $t('task.markdownIgnoreLabels') }}</label>
-                          <input v-model="config.markdownIgnoreLabels" type="text" class="w-full form-input-sm" :placeholder="uiText('legacyUi.text52')" />
-                        </div>
                       </div>
                    </div>
                 </div>
@@ -434,9 +337,9 @@
               <div class="flex items-center flex-1 min-w-0">
                 <FileText :class="['w-4 h-4 mr-3 flex-shrink-0', progress.success ? 'text-green-500' : progress.error ? 'text-red-500' : 'text-gray-400']" />
                 <div class="truncate">
-                   <p class="text-sm text-gray-700 truncate font-medium">{{ progress.fileName }}</p>
+                   <p class="text-sm text-gray-700 truncate font-medium" :title="progress.fileName">{{ progress.fileName }}</p>
                    <p v-if="progress.taskId" class="text-[10px] text-gray-400 font-mono tracking-tight">{{ progress.taskId }}</p>
-                   <p v-if="progress.errorMsg" class="text-[10px] text-red-500 truncate">{{ progress.errorMsg }}</p>
+                   <p v-if="progress.errorMsg" class="text-[10px] text-red-500 truncate" :title="progress.errorMsg">{{ progress.errorMsg }}</p>
                 </div>
               </div>
               <div class="flex items-center ml-3">
@@ -463,13 +366,12 @@
 </template>
 
 <script setup lang="ts">
-import { useI18n as useUiI18n } from 'vue-i18n'
-const { t: uiText } = useUiI18n()
 import { ref, reactive, computed, watch, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useTaskStore } from '@/stores'
 import FileUploader from '@/components/FileUploader.vue'
+import PageHeader from '@/components/PageHeader.vue'
 import {
   Upload, Loader, AlertCircle, X, FileText, CheckCircle, XCircle,
   Settings, ChevronDown, ChevronUp, Info, RotateCcw, ArrowRight,
@@ -510,13 +412,6 @@ const defaultConfig = {
   end_page: undefined as number | undefined,
 
   // 预处理
-  convert_office_to_pdf: false,
-  office_parser: 'compatible' as 'compatible' | 'mineru',
-
-  // 图片存储: 任务级 RustFS 开关 (undefined=跟随系统配置; true=上传对象存储; false=保留本地)
-  webhook_url: '',
-  use_rustfs: undefined as boolean | undefined,
-
   remove_watermark: false,
   watermark_conf_threshold: 0.35,
   watermark_dilation: 10,
@@ -529,25 +424,9 @@ const defaultConfig = {
   // 远程服务
   server_url: '',
 
-  // === PaddleOCR 高级参数默认值 ===
-  useDocOrientationClassify: false,
-  useDocUnwarping: false,
-  useLayoutDetection: true,
-  useChartRecognition: false,
-  useSealRecognition: true,
-  useOcrForImageBlock: false,
-  mergeTables: true,
-  relevelTitles: true,
-  layoutShapeMode: 'auto',
-  promptLabel: 'ocr',
-  repetitionPenalty: 1.0,
-  temperature: 0.0,
-  topP: 1.0,
-  minPixels: 147384,
-  maxPixels: 2822400,
-  layoutNms: true,
-  restructurePages: true,
-  markdownIgnoreLabels: 'header,header_image,footer,footer_image,number,footnote,aside_text',
+  // 加密文档打开密码（可选，仅加密 PDF / Office / ZIP 需要）
+  password: '',
+  use_rustfs: null as boolean | null,
 
   // Mineru Debug Options (Default: True as per source code)
   draw_layout_bbox: true,
@@ -573,15 +452,7 @@ const mineruBackends = ['pipeline', 'vlm-auto-engine', 'hybrid-auto-engine', 'vl
 const isMinerUBackend = computed(() => mineruBackends.includes(config.backend))
 const isHttpClientBackend = computed(() => ['vlm-http-client', 'hybrid-http-client'].includes(config.backend))
 
-const showLanguageOption = computed(() => isMinerUBackend.value || ['paddleocr-vl', 'paddleocr-vl-vllm', 'sensevoice', 'auto'].includes(config.backend))
-
-// 图片存储开关: 仅对会产出图片的文档类后端显示
-const showImageStorageOption = computed(() => isMinerUBackend.value || ['paddleocr-vl', 'paddleocr-vl-vllm', 'auto'].includes(config.backend))
-const imageStorageHint = computed(() => {
-  if (config.use_rustfs === true) return t('task.imageStorageUploadHint')
-  if (config.use_rustfs === false) return t('task.imageStorageLocalHint')
-  return t('task.imageStorageDefaultHint')
-})
+const showLanguageOption = computed(() => isMinerUBackend.value || ['sensevoice', 'auto'].includes(config.backend))
 
 // 动态 Hint
 const currentBackendHint = computed(() => {
@@ -592,8 +463,6 @@ const currentBackendHint = computed(() => {
     'hybrid-auto-engine': t('task.backendHybridAutoHint'),
     'vlm-http-client': t('task.backendVlmHttpClientHint'),
     'hybrid-http-client': t('task.backendHybridHttpClientHint'),
-    'paddleocr-vl': t('task.backendPaddleOcrVl09bHint'),
-    'paddleocr-vl-vllm': t('task.backendPaddleOCRVLLMHint'),
     'sensevoice': t('task.backendSenseVoiceHint'),
     'video': t('task.backendVideoHint'),
     'fasta': t('task.backendFastaHint'),
@@ -663,7 +532,11 @@ onMounted(() => {
   if (saved) { try { const p = JSON.parse(saved); Object.assign(config, p); } catch(e){} }
 })
 
-watch(() => config, () => { localStorage.setItem('task_submit_config', JSON.stringify(config)) }, { deep: true })
+// 密码属敏感信息，不落 localStorage；其余配置正常持久化
+watch(() => config, () => {
+  const { password: _password, ...rest } = config
+  localStorage.setItem('task_submit_config', JSON.stringify(rest))
+}, { deep: true })
 
 function resetConfig() { Object.assign(config, defaultConfig); localStorage.removeItem('task_submit_config'); currentPreset.value = 'default' }
 
@@ -689,7 +562,7 @@ async function submitTasks() {
   }
 
   if (isHttpClientBackend.value && !config.server_url) {
-    errorMessage.value = "请填写远程服务器地址 (Server URL)"
+    errorMessage.value = t('task.serverUrlRequired')
     return
   }
 

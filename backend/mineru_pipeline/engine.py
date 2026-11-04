@@ -7,24 +7,22 @@ MinerU Pipeline Engine
 - [新增] 智能显存休眠机制 (Auto-Sleep): 空闲 5 分钟自动释放显存
 - [新增] 自动唤醒机制 (Auto-Wakeup): 新任务自动重新加载模型
 - [优化] 移除每次任务后的强制显存清理，提升连续处理性能
-- [核心修复] 深度文本清洗 (双重反转义、去重、清洗 LaTeX 符号)
 - [核心修复] 使用临时纯英文目录处理，规避中文路径问题
 """
 
 import json
-import shutil
 import tempfile
 import time
 import urllib.request
 import urllib.error
-import re
-import html
 import gc
 import threading
 from pathlib import Path
 from typing import Optional, Dict, Any
 from threading import Lock
 from loguru import logger
+
+from utils import copy_file
 import img2pdf
 
 # 尝试导入 torch 用于显存管理
@@ -34,6 +32,8 @@ except ImportError:
     torch = None
 
 
+# 配置了本地 vLLM 时，进程内引擎改走 HTTP 客户端：进程内引擎要求镜像里装 vllm 包，
+# 而本项目的 vLLM 跑在独立容器里（见 backend/requirements.txt 中 mineru[core] 的说明）。
 _LOCAL_VLLM_REWRITE = {
     "vlm-auto-engine": "vlm-http-client",
     "hybrid-auto-engine": "hybrid-http-client",
@@ -43,7 +43,7 @@ _LOCAL_VLLM_REWRITE = {
 class MinerUPipelineEngine:
     """
     MinerU Pipeline 引擎
-    集成自动显存管理与深度清洗功能
+    集成自动显存管理功能
     """
 
     _instance: Optional["MinerUPipelineEngine"] = None
@@ -58,7 +58,7 @@ class MinerUPipelineEngine:
                     cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, device: str = "cuda:0", vlm_api_base: str = None):
+    def __init__(self, device: str = "cpu", vlm_api_base: str = None):
         if self._initialized:
             return
 
@@ -161,40 +161,66 @@ class MinerUPipelineEngine:
         logger.warning(f"⚠️  VLLM server wait timed out after {timeout}s. Process may fail.")
         return False
 
-    def _clean_markdown(self, text: str) -> str:
+    @staticmethod
+    def _flatten_content_blocks(json_content):
+        """把 MinerU 的 content_list 拍平成块列表，兼容 v1 与 v2
+
+        - v1 (*_content_list.json)    : 扁平数组 [block, block, ...]
+        - v2 (*_content_list_v2.json) : 按页分组的嵌套数组 [[block, ...], [block, ...], ...]
+
+        前端 TaskDetail.vue 早已按 v2 处理，这里与之保持一致。历史上这里只按 v1
+        处理，遇到 v2 会抛 AttributeError: 'list' object has no attribute 'get'。
         """
-        [关键功能] 深度清洗 Markdown 文本
-        解决 HTML 转义、LaTeX 过度包装、非换行空格和重复内容问题
-        """
-        if not text:
+        if not isinstance(json_content, list):
+            return []
+
+        blocks = []
+        for item in json_content:
+            if isinstance(item, list):
+                # v2：一页的块列表
+                blocks.extend(b for b in item if isinstance(b, dict))
+            elif isinstance(item, dict):
+                # 按页分组的对象格式，或 v1 的扁平块
+                page_blocks = item.get("parsing_res_list") or item.get("blocks")
+                if isinstance(page_blocks, list):
+                    blocks.extend(b for b in page_blocks if isinstance(b, dict))
+                else:
+                    blocks.append(item)
+        return blocks
+
+    @staticmethod
+    def _extract_block_text(block):
+        """从单个块里取纯文本，兼容 v1 的 text 字段与 v2 的 content 结构"""
+        if not isinstance(block, dict):
             return ""
 
-        if "117" in text or "LVEDd" in text:
-            logger.debug(f"🧹 Executing _clean_markdown... (Length: {len(text)})")
+        # v1：直接带 text
+        text = block.get("text")
+        if isinstance(text, str) and text:
+            return text
 
-        # 1. HTML 反转义 (执行两次以解决 &amp;gt; 这种双重转义问题)
-        text = html.unescape(text)
-        text = html.unescape(text)
+        content = block.get("content")
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, dict):
+            return ""
 
-        # 2. 暴力替换常见的未转义字符
-        text = text.replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&")
-
-        # 3. 去除 LaTeX 的 \mathrm{} 包装
-        text = re.sub(r"\\mathrm\{(.*?)\}", r"\1", text, flags=re.DOTALL)
-
-        # 4. 清洗 LaTeX 特殊字符
-        text = text.replace("~", " ")
-
-        # 5. 去除模型幻觉产生的 <del> 标签
-        text = text.replace("<del>", "").replace("</del>", "")
-
-        # 6. [加强版] 暴力去重逻辑
-        text = re.sub(r"(\S+)([\s\r\n]+)\1", r"\1", text)
-
-        # 7. 去除连续的多余空行
-        text = re.sub(r"\n{3,}", "\n\n", text)
-
-        return text
+        # v2：content 下按块类型分不同的键，值形如 [{"content": "..."}, ...]
+        for key in ("title_content", "paragraph_content", "table_content", "list_content"):
+            items = content.get(key)
+            if not isinstance(items, list):
+                continue
+            parts = []
+            for item in items:
+                if isinstance(item, dict):
+                    piece = item.get("content")
+                    if isinstance(piece, str):
+                        parts.append(piece)
+                elif isinstance(item, str):
+                    parts.append(item)
+            if parts:
+                return "".join(parts)
+        return ""
 
     def cleanup(self):
         """
@@ -210,14 +236,14 @@ class MinerUPipelineEngine:
             except Exception:
                 pass
 
-            # 强制 GC 与 CUDA 缓存清理
+            # 强制 GC 与 CUDA/MPS 缓存清理
             try:
                 self._pipeline = None  # 释放函数引用，促使下次重新加载
                 gc.collect()
                 if torch and torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     torch.cuda.ipc_collect()
-                elif torch and hasattr(torch, "mps") and torch.backends.mps.is_available():
+                if torch and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
                     torch.mps.empty_cache()
                 logger.info("✅ GPU Memory released completely.")
             except Exception as e:
@@ -225,7 +251,7 @@ class MinerUPipelineEngine:
 
     def parse(self, file_path: str, output_path: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
-        处理文件 (增强版：自动唤醒 + 临时目录 + 深度清洗)
+        处理文件 (增强版：自动唤醒 + 临时目录)
         """
         # =========================================================
         # 1. 状态更新与自动唤醒 (Auto-Wakeup)
@@ -260,7 +286,7 @@ class MinerUPipelineEngine:
             if not server_url and self.vlm_api_base:
                 backend = _LOCAL_VLLM_REWRITE.get(user_backend, user_backend)
                 if "http-client" in backend:
-                    server_url = self.vlm_api_base.rstrip("/").removesuffix("/v1")
+                    server_url = self.vlm_api_base.replace("/v1", "")
                     if backend != user_backend:
                         logger.info(f"🔄 [Accelerate] Switching to {backend} using local vLLM")
 
@@ -310,23 +336,23 @@ class MinerUPipelineEngine:
             if file_ext in [".png", ".jpg", ".jpeg"]:
                 logger.info("🖼️  Converting image to PDF...")
                 try:
+                    # ifvalid：EXIF 方向值非法（如 0）时告警并忽略，而不是直接抛错
                     pdf_bytes = img2pdf.convert(file_bytes, rotation=img2pdf.Rotation.ifvalid)
                 except Exception as e:
                     raise ValueError(f"Image conversion failed: {e}")
                 safe_file_name = "result.pdf"
             elif file_ext in [".docx", ".xlsx", ".pptx"]:
-                # MinerU 3.0 原生 DOCX 解析：直接传字节，保留 .docx 后缀
-                # do_parse 内部通过文件名后缀识别类型，走 office_docx_analyze() 路径
-                logger.info("📄 DOCX detected, passing to MinerU native parser...")
+                # MinerU 3.0+ 原生 DOCX、3.1+ 原生 PPTX/XLSX 解析：直接传字节，保留原后缀
+                # do_parse 内部通过文件名后缀识别类型
+                logger.info(f"📄 {file_ext.upper()} detected, passing to MinerU native parser...")
                 pdf_bytes = file_bytes
-                safe_file_name = "result" + file_ext
+                safe_file_name = f"result{file_ext}"
             else:
                 pdf_bytes = file_bytes
                 safe_file_name = "result.pdf"
 
             lang = options.get("lang", "auto")
-            # MinerU 3.4 routes the previous dedicated Latin/English/Japanese models to ch (OCRv6).
-            if lang in {"auto", "en", "latin", "japan", "chinese_cht"}:
+            if lang == "auto":
                 lang = "ch"
 
             # 使用临时纯英文目录处理
@@ -369,22 +395,14 @@ class MinerUPipelineEngine:
                         else:
                             raise FileNotFoundError("Processing failed internally - No output generated")
 
-                # 1. 读取内容并进行深度清洗
+                # 1. 读取内容（保持 MinerU 原样输出，不做文本改写）
                 content = ""
                 json_content = None
 
                 temp_md_files = list(generated_result_dir.rglob("*.md"))
                 if temp_md_files:
-                    md_file = temp_md_files[0]
-                    raw_content = md_file.read_text(encoding="utf-8")
-
-                    # 深度清洗
-                    content = self._clean_markdown(raw_content)
-
-                    # 覆盖写入清洗后的内容
-                    md_file.write_text(content, encoding="utf-8")
-
-                    logger.info(f"✅ Read and cleaned MD content: {len(content)} chars")
+                    content = temp_md_files[0].read_text(encoding="utf-8")
+                    logger.info(f"✅ Read MD content: {len(content)} chars")
 
                 # MinerU 3.0 新增 content_list_v2.json（推荐格式），优先使用；兼容 v1
                 temp_json_files = list(generated_result_dir.rglob("*_content_list_v2.json"))
@@ -401,10 +419,9 @@ class MinerUPipelineEngine:
                 if not content.strip() and json_content:
                     logger.warning("⚠️  Markdown file is empty, attempting to recover text from JSON...")
                     recovered_text = []
-                    if isinstance(json_content, list):
-                        for block in json_content:
-                            text = block.get("text", "")
-                            text = self._clean_markdown(text)
+                    for block in self._flatten_content_blocks(json_content):
+                        text = self._extract_block_text(block)
+                        if text:
                             recovered_text.append(text)
                     content = "\n\n".join(recovered_text)
 
@@ -421,7 +438,7 @@ class MinerUPipelineEngine:
                             rel_path = src_path.relative_to(generated_result_dir)
                             dest_path = final_output_dir / rel_path
                             dest_path.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(src_path, dest_path)
+                            copy_file(src_path, dest_path)
 
                 # 4. 返回路径
                 final_md_path = None

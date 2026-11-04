@@ -1,18 +1,26 @@
 # ============================================================================
 # MinerU Server - Enterprise AI Data Preprocessing (CUDA 13.0 Edition)
-# Optimized for: MinerU 3.0.9 (VLM Support)
+# Optimized for: MinerU 3.4.5 (VLM Support)
 # Fixes: Missing botocore, s3transfer, reportlab, and other sub-dependencies
 # ============================================================================
 
-FROM nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04 AS base
+# ============================================================================
+# 镜像源配置（构建参数）：
+#   - 默认使用国内镜像（阿里云 apt / 阿里云 PyPI）
+#   - 海外网络: docker buildx build --build-arg APT_MIRROR= --build-arg PIP_MIRROR=https://pypi.org/simple ...
+# ============================================================================
+ARG APT_MIRROR=mirrors.aliyun.com
 ARG PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple/
-ARG PIP_TIMEOUT=600
-ARG PIP_RETRIES=10
-ENV PIP_DEFAULT_TIMEOUT=${PIP_TIMEOUT} PIP_RETRIES=${PIP_RETRIES}
 
-# 1. [网络优化] 阿里云源 + 抗干扰配置
-RUN sed -i 's/archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list.d/ubuntu.sources && \
-    sed -i 's/security.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list.d/ubuntu.sources && \
+FROM nvidia/cuda:13.0.2-cudnn-runtime-ubuntu24.04 AS base
+ARG APT_MIRROR
+ARG PIP_MIRROR
+
+# 1. [网络优化] apt 源（APT_MIRROR 为空则保留官方源）+ 抗干扰配置
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s/archive.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list.d/ubuntu.sources && \
+        sed -i "s/security.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list.d/ubuntu.sources; \
+    fi && \
     echo 'Acquire::Retries "20"; Acquire::http::Timeout "300";' > /etc/apt/apt.conf.d/99custom
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -23,19 +31,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH \
     PIP_CACHE_DIR=/root/.cache/pip
 
-# 2. [系统修复] 安装底层库 (Ubuntu 24.04 适配)
+# 2. [系统修复] 底层库 + 中文字体 + LibreOffice
+# 合并为单层：原先拆成两个 RUN 会执行两次 apt-get update（各拉一遍索引）。
+# LibreOffice 只装实际用到的三个组件，元包 libreoffice 会额外带上 Base / Draw / Math，
+# 本项目一个都不用（Dockerfile.cpu 与 Dockerfile.offline 本来就是这么写的）。
+# build-essential 提供 triton 运行期所需的 gcc。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.12 python3.12-dev python3-pip python3.12-venv \
+    python3.12 python3.12-dev python3-pip python3.12-venv build-essential \
     git wget curl ffmpeg antiword pandoc poppler-utils \
     libgomp1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
     libgl1 libglx-mesa0 libgstreamer1.0-0 \
-    && rm -rf /var/lib/apt/lists/*
-
-# 3. [系统修复] 安装中文字体
-RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-core fonts-noto-cjk fonts-noto-cjk-extra \
     fonts-wqy-zenhei fonts-wqy-microhei fontconfig \
-    libreoffice \
+    libreoffice-writer libreoffice-calc libreoffice-impress \
     && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
 
@@ -51,43 +59,42 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Stage 2: Dependencies Installation
 # -----------------------------------------------------------------------------
 FROM base AS dependencies
-ARG PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple/
-COPY backend/wheels/ /opt/tianshu-wheels/
-ENV PIP_FIND_LINKS=/opt/tianshu-wheels
 WORKDIR /tmp
 COPY backend/requirements.txt /tmp/requirements.txt
-ARG PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple/
+ARG PIP_MIRROR
 
 # Step 1: [地基] 锁定科学计算基础包
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "numpy==1.26.4" "scipy>=1.13,<1.15" "pandas>=1.3.0" "psutil" "py-cpuinfo" -i ${PIP_MIRROR} --break-system-packages
+    pip install "numpy==1.26.4" "pandas>=1.3.0" "psutil" "py-cpuinfo" -i ${PIP_MIRROR} --break-system-packages
 
-# Step 2: [框架A] PyTorch 2.10.0+cu130
+# Step 2: [框架] PyTorch 2.10.0+cu130
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install torch==2.10.0+cu130 torchvision==0.25.0+cu130 --index-url https://download.pytorch.org/whl/cu130 --break-system-packages
 
-# Step 3: [框架B] PaddlePaddle 3.3.0
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu130/ --break-system-packages
-
-# Step 4: [核心业务包] (注意：移除 --no-deps，补全缺失的 botocore/reportlab 等)
+# Step 3: [核心业务包] (注意：移除 --no-deps，补全缺失的 botocore/reportlab 等)
+#
+# 使用解析/S3 extras，避免未使用的 Gradio 与 Starlette 安全版本冲突。
+#
+# 版本钉死不用 >=：本项目直接 import 了 mineru.utils.model_utils 与
+# mineru.cli.common，二者都不是 MinerU 承诺稳定的公共 API。线上曾因 >=3.4.5
+# 在重新构建时解析到上游新版本，Worker 启动即崩溃重启：
+#     ModuleNotFoundError: No module named 'mineru.utils.model_utils'
+# 升级 MinerU 时务必同步确认下面 Step 7 的入口断言仍然通过。
 # 加入了日志中提示缺失的所有包
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install "huggingface-hub<1.0" \
                 "mineru[pipeline,vlm,s3]==3.4.5" \
-                "paddleocr[all]>=3.4.0" \
-                "paddlex>=3.4.1" \
                 "transformers==4.57.6" \
                 "openai>=1.50.0" \
                 "boto3>=1.34.0" \
                 "botocore>=1.34.0" \
-                "pypdf>=5.6.0" \
+                "pypdf>=5.1.0" \
                 "reportlab" \
                 "pdfminer.six>=20251230" \
                 "albumentations>=1.4.11" \
-                "opencv-python==4.11.0.86" \
+                "opencv-python>=4.11.0.86" \
                 "scikit-image>=0.25.0" \
-                "mineru-vl-utils>=1.0.5,<2" \
+                "mineru-vl-utils" \
                 "qwen-vl-utils" \
                 "doclayout-yolo==0.0.4" \
                 "prettytable" \
@@ -95,9 +102,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                 "ujson" \
     -i ${PIP_MIRROR} --break-system-packages
 
-# Step 5: [补全] 安装 requirements.txt 并过滤掉已安装的重型框架
+# Step 4: [补全] 安装 requirements.txt 并过滤掉已安装的重型框架
 RUN --mount=type=cache,target=/root/.cache/pip \
-    sed -i '/torch/d; /paddle/d; /nvidia/d; /opencv/d; /numpy/d; /pandas/d; /transformers/d; /mineru/d; /paddlex/d; /boto3/d; /openai/d; /pypdf/d' /tmp/requirements.txt && \
+    sed -i '/torch/d; /nvidia/d; /opencv/d; /numpy/d; /pandas/d; /transformers/d; /mineru/d; /boto3/d; /openai/d; /pypdf/d' /tmp/requirements.txt && \
     pip install -r /tmp/requirements.txt -i ${PIP_MIRROR} --break-system-packages
 
 # Step 5: [重新锁定 PyTorch] 防止上游包降级或替换 torch 版本
@@ -108,16 +115,38 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --break-system-packages
 
 # Step 6: [扩展] FlashAttention (必须在 torch 版本确认后最后安装)
+# 该 wheel 有 242MB 且只在 GitHub Releases 上，国内直连经常几十 KB/s 且反复断连。
+# 因此优先使用预先下载好的本地 wheel；backend/wheels/ 为空时才回退到直连下载。
+#   wget -c -t 0 --timeout=30 -O backend/wheels/flash_attn-2.8.3+cu130torch2.10-cp312-cp312-linux_x86_64.whl \
+#     https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp312-cp312-linux_x86_64.whl
+COPY backend/wheels/ /tmp/wheels/
 RUN --mount=type=cache,target=/root/.cache/pip \
-    if ls /opt/tianshu-wheels/flash_attn-*.whl > /dev/null 2>&1; then \
-        pip install /opt/tianshu-wheels/flash_attn-*.whl --break-system-packages; \
+    if ls /tmp/wheels/flash_attn-*.whl > /dev/null 2>&1; then \
+        echo "📦 Installing FlashAttention from pre-downloaded wheel" && \
+        pip install /tmp/wheels/flash_attn-*.whl --break-system-packages; \
     else \
+        echo "🌐 No local wheel found, downloading FlashAttention from GitHub" && \
         pip install https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu130torch2.10-cp312-cp312-linux_x86_64.whl --break-system-packages; \
     fi
 
+# Step 6.5: [ONNX GPU] 表格模型（结构识别 / 分类）跑在 ONNX Runtime 上。MinerU 依赖的是纯 CPU 版
+# onnxruntime，装上后表格模型只能用 CPU，多进程下成为 CPU 瓶颈。换成 onnxruntime-gpu：
+# - 1.27 起 PyPI 上的 onnxruntime-gpu 默认按 CUDA 13.0 + cuDNN 9 构建，与本镜像一致
+# - 两个包共用 onnxruntime 模块目录，必须先卸 CPU 版，否则文件互相覆盖
+# - 必须是最后一个 pip 步骤：之后再装依赖 mineru 的包，会把 CPU 版装回来
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip uninstall -y onnxruntime --break-system-packages && \
+    pip install onnxruntime-gpu==1.30.0 -i ${PIP_MIRROR} --break-system-packages
+
 # Step 7: [最终验证]
-RUN python -c "import torch; import flash_attn; import pypdf; import boto3; import botocore; import openai; print('✅ All Backend Dependencies Verified')" && \
-    pip show paddlepaddle-gpu paddleocr paddlex mineru flash-attn | grep -E "^(Name|Version)"
+# 除了三方包，这里还显式导入本项目真正用到的 MinerU 入口。
+# 这三个入口不是 MinerU 承诺稳定的公共 API，上游版本漂移就可能消失；
+# 在构建期验证，可以让问题当场暴露，而不是等到线上 Worker 起不来。
+RUN python -c "import torch; import pypdf; import boto3; import botocore; import openai; print(chr(9989) + ' 三方依赖验证通过')" \
+    && python -c "import flash_attn; print(chr(9989) + ' flash_attn 可用')" \
+    && python -c "import onnxruntime as o; p = o.get_available_providers(); assert 'CUDAExecutionProvider' in p, p; print(chr(9989) + ' onnxruntime-gpu ' + o.__version__ + ' ' + str(p))" \
+    && python -c "from mineru.cli.common import do_parse; from mineru.utils.model_utils import get_vram, clean_memory; print(chr(9989) + ' MinerU 解析入口验证通过 (do_parse / get_vram / clean_memory)')" \
+    && pip show mineru flash-attn | grep -E "^(Name|Version)"
 
 # -----------------------------------------------------------------------------
 # Stage 3: Application Runtime
@@ -130,11 +159,21 @@ COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY scripts/init-models.sh /usr/local/bin/init-models.sh
 
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/init-models.sh && \
-    mkdir -p /app/models /app/data/uploads /app/data/output /app/logs
+    mkdir -p /app/models /app/data/uploads /app/data/output /app/data/db /app/logs
+
+# 非 root 运行用户（worker 服务因挂载 /var/run/docker.sock，在 compose 中显式覆盖为 root）
+RUN groupadd -g 10001 tianshu && \
+    useradd -u 10001 -g tianshu -m -s /bin/bash tianshu && \
+    chown -R tianshu:tianshu /app /home/tianshu
+
+# USER 指令不会自动设置 HOME，显式指定以兼容 ~/.cache、~/mineru.json 等路径解析
+ENV HOME=/home/tianshu
 
 WORKDIR /app/backend
 
 EXPOSE 8000 8001 8002
+
+USER tianshu
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["api", "python", "api_server.py"]

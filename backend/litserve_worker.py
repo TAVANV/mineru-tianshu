@@ -10,7 +10,7 @@ Worker 主动循环拉取任务并处理
 优化日志 (2026-02-16):
 1. [并发] 强制限制 workers_per_device=1 (可通过 MAX_CONCURRENT_TASKS 调整)，防止爆显存
 2. [修复] 强制回写源 PDF 到 output 目录，解决前端无法预览源文件的问题
-3. [修复] PaddleOCR/MinerU 返回结果中补全 json_content 和 pdf_path 以支持双向定位
+3. [修复] MinerU 返回结果中补全 json_content 和 pdf_path 以支持双向定位
 4. [性能] 移除单次任务后的强制显存清理 (clean_memory)，依赖引擎的智能休眠机制
 5. [稳定] 增强 VLLM 容器互斥切换的健壮性
 """
@@ -23,12 +23,13 @@ import threading
 import signal
 import atexit
 import shutil
-import filecmp
 import socket
 import multiprocessing
 import warnings
 import subprocess
 import tempfile
+import uuid
+import zipfile
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -91,7 +92,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # Local imports
 from task_db import TaskDB
 from output_normalizer import normalize_output
-from utils import parse_list_arg
+from utils import (
+    parse_list_arg,
+    ALLOWED_UPLOAD_EXTENSIONS,
+    copy_file,
+    move_file,
+    sniff_office_file,
+    EncryptedDocumentError,
+    DocDecryptError,
+    cleanup_decrypted,
+    decrypted_dir,
+    decrypt_if_needed,
+)
 import importlib.util
 
 
@@ -117,8 +129,6 @@ try:
 except ImportError:
     logger.info("ℹ️  MarkItDown not available (optional)")
 
-PADDLEOCR_VL_AVAILABLE = check_dependency("paddleocr_vl", "PaddleOCR-VL")
-PADDLEOCR_VL_VLLM_AVAILABLE = check_dependency("paddleocr_vl_vllm", "PaddleOCR-VL-VLLM")
 MINERU_PIPELINE_AVAILABLE = check_dependency("mineru_pipeline", "MinerU Pipeline")
 SENSEVOICE_AVAILABLE = check_dependency("audio_engines", "SenseVoice")
 VIDEO_ENGINE_AVAILABLE = check_dependency("video_engines", "Video Engine")
@@ -135,43 +145,172 @@ try:
 except ImportError as e:
     logger.info(f"ℹ️  Format Engines not available: {e}")
 
+IMAGE_CAPTION_AVAILABLE = False
+try:
+    from image_caption import ImageCaptionConfig, process_output_dir
+
+    IMAGE_CAPTION_AVAILABLE = True
+    logger.info("✅ Image Caption available")
+except ImportError as e:
+    logger.info(f"ℹ️  Image Caption not available: {e}")
+
 
 # ==============================================================================
 # 3. VLLM Container Controller
 # ==============================================================================
+
+# compose 中 vllm-mineru 是 profiles: ["manual"] + restart: no，不随 up 启动，
+# 由 worker 在确认某个任务要用本地 vLLM 时冷启动。
+VLLM_MINERU_CONTAINER = "tianshu-vllm-mineru"
+
+# 会落到本地 vLLM 的 backend：*-auto-engine 由 mineru_pipeline/engine.py 改写成
+# *-http-client，*-http-client 则直接用 mineru_vllm_api —— 两者都要求容器在运行。
 LOCAL_VLLM_BACKENDS = frozenset({"vlm-auto-engine", "hybrid-auto-engine", "vlm-http-client", "hybrid-http-client"})
+
+# 表格文件统一走 MarkItDown（pandas 读表，.xlsx 用 openpyxl、.xls 用 xlrd，无需先转格式）。
+# 不走 MinerU 原生 XLSX 解析：它对每个 sheet 按 3 档间隔容忍度各做一遍全量表格检测，
+# 大表耗时和内存都很高（2 万行 x 20 列约 50s / 1.8GB），容易拖死或 OOM 掉 worker。
+SPREADSHEET_EXTENSIONS = frozenset({".xlsx", ".xls"})
+
+# 每个 worker 进程的 CPU 线程数。不设上限时 PyTorch / OpenCV / BLAS 在每个进程里都按全部核数开线程池，
+# 多卡多进程下（如 128 核、8 卡 x 2 = 16 进程）会有上千个计算线程抢核，CPU 侧的渲染、预处理、
+# 后处理全部变慢，GPU 一直在等数据。由主进程写入进程总数，子进程在 setup() 里据此均分。
+TOTAL_WORKERS_ENV = "TIANSHU_TOTAL_WORKERS"
+# MINERU_INTRA_OP_NUM_THREADS：MinerU 表格结构模型（slanet+ / unet，ONNX Runtime）读取的线程数，
+# 不认 OMP_NUM_THREADS，未设置时 ONNX Runtime 按全部核数开线程
+CPU_THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "MINERU_INTRA_OP_NUM_THREADS",
+)
+
+
+def _available_cpus() -> int:
+    """容器 / 任务集可用的 CPU 数（优先 sched_getaffinity，能反映 cpuset 限制）"""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def resolve_cpu_threads(override: Optional[str], total_workers: Optional[str], cpu_count: int) -> int:
+    """计算单进程线程数：WORKER_CPU_THREADS 显式指定优先，否则按可用核数均分给全部 worker 进程"""
+    try:
+        explicit = int(override) if override not in (None, "") else 0
+    except ValueError:
+        explicit = 0
+    if explicit > 0:
+        return explicit
+
+    try:
+        workers = int(total_workers) if total_workers not in (None, "") else 1
+    except ValueError:
+        workers = 1
+    return max(1, cpu_count // max(1, workers))
+
+
+def configure_cpu_threads() -> int:
+    """在导入 torch / cv2 之前设置线程环境变量；已显式设置的变量保持不动"""
+    threads = resolve_cpu_threads(os.getenv("WORKER_CPU_THREADS"), os.getenv(TOTAL_WORKERS_ENV), _available_cpus())
+    for var in CPU_THREAD_ENV_VARS:
+        os.environ.setdefault(var, str(threads))
+    # 单次推理内的算子间并行对这些小模型收益很小，多进程下只会继续放大线程数
+    os.environ.setdefault("MINERU_INTER_OP_NUM_THREADS", "1")
+    return threads
+
+
+ORT_CUDA_PROVIDER = "CUDAExecutionProvider"
+ORT_CPU_PROVIDER = "CPUExecutionProvider"
+# 与 MinerU 表格结构模型的 CUDA provider 配置保持一致（mineru/model/table/rec/onnxruntime_provider.py）
+ORT_CUDA_PROVIDER_OPTIONS = {"cudnn_conv_algo_search": "HEURISTIC", "arena_extend_strategy": "kSameAsRequested"}
+
+
+def configure_onnxruntime_sessions(threads: int, use_cuda: bool) -> list[str]:
+    """给未显式配置的 ONNX Runtime 会话补上线程上限与执行设备，返回会话默认使用的 provider 列表
+
+    MinerU 的表格分类模型（PaddleTableClsModel）创建会话时既不传 SessionOptions 也不传 providers：
+    - 线程：任何环境变量都管不到，每个进程都按全部核数开线程
+    - 设备：CPU 版 onnxruntime 下只能走 CPU；onnxruntime-gpu 下不传 providers 会直接报错
+      （ORT 1.9 起要求显式指定）
+    这里包装 InferenceSession：调用方没传的才补（线程数为默认值 0 也视为没传），显式配置保持不动。
+    需在模型首次构建（首个任务）之前调用；调用方以属性方式访问 onnxruntime.InferenceSession 时生效。
+    worker 进程已按 CUDA_VISIBLE_DEVICES 绑卡，device_id 固定为 0。
+    """
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return []
+
+    if use_cuda and ORT_CUDA_PROVIDER in ort.get_available_providers():
+        default_providers = [(ORT_CUDA_PROVIDER, {"device_id": 0, **ORT_CUDA_PROVIDER_OPTIONS}), ORT_CPU_PROVIDER]
+    else:
+        default_providers = [ORT_CPU_PROVIDER]
+    provider_names = [p[0] if isinstance(p, tuple) else p for p in default_providers]
+
+    original = getattr(ort.InferenceSession, "_tianshu_original", ort.InferenceSession)
+
+    class ConfiguredInferenceSession(original):
+        _tianshu_original = original
+
+        def __init__(self, path_or_bytes, sess_options=None, providers=None, provider_options=None, **kwargs):
+            if sess_options is None:
+                sess_options = ort.SessionOptions()
+            if sess_options.intra_op_num_threads == 0:
+                sess_options.intra_op_num_threads = threads
+            if sess_options.inter_op_num_threads == 0:
+                sess_options.inter_op_num_threads = 1
+            if providers is None and provider_options is None:
+                providers = default_providers
+            super().__init__(path_or_bytes, sess_options, providers, provider_options, **kwargs)
+
+    ort.InferenceSession = ConfiguredInferenceSession
+    return provider_names
+
+
+def apply_cpu_threads_to_libs(threads: int) -> None:
+    """环境变量之外再显式设置一遍：OpenCV 不读 OMP_NUM_THREADS，torch 若已提前导入也需要显式调用"""
+    try:
+        import torch
+
+        torch.set_num_threads(threads)
+    except Exception as e:
+        logger.debug(f"torch.set_num_threads skipped: {e}")
+    try:
+        import cv2
+
+        cv2.setNumThreads(threads)
+    except Exception as e:
+        logger.debug(f"cv2.setNumThreads skipped: {e}")
 
 
 class VLLMController:
-    """Upstream e740406 cold start, retaining PaddleOCR mutual exclusion."""
+    """按需冷启动 vLLM 容器。"""
 
-    def ensure_service(self, target_container: str, conflict_container: str):
-        try:
-            import docker
-        except ImportError:
-            logger.info("Docker SDK unavailable; vLLM is externally managed")
-            return
+    def ensure_running(self, container_name: str) -> None:
+        """确保容器在运行。
+
+        容器不存在或 Docker 不可达，说明 vLLM 由外部托管（本机直接跑 vllm serve），
+        此时无需处理。容器 status 变成 running 只代表进程起来了，vLLM 这时还在载模型，
+        就绪与否由 engine._wait_for_server 轮询 /v1/models 判定。
+        """
+        import docker
+        import docker.errors
+
         try:
             client = docker.from_env()
-        except docker.errors.DockerException:
-            logger.info("Docker unreachable; vLLM is externally managed")
+        except docker.errors.DockerException as e:
+            logger.info(f"ℹ️  Docker unreachable ({e}), treating vLLM as externally managed")
             return
+
         try:
-            # Resolve target before touching a conflict: external services own their lifecycle.
-            try:
-                target = client.containers.get(target_container)
-            except docker.errors.NotFound:
-                logger.info("vLLM container absent; service is externally managed")
-                return
-            try:
-                conflict = client.containers.get(conflict_container)
-            except docker.errors.NotFound:
-                conflict = None
-            if conflict is not None and conflict.status == "running":
-                conflict.stop()
-            if target.status != "running":
-                target.start()
-            # Model readiness is checked by the engine, not container status polling.
+            container = client.containers.get(container_name)
+            if container.status != "running":
+                logger.info(f"🚀 Cold-starting vLLM container {container_name}")
+                container.start()
+        except docker.errors.NotFound:
+            logger.info(f"ℹ️  Container {container_name} not found, treating vLLM as externally managed")
         finally:
             client.close()
 
@@ -182,12 +321,10 @@ class VLLMController:
 class MinerUWorkerAPI(ls.LitAPI):
     def __init__(
         self,
-        paddleocr_vl_vllm_api_list=None,
         mineru_vllm_api_list=None,
         output_dir=None,
         poll_interval=0.5,
         enable_worker_loop=True,
-        paddleocr_vl_vllm_engine_enabled=False,
     ):
         super().__init__()
 
@@ -201,8 +338,6 @@ class MinerUWorkerAPI(ls.LitAPI):
         self.enable_worker_loop = enable_worker_loop
 
         # API 配置
-        self.paddleocr_vl_vllm_engine_enabled = paddleocr_vl_vllm_engine_enabled
-        self.paddleocr_vl_vllm_api_list = paddleocr_vl_vllm_api_list or []
         self.mineru_vllm_api_list = mineru_vllm_api_list or []
 
         # 进程间共享计数器
@@ -221,12 +356,6 @@ class MinerUWorkerAPI(ls.LitAPI):
         logger.info(f"🔢 [Init] I am Global Worker #{my_global_index} (on {device})")
 
         # API 分配
-        self.paddleocr_vl_vllm_api = None
-        if self.paddleocr_vl_vllm_engine_enabled and self.paddleocr_vl_vllm_api_list:
-            assigned_api = self.paddleocr_vl_vllm_api_list[my_global_index % len(self.paddleocr_vl_vllm_api_list)]
-            self.paddleocr_vl_vllm_api = assigned_api
-            logger.info(f"🔧 Worker #{my_global_index} assigned Paddle OCR VL API: {assigned_api}")
-
         self.mineru_vllm_api = None
         if self.mineru_vllm_api_list:
             assigned_mineru_api = self.mineru_vllm_api_list[my_global_index % len(self.mineru_vllm_api_list)]
@@ -254,41 +383,34 @@ class MinerUWorkerAPI(ls.LitAPI):
             hf_endpoint = os.getenv("HF_ENDPOINT", "https://hf-mirror.com")
             os.environ.setdefault("HF_ENDPOINT", hf_endpoint)
 
+        # CPU 线程上限：必须在下方首次导入 torch（mineru.utils.model_utils）之前设置环境变量
+        cpu_threads = configure_cpu_threads()
+
         # 设备配置
         self.device = device
         if "cuda" in str(device):
             self.accelerator = "cuda"
             self.engine_device = "cuda:0"
         elif "mps" in str(device):
+            # Apple Silicon: MinerU 通过 MINERU_DEVICE_MODE 使用 MPS 加速；
+            # 音视频等辅助引擎（FunASR 等）对 MPS 支持不稳定，统一走 CPU
             self.accelerator = "mps"
-            self.engine_device = "cpu"  # Paddle/audio/video remain on their supported CPU path.
+            self.engine_device = "cpu"
             os.environ.setdefault("MINERU_DEVICE_MODE", "mps")
         else:
             self.accelerator = "cpu"
             self.engine_device = "cpu"
 
-        # PyTorch 2.6 兼容：torch.load 的 weights_only 默认从 False 改为 True，
-        # 会拒绝加载 doclayout_yolo/ultralytics 等含自定义类（YOLOv10DetectionModel 等）的 .pt 模型，
-        # 报 UnpicklingError。模型来自可信源（ModelScope/打包镜像），这里把默认改回 False。
-        # 必须在 CUDA_VISIBLE_DEVICES 设置之后、加载任何模型之前执行。
-        try:
-            import torch as _torch
-
-            if not getattr(_torch.load, "_weights_only_patched", False):
-                _orig_torch_load = _torch.load
-
-                def _compat_torch_load(*args, **kwargs):
-                    kwargs.setdefault("weights_only", False)
-                    return _orig_torch_load(*args, **kwargs)
-
-                _compat_torch_load._weights_only_patched = True
-                _torch.load = _compat_torch_load
-                logger.info("🔧 [Compat] Patched torch.load(weights_only=False) for PyTorch 2.6")
-        except Exception as _e:
-            logger.warning(f"⚠️  Failed to patch torch.load for PyTorch 2.6: {_e}")
-
         # MinerU VRAM 设置
         from mineru.utils.model_utils import get_vram
+
+        apply_cpu_threads_to_libs(cpu_threads)
+        ort_providers = configure_onnxruntime_sessions(cpu_threads, use_cuda=self.accelerator == "cuda")
+        logger.info(
+            f"🧵 [CPU Threads] {cpu_threads} threads per worker "
+            f"(total workers: {os.getenv(TOTAL_WORKERS_ENV, '?')}, cpus: {_available_cpus()}, "
+            f"onnxruntime providers: {ort_providers or 'n/a'})"
+        )
 
         if os.getenv("MINERU_VIRTUAL_VRAM_SIZE", None) is None:
             if self.accelerator == "cuda":
@@ -298,6 +420,7 @@ class MinerUWorkerAPI(ls.LitAPI):
                 except Exception:
                     os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "8"
             elif self.accelerator == "mps":
+                # Apple Silicon 统一内存架构，给较大阈值避免频繁 GC
                 os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "8"
             else:
                 os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "1"
@@ -323,8 +446,6 @@ class MinerUWorkerAPI(ls.LitAPI):
         # 引擎占位符
         self.markitdown = MarkItDown() if MARKITDOWN_AVAILABLE else None
         self.mineru_pipeline_engine = None
-        self.paddleocr_vl_engine = None
-        self.paddleocr_vl_vllm_engine = None
         self.sensevoice_engine = None
         self.video_engine = None
         self.watermark_handler = None
@@ -340,56 +461,9 @@ class MinerUWorkerAPI(ls.LitAPI):
             except Exception as e:
                 logger.error(f"❌ Failed to init watermark engine: {e}")
 
-        # Worker 启动时恢复卡住的 processing 任务：
-        # 第一步：按 worker 前缀识别已死亡的旧实例（重启后 PID 变化），立即重置其遗留任务
-        # （不依赖时间窗口，比 reset_stale_tasks 更快回收 OOM/崩溃重启留下的孤儿任务）。
-        try:
-            worker_id_prefix = "-".join(self.worker_id.rsplit("-", 1)[:-1])  # 去掉尾部 -{pid}
-            reset_count = self.task_db.reset_tasks_from_dead_worker(
-                worker_id_prefix=worker_id_prefix,
-                current_worker_id=self.worker_id,
-            )
-            if reset_count > 0:
-                logger.warning(f"🔄 Dead-worker recovery: reset {reset_count} tasks from previous instance")
-            else:
-                logger.info("✅ Dead-worker recovery: no orphaned tasks found")
-        except Exception as e:
-            logger.error(f"❌ Dead-worker recovery failed: {e}")
-
-        # 第二步：兜底——重置其它来源的超时任务（其他机器崩溃等情况）
-        try:
-            reset_count = self.task_db.reset_stale_tasks(timeout_minutes=10, max_retries=3)
-            if reset_count > 0:
-                logger.warning(f"🔄 Startup recovery: reset {reset_count} stale tasks back to pending")
-        except Exception as e:
-            logger.error(f"❌ Startup recovery failed: {e}")
-
         if self.enable_worker_loop:
             self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
             self.worker_thread.start()
-            # 心跳线程：定期续租正在处理任务的 started_at，避免长任务（如大分片）
-            # 被 scheduler 的 reset_stale_tasks 误判为超时卡死而重置。
-            self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-            self.heartbeat_thread.start()
-            logger.info("💓 Heartbeat loop started")
-
-    def _heartbeat_loop(self):
-        """
-        心跳线程：周期性续租当前正在处理任务的 started_at。
-
-        scheduler 的 reset_stale_tasks 用 started_at 判断任务是否"超时卡死"。
-        只要 worker 还在跑这个任务，就定期刷新 started_at，避免被误判超时重置。
-        心跳间隔须显著小于 scheduler 的 --stale-task-timeout（默认 60 分钟）。
-        """
-        heartbeat_interval = 60  # 秒
-        while self.running:
-            try:
-                task_id = self.current_task_id
-                if task_id:
-                    self.task_db.update_heartbeat(task_id, self.worker_id)
-            except Exception as e:
-                logger.debug(f"💓 heartbeat update failed: {e}")
-            time.sleep(heartbeat_interval)
 
     def _worker_loop(self):
         logger.info(f"🔁 {self.worker_id} started task polling loop")
@@ -429,6 +503,15 @@ class MinerUWorkerAPI(ls.LitAPI):
                 logger.error(f"❌ Worker loop error: {e}")
                 time.sleep(self.poll_interval)
 
+    def _enqueue_webhook(self, task_id: str, event: str):
+        """任务终态触发 webhook 通知入队；任何失败只记日志，不影响任务主流程"""
+        try:
+            from webhook.dispatcher import enqueue_task_event
+
+            enqueue_task_event(self.task_db, task_id, event)
+        except Exception as e:
+            logger.warning(f"⚠️ Webhook 通知入队失败（任务 {task_id}，事件 {event}）: {e}")
+
     def _process_task(self, task: dict):
         """处理任务"""
         task_id = task["task_id"]
@@ -436,50 +519,60 @@ class MinerUWorkerAPI(ls.LitAPI):
         options = json.loads(task.get("options", "{}"))
         parent_task_id = task.get("parent_task_id")
         backend = task.get("backend", "auto")
-        if parent_task_id and Path(file_path).suffix.lower() in {".pdf", ".png", ".jpg", ".jpeg"}:
-            backend = options.get("archive_requested_backend", backend)
 
-        current = self.task_db.get_task(task_id)
-        if not current or current["status"] != "processing" or current.get("is_parent"):
+        # 已拆分的父任务被重新拉取：只可能是等待合并，绝不能重新拆分。
+        # 子任务已全部完成（重试一个合并失败的父任务）→ 直接合并；否则继续等子任务完成后触发合并
+        if task.get("is_parent") and (task.get("child_count") or 0) > 0:
+            if self.task_db.all_children_completed(task_id):
+                logger.info(f"🔗 Parent task {task_id} re-pulled with all subtasks completed, merging")
+                self._finalize_parent_task(task_id)
+            else:
+                logger.warning(f"⚠️  Parent task {task_id} re-pulled while subtasks are unfinished, skipping")
             return
+
+        corrected_copy = None
+        decrypt_work_dir = None
         try:
-            from runtime_modes import validate_pipeline_task
+            # 0. 前置校验：文件必须存在且非空
+            # 空文件一路走到解析引擎，只会得到引擎内部的异常（PdfiumError 之类），
+            # 用户完全看不懂。这里提前拦下并给出人话错误。
+            self._validate_source_file(file_path)
 
-            validate_pipeline_task(file_path, backend)
-            if Path(file_path).suffix.lower() == ".zip":
-                self._split_archive(task_id, file_path, task, options)
-                return
-            # 1. 智能服务切换
-            paddle_container = "tianshu-vllm-paddleocr"
-            mineru_container = "tianshu-vllm-mineru"
+            # 0.3 加密文档前置解密（PDF / Office / ZIP）：密码来自提交时的 options。
+            # 未加密文件零成本直接通过；解密产物写到 output_dir/decrypted/{task_id}/，
+            # 任务结束时清理。必须在 Office 嗅探与 ZIP 解包之前，保证下游拿到明文副本。
+            decrypt_work_dir = decrypted_dir(self.output_dir, task_id)
+            file_path = decrypt_if_needed(file_path, Path(file_path).suffix, options.get("password"), decrypt_work_dir)
 
-            if backend == "paddleocr-vl-vllm" and self.paddleocr_vl_vllm_api:
-                self.vllm_controller.ensure_service(
-                    target_container=paddle_container, conflict_container=mineru_container
-                )
-            elif backend in LOCAL_VLLM_BACKENDS and self.mineru_vllm_api and not options.get("server_url"):
-                self.vllm_controller.ensure_service(
-                    target_container=mineru_container, conflict_container=paddle_container
-                )
+            # 0.5 Office 文件按文件头识别真实格式（必须在路由判断之前）：
+            # 加密文件直接失败并说明原因；改了扩展名的旧版格式 / HTML 转交对应解析路径
+            corrected_copy = self._resolve_office_real_format(file_path, task.get("file_name"))
+            if corrected_copy:
+                file_path = str(corrected_copy)
 
             file_ext = Path(file_path).suffix.lower()
 
-            # 2. 预处理
-            if file_ext in [".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt"] and options.get(
-                "convert_office_to_pdf", False
-            ):
-                try:
-                    pdf_path = self._convert_office_to_pdf(file_path)
-                    file_path = pdf_path
-                    file_ext = ".pdf"
-                    logger.info(f"✅ Office converted to PDF: {pdf_path}")
-                except Exception as e:
-                    logger.warning(f"⚠️ Office conversion failed, falling back: {e}")
+            # 表格文件在 auto 和 MinerU 系 backend（前端预设会传 pipeline / vlm / hybrid）下都改走 MarkItDown
+            is_mineru_backend = "pipeline" in backend or "vlm-" in backend or "hybrid-" in backend
+            route_spreadsheet = file_ext in SPREADSHEET_EXTENSIONS and (backend == "auto" or is_mineru_backend)
 
-            # 3. PDF 拆分
-            is_archive_document = "archive_index" in options and not options.get("chunk_info")
-            if file_ext == ".pdf" and (not parent_task_id or is_archive_document):
+            # 1. 冷启动本地 vLLM 容器；调用方自带 server_url 时指向的是外部服务，不插手
+            if (
+                backend in LOCAL_VLLM_BACKENDS
+                and not route_spreadsheet
+                and self.mineru_vllm_api
+                and not options.get("server_url")
+            ):
+                self.vllm_controller.ensure_running(VLLM_MINERU_CONTAINER)
+
+            # 2. PDF 拆分
+            if file_ext == ".pdf" and not parent_task_id:
                 if self._should_split_pdf(task_id, file_path, task, options):
+                    return
+
+            # 3. ZIP 解包拆分（优先于引擎路由，任何 backend 值都走拆分，子任务继承父任务 backend）
+            if file_ext == ".zip" and not parent_task_id:
+                if self._should_split_zip(task_id, file_path, task, options):
                     return
 
             # 4. 去水印
@@ -493,16 +586,12 @@ class MinerUWorkerAPI(ls.LitAPI):
             # 5. 引擎路由
             result = None
 
-            if file_ext == ".epub":
-                from utils.archive_utils import convert_epub
+            if route_spreadsheet:
+                if not self.markitdown:
+                    raise ValueError(f"MarkItDown not available, cannot parse {file_ext} spreadsheet")
+                logger.info(f"📊 {file_ext.upper()} spreadsheet detected, parsing with MarkItDown (backend={backend})")
+                result = self._process_with_markitdown(file_path, options)
 
-                out = Path(self.output_dir) / Path(file_path).stem
-                convert_epub(file_path, out)
-                normalize_output(out, use_rustfs=options.get("use_rustfs"))
-                result = {"result_path": str(out), "content": (out / "result.md").read_text(encoding="utf-8")}
-            elif file_ext in [".docx", ".xlsx", ".pptx"] and options.get("office_parser", "compatible") == "mineru":
-                options["parse_mode"] = "pipeline"
-                result = self._process_with_mineru(file_path, options)
             elif backend == "sensevoice":
                 if not SENSEVOICE_AVAILABLE:
                     raise ValueError("SenseVoice not available")
@@ -513,17 +602,7 @@ class MinerUWorkerAPI(ls.LitAPI):
                     raise ValueError("Video engine not available")
                 result = self._process_video(file_path, options)
 
-            elif backend == "paddleocr-vl":
-                if not PADDLEOCR_VL_AVAILABLE:
-                    raise ValueError("PaddleOCR-VL not available")
-                result = self._process_with_paddleocr_vl(file_path, options)
-
-            elif backend == "paddleocr-vl-vllm":
-                if not PADDLEOCR_VL_VLLM_AVAILABLE:
-                    raise ValueError("PaddleOCR-VL-VLLM not available")
-                result = self._process_with_paddleocr_vl_vllm(file_path, options)
-
-            elif "pipeline" in backend or "vlm-" in backend or "hybrid-" in backend:
+            elif is_mineru_backend:
                 if not MINERU_PIPELINE_AVAILABLE:
                     raise ValueError("MinerU Pipeline not available")
                 options["parse_mode"] = backend
@@ -536,37 +615,41 @@ class MinerUWorkerAPI(ls.LitAPI):
                     result = self._process_audio(file_path, options)
                 elif file_ext in [".mp4", ".avi", ".mkv", ".mov"] and VIDEO_ENGINE_AVAILABLE:
                     result = self._process_video(file_path, options)
-                elif file_ext in [".pdf", ".png", ".jpg", ".jpeg", ".docx"] and MINERU_PIPELINE_AVAILABLE:
+                elif file_ext in [".pdf", ".png", ".jpg", ".jpeg", ".docx", ".pptx"] and MINERU_PIPELINE_AVAILABLE:
                     options["parse_mode"] = "pipeline"
                     result = self._process_with_mineru(file_path, options)
-                elif file_ext in [".xlsx", ".pptx"]:
-                    # xlsx/pptx 用自研解析器（保留图片、xlsx 含外部引用不崩），替代 MarkItDown
-                    result = self._process_office(file_path, options)
-                elif file_ext == ".md":
-                    # Markdown 原生处理：提取内/外部图片
-                    result = self._process_markdown(file_path, options)
-                elif file_ext in [".doc", ".xls", ".ppt"]:
-                    # 旧格式先用 LibreOffice 转为对应新格式，再走已有处理链
-                    # .doc→.docx→MinerU原生  .xls→.xlsx→MarkItDown  .ppt→.pptx→MarkItDown
+                elif file_ext in [".doc", ".ppt"]:
+                    # 旧版 Office 格式先用 LibreOffice 转为对应 OOXML 新格式，再走 MinerU 原生解析
                     try:
                         new_path = self._convert_office_to_new_format(file_path)
-                        new_ext = Path(new_path).suffix.lower()
-                        if new_ext == ".docx" and MINERU_PIPELINE_AVAILABLE:
+                    except Exception as e:
+                        logger.warning(f"⚠️ Old Office conversion failed ({e}); MarkItDown fallback is skipped")
+                        raise
+
+                    try:
+                        try:
+                            if not MINERU_PIPELINE_AVAILABLE:
+                                raise ValueError("MinerU Pipeline not available for converted Office file")
                             options["parse_mode"] = "pipeline"
                             result = self._process_with_mineru(new_path, options)
-                        elif new_ext in [".xlsx", ".pptx"]:
-                            # .xls→.xlsx / .ppt→.pptx 转换后走自研解析器
-                            result = self._process_office(new_path, options)
-                        elif self.markitdown:
+                            if not result:
+                                raise ValueError("No result generated by MinerU for converted Office file")
+                        except Exception as e:
+                            if not self.markitdown:
+                                raise
+                            logger.warning(
+                                f"⚠️ Converted Office parsing failed ({e}); falling back to MarkItDown with {new_path}"
+                            )
                             result = self._process_with_markitdown(new_path, options)
-                        else:
-                            raise ValueError(f"No handler available for converted {new_ext}")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Old format conversion failed ({e}), falling back to MarkItDown")
-                        if self.markitdown:
-                            result = self._process_with_markitdown(file_path, options)
-                        else:
-                            raise ValueError(f"Unsupported file type: {file_ext}") from e
+                    finally:
+                        # 转换产物是中间件，解析完即可删除；否则会永久堆积在上传目录
+                        try:
+                            Path(new_path).unlink(missing_ok=True)
+                        except OSError as cleanup_err:
+                            logger.debug(f"清理转换产物失败 {new_path}: {cleanup_err}")
+                elif file_ext in [".epub"] and self.markitdown:
+                    # EPUB 电子书走 MarkItDown 原生支持
+                    result = self._process_with_markitdown(file_path, options)
                 elif self.markitdown:
                     result = self._process_with_markitdown(file_path, options)
                 else:
@@ -586,9 +669,8 @@ class MinerUWorkerAPI(ls.LitAPI):
                 raise ValueError("No result generated by engine")
 
             # 6. 保存完整结果到数据库 (包含 json_content 和 pdf_path)
-            saved = self.task_db.update_task_status(
+            self.task_db.update_task_status(
                 task_id=task_id,
-                worker_id=getattr(self, "worker_id", None),
                 status="completed",
                 result_path=result["result_path"],
                 error_message=None,
@@ -602,24 +684,46 @@ class MinerUWorkerAPI(ls.LitAPI):
                 ),
             )
 
+            # 单任务完成触发 webhook；子任务不触发，由父任务合并完成后统一通知
+            if not parent_task_id:
+                self._enqueue_webhook(task_id, "task.completed")
+
             # 7. 合并子任务
-            if saved and parent_task_id:
+            if parent_task_id:
                 parent_id_to_merge = self.task_db.on_child_task_completed(task_id)
                 if parent_id_to_merge:
-                    try:
-                        self._merge_parent_task_results(parent_id_to_merge)
-                    except Exception as e:
-                        if self.task_db.update_task_status(parent_id_to_merge, "failed", error_message=str(e)):
-                            self.task_db.on_child_task_failed(parent_id_to_merge, str(e))
+                    self._finalize_parent_task(parent_id_to_merge)
 
+        except DocDecryptError as e:
+            # 解密失败：文案已是友好中文，直接落库，不套 "TypeError: ..." 前缀
+            error_msg = str(e)
+            self.task_db.update_task_status(task_id, "failed", error_message=error_msg)
+            if parent_task_id:
+                self.task_db.on_child_task_failed(task_id, error_msg)
+            else:
+                self._enqueue_webhook(task_id, "task.failed")
+            raise
         except Exception as e:
             error_msg = f"{type(e).__name__}: {str(e)}"
-            saved = self.task_db.update_task_status(
-                task_id, "failed", error_message=error_msg, worker_id=getattr(self, "worker_id", None)
-            )
-            if saved and parent_task_id:
+            self.task_db.update_task_status(task_id, "failed", error_message=error_msg)
+            if parent_task_id:
                 self.task_db.on_child_task_failed(task_id, error_msg)
+            else:
+                self._enqueue_webhook(task_id, "task.failed")
             raise
+        finally:
+            # 纠正扩展名用的临时副本，解析完即删除；原始上传文件保留（重试时还要用）
+            if corrected_copy:
+                try:
+                    Path(corrected_copy).unlink(missing_ok=True)
+                except OSError as cleanup_err:
+                    logger.debug(f"清理格式纠正副本失败 {corrected_copy}: {cleanup_err}")
+            # 解密产物随任务完成清理；清理失败绝不能阻塞任务
+            if decrypt_work_dir is not None:
+                try:
+                    cleanup_decrypted(decrypt_work_dir)
+                except Exception as cleanup_err:
+                    logger.debug(f"清理解密产物失败 {decrypt_work_dir}: {cleanup_err}")
 
     # -------------------------------------------------------------------------
     # Helper: 确保 PDF 存在于 Output 目录
@@ -652,7 +756,7 @@ class MinerUWorkerAPI(ls.LitAPI):
 
         if not target_path.exists():
             try:
-                shutil.copy2(source_file, target_path)
+                copy_file(source_file, target_path)
                 logger.info(f"📄 Copied source PDF to output: {target_name}")
             except Exception as e:
                 logger.warning(f"Failed to copy source PDF: {e}")
@@ -668,7 +772,7 @@ class MinerUWorkerAPI(ls.LitAPI):
             from mineru_pipeline import MinerUPipelineEngine
 
             self.mineru_pipeline_engine = MinerUPipelineEngine(
-                device="mps" if self.accelerator == "mps" else self.engine_device, vlm_api_base=self.mineru_vllm_api
+                device=self.engine_device, vlm_api_base=self.mineru_vllm_api
             )
 
         output_dir = Path(self.output_dir) / Path(file_path).stem
@@ -676,8 +780,21 @@ class MinerUWorkerAPI(ls.LitAPI):
 
         result = self.mineru_pipeline_engine.parse(file_path, output_path=str(output_dir), options=options)
 
+        # 图片描述处理器：管理员开启后，规范化时（RustFS 上传改 URL 之前）按文件名匹配写回 alt/img_caption
+        caption_stats = None
+
+        def caption_processor(proc_dir: Path, _norm_result: dict):
+            nonlocal caption_stats
+            caption_cfg = ImageCaptionConfig.load()
+            if caption_cfg:
+                caption_stats = process_output_dir(proc_dir, caption_cfg)
+
         actual_output = Path(result["result_path"])
-        normalize_output(actual_output, use_rustfs=options.get("use_rustfs"))
+        normalize_output(
+            actual_output,
+            image_processor=caption_processor if IMAGE_CAPTION_AVAILABLE else None,
+            use_rustfs=options.get("use_rustfs"),
+        )
 
         # 扁平化目录结构
         if actual_output.resolve() != output_dir.resolve():
@@ -689,7 +806,7 @@ class MinerUWorkerAPI(ls.LitAPI):
                             shutil.rmtree(dest)
                         else:
                             dest.unlink()
-                    shutil.move(str(item), str(dest))
+                    move_file(item, dest)
                 shutil.rmtree(actual_output)
             except Exception as e:
                 logger.warning(f"Flattening warning: {e}")
@@ -697,64 +814,24 @@ class MinerUWorkerAPI(ls.LitAPI):
         # [修复] 确保 PDF 存在并返回路径
         pdf_path = self._ensure_pdf_in_output(file_path, output_dir)
 
+        # 图片描述写回的是磁盘文件，这里刷新内存快照，保证 tasks.data 中携带描述
+        if caption_stats and caption_stats.get("captioned"):
+            try:
+                md_file = output_dir / "result.md"
+                if md_file.exists():
+                    result["markdown"] = md_file.read_text(encoding="utf-8")
+                json_file = output_dir / "result.json"
+                if json_file.exists():
+                    result["json_content"] = json.loads(json_file.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to refresh captioned result: {e}")
+
         return {
             "result_path": str(output_dir),
             "content": result.get("markdown", ""),
             "json_content": result.get("json_content"),
             "pdf_path": pdf_path,  # 返回给前端
             "markdown_file": result.get("markdown_file"),
-        }
-
-    def _process_with_paddleocr_vl(self, file_path: str, options: dict) -> dict:
-        if self.accelerator != "cuda":
-            raise RuntimeError("PaddleOCR-VL requires CUDA")
-
-        if self.paddleocr_vl_engine is None:
-            from paddleocr_vl import PaddleOCRVLEngine
-
-            self.paddleocr_vl_engine = PaddleOCRVLEngine(device="cuda:0", model_name="PaddleOCR-VL-1.5-0.9B")
-
-        output_dir = Path(self.output_dir) / Path(file_path).stem
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        result = self.paddleocr_vl_engine.parse(file_path, output_path=str(output_dir), **options)
-
-        pdf_path = self._ensure_pdf_in_output(file_path, output_dir)
-        normalize_output(output_dir, use_rustfs=options.get("use_rustfs"))
-
-        return {
-            "result_path": str(output_dir),
-            "content": result.get("markdown", ""),
-            "json_content": result.get("json_content"),  # 必须传递
-            "pdf_path": pdf_path,
-        }
-
-    def _process_with_paddleocr_vl_vllm(self, file_path: str, options: dict) -> dict:
-        if self.accelerator != "cuda":
-            raise RuntimeError("PaddleOCR-VL-VLLM requires CUDA")
-
-        if self.paddleocr_vl_vllm_engine is None:
-            from paddleocr_vl_vllm import PaddleOCRVLVLLMEngine
-
-            self.paddleocr_vl_vllm_engine = PaddleOCRVLVLLMEngine(
-                device="cuda:0", vllm_api_base=self.paddleocr_vl_vllm_api, model_name="PaddleOCR-VL-1.5-0.9B"
-            )
-
-        output_dir = Path(self.output_dir) / Path(file_path).stem
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        result = self.paddleocr_vl_vllm_engine.parse(file_path, output_path=str(output_dir), **options)
-
-        # [修复] 复制源文件以便预览 (关键修复)
-        pdf_path = self._ensure_pdf_in_output(file_path, output_dir)
-
-        normalize_output(output_dir, handle_method="paddleocr-vl", use_rustfs=options.get("use_rustfs"))
-
-        return {
-            "result_path": str(output_dir),
-            "content": result.get("markdown", ""),
-            "json_content": result.get("json_content"),  # 关键：支持右侧高亮
-            "pdf_path": pdf_path,  # 关键：支持左侧预览
         }
 
     def _process_audio(self, file_path: str, options: dict) -> dict:
@@ -773,7 +850,7 @@ class MinerUWorkerAPI(ls.LitAPI):
             use_itn=options.get("use_itn", True),
             enable_speaker_diarization=options.get("enable_speaker_diarization", False),
         )
-        normalize_output(output_dir, use_rustfs=options.get("use_rustfs"))
+        normalize_output(output_dir, use_rustfs=(options or {}).get("use_rustfs"))
         return {"result_path": str(output_dir), "content": result.get("markdown", "")}
 
     def _process_video(self, file_path: str, options: dict) -> dict:
@@ -792,166 +869,13 @@ class MinerUWorkerAPI(ls.LitAPI):
             use_itn=options.get("use_itn", True),
             keep_audio=options.get("keep_audio", False),
             enable_keyframe_ocr=options.get("enable_keyframe_ocr", False),
-            ocr_backend=options.get("ocr_backend", "paddleocr-vl"),
+            ocr_backend=options.get("ocr_backend", "mineru"),
             keep_keyframes=options.get("keep_keyframes", False),
         )
 
         (output_dir / f"{Path(file_path).stem}_video_analysis.md").write_text(result["markdown"], encoding="utf-8")
-        normalize_output(output_dir, use_rustfs=options.get("use_rustfs"))
+        normalize_output(output_dir, use_rustfs=(options or {}).get("use_rustfs"))
         return {"result_path": str(output_dir), "content": result["markdown"]}
-
-    def _process_markdown(self, file_path: str, options: dict) -> dict:
-        """
-        处理 Markdown 文件，提取内/外部图片并上传 RustFS（不可用时降级本地保存）。
-
-        Returns:
-            {result_path, content, chunks, images, rustfs_urls}
-        """
-        from utils.markdown_image_extractor import (
-            process_markdown_images,
-            chunk_markdown_by_heading,
-        )
-
-        md_file = Path(file_path)
-        markdown_content = md_file.read_text(encoding="utf-8")
-
-        output_dir = Path(self.output_dir) / md_file.stem
-        output_dir.mkdir(parents=True, exist_ok=True)
-        images_dir = output_dir / "images"
-
-        try:
-            use_rustfs = (options or {}).get("use_rustfs")
-            # 任务级开关优先；未指定(None)时回退到 RUSTFS_ENABLED 环境变量
-            if use_rustfs is None:
-                use_rustfs = os.getenv("RUSTFS_ENABLED", "true").lower() in ("true", "1", "yes")
-            if not use_rustfs:
-                rustfs_client = None
-            else:
-                from storage import RustFSClient
-
-                rustfs_client = RustFSClient()
-        except Exception as e:
-            logger.warning(f"⚠️  RustFS not available: {e}")
-            rustfs_client = None
-
-        from image_caption import ImageCaptionConfig
-
-        caption_enabled = ImageCaptionConfig.load() is not None
-        if caption_enabled:
-            rustfs_client = None
-
-        result = process_markdown_images(
-            markdown_content=markdown_content,
-            markdown_file_path=str(md_file),
-            output_dir=str(images_dir),
-            rustfs_client=rustfs_client,
-        )
-
-        if caption_enabled:
-            (output_dir / "result.md").write_text(result["content"], encoding="utf-8")
-            normalize_output(output_dir, use_rustfs=options.get("use_rustfs"))
-            result["content"] = (output_dir / "result.md").read_text(encoding="utf-8")
-
-        structured_chunks = chunk_markdown_by_heading(
-            result["content"],
-            include_images=True,
-            image_info=result["images"],
-        )
-
-        result_file = output_dir / "result.md"
-        result_file.write_text(result["content"], encoding="utf-8")
-
-        chunks_file = output_dir / "chunks.json"
-        chunks_file.write_text(
-            json.dumps(structured_chunks, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-        logger.info(f"📝 Markdown processed: {len(result['images'])} images extracted")
-
-        return {
-            "result_path": str(output_dir),
-            "content": result["content"],
-            "chunks": structured_chunks,
-            "images": result["images"],
-            "rustfs_urls": result["rustfs_urls"],
-        }
-
-    def _process_office(self, file_path: str, options: dict) -> dict:
-        """
-        处理新格式 Office 文件 (xlsx/pptx)：用自研解析器提取表格/文本与图片，
-        图片可上传 RustFS（不可用时降级为本地保存）。
-
-        注：docx 走 MinerU Pipeline（质量更高），不经过此方法。
-
-        Returns:
-            {result_path, content, chunks, images, rustfs_urls}
-        """
-        if options.get("office_parser", "compatible") == "mineru":
-            return self._process_with_mineru(file_path, options | {"parse_mode": "pipeline"})
-        from utils.office_to_markdown import office_to_markdown
-        from utils.markdown_image_extractor import chunk_markdown_by_heading
-
-        output_dir = Path(self.output_dir) / Path(file_path).stem
-        output_dir.mkdir(parents=True, exist_ok=True)
-        images_dir = output_dir / "images"
-
-        use_rustfs = (options or {}).get("use_rustfs")
-        # 任务级开关优先；未指定(None)时回退到 RUSTFS_ENABLED 环境变量
-        if use_rustfs is None:
-            use_rustfs = os.getenv("RUSTFS_ENABLED", "true").lower() in ("true", "1", "yes")
-        rustfs_client = None
-        if use_rustfs:
-            try:
-                from storage import RustFSClient
-
-                rustfs_client = RustFSClient()
-            except Exception as e:
-                logger.warning(f"⚠️  RustFS not available: {e}")
-
-        from image_caption import ImageCaptionConfig
-
-        caption_enabled = ImageCaptionConfig.load() is not None
-        if caption_enabled:
-            rustfs_client = None
-
-        markdown_content, images = office_to_markdown(
-            file_path=file_path,
-            images_dir=str(images_dir),
-            rustfs_client=rustfs_client,
-        )
-
-        logger.info(f"📄 Office processed: {len(images)} images extracted")
-
-        result_file = output_dir / "result.md"
-        result_file.write_text(markdown_content, encoding="utf-8")
-
-        if caption_enabled:
-            (output_dir / "result.md").write_text(markdown_content, encoding="utf-8")
-            normalize_output(output_dir, use_rustfs=options.get("use_rustfs"))
-            markdown_content = (output_dir / "result.md").read_text(encoding="utf-8")
-
-        structured_chunks = chunk_markdown_by_heading(
-            markdown_content,
-            include_images=True,
-            image_info=images,
-        )
-
-        chunks_file = output_dir / "chunks.json"
-        chunks_file.write_text(
-            json.dumps(structured_chunks, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-        rustfs_urls = {img["src"]: img["rustfs_url"] for img in images if img.get("rustfs_url")}
-
-        return {
-            "result_path": str(output_dir),
-            "content": markdown_content,
-            "chunks": structured_chunks,
-            "images": images,
-            "rustfs_urls": rustfs_urls,
-        }
 
     def _process_with_markitdown(self, file_path: str, options: dict = None) -> dict:
         if not self.markitdown:
@@ -962,17 +886,6 @@ class MinerUWorkerAPI(ls.LitAPI):
 
         result = self.markitdown.convert(file_path)
         markdown_content = result.text_content
-
-        if Path(file_path).suffix.lower() == ".docx":
-            try:
-                from utils.docx_image_extractor import extract_images_from_docx, append_images_to_markdown
-
-                images_dir = output_dir / "images"
-                images = extract_images_from_docx(file_path, str(images_dir))
-                if images:
-                    markdown_content = append_images_to_markdown(markdown_content, images)
-            except Exception as e:
-                logger.warning(f"DOCX image extraction failed: {e}")
 
         (output_dir / f"{Path(file_path).stem}_markitdown.md").write_text(markdown_content, encoding="utf-8")
         normalize_output(output_dir, use_rustfs=(options or {}).get("use_rustfs"))
@@ -1003,54 +916,66 @@ class MinerUWorkerAPI(ls.LitAPI):
             json.dumps(result["json_content"], indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
-        normalize_output(output_dir, use_rustfs=options.get("use_rustfs"))
+        normalize_output(output_dir, use_rustfs=(options or {}).get("use_rustfs"))
         return {"result_path": str(output_dir), "content": result["content"], "json_content": result["json_content"]}
 
     # -------------------------------------------------------------------------
     # Utilities
     # -------------------------------------------------------------------------
-    def _convert_office_to_pdf(self, file_path: str) -> str:
-        input_file = Path(file_path)
-        final_pdf = input_file.parent / f"{input_file.stem}.pdf"
-        if final_pdf.exists():
-            final_pdf.unlink()
+    @staticmethod
+    def _validate_source_file(file_path: str) -> int:
+        """解析前校验源文件，返回文件字节数
 
-        try:
-            with tempfile.TemporaryDirectory(prefix="libreoffice_") as temp_dir:
-                temp_path = Path(temp_dir)
-                temp_input = temp_path / input_file.name
-                shutil.copy2(input_file, temp_input)
+        API 层已拒绝空上传，这里是第二道防线：子任务文件（PDF 分片、ZIP 解包条目）
+        和旧版 Office 的转换产物都不经过上传接口，同样可能是空的。
 
-                # 独立 UserInstallation：避免多 worker 并发时 LibreOffice profile 锁冲突导致失败/卡死
-                user_install = f"file://{temp_path}/libreoffice_profile"
-                cmd = [
-                    "libreoffice",
-                    "--headless",
-                    f"-env:UserInstallation={user_install}",
-                    "--convert-to",
-                    "pdf",
-                    "--outdir",
-                    str(temp_path),
-                    str(temp_input),
-                ]
-                # 超时 600s 支持大文件（约 500 页）
-                subprocess.run(cmd, check=True, timeout=600, capture_output=True, text=True)
+        Raises:
+            FileNotFoundError: 文件不存在
+            ValueError: 文件为 0 字节
+        """
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"源文件不存在: {file_path}")
 
-                temp_pdf = temp_path / f"{input_file.stem}.pdf"
-                if not temp_pdf.exists():
-                    raise RuntimeError("PDF output missing")
-                shutil.move(str(temp_pdf), str(final_pdf))
-                return str(final_pdf)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"LibreOffice conversion timeout (>600s): {input_file.name}")
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"LibreOffice conversion failed: {e.stderr or 'no stderr'}")
-        except Exception as e:
-            raise RuntimeError(f"Office conversion failed: {e}")
+        size = path.stat().st_size
+        if size == 0:
+            raise ValueError(f"源文件内容为空（0 字节），无法解析: {path.name}")
+
+        return size
+
+    @staticmethod
+    def _resolve_office_real_format(file_path: str, display_name: Optional[str] = None) -> Optional[Path]:
+        """按文件头识别 .xlsx / .docx / .pptx 的真实格式
+
+        - 加密（敏感度标签 / IRM / 打开密码）：抛 EncryptedDocumentError，不做任何绕过
+        - 旧版 .xls/.doc/.ppt 或 HTML 改了扩展名：复制一份正确扩展名的副本并返回其路径，
+          后续路由按真实格式走（调用方负责删除副本）；副本与原文件同名不同后缀，输出目录名不变
+        - 真正的 OOXML 或无法判断：返回 None，按原扩展名处理
+        """
+        result = sniff_office_file(file_path)
+        if result.kind == "encrypted":
+            raise EncryptedDocumentError(result.detail, display_name or Path(file_path).name)
+        if result.kind not in ("legacy", "html"):
+            return None
+
+        source = Path(file_path)
+        target = source.with_suffix(result.detail)
+        if target.exists():
+            target = source.with_name(f"{source.stem}.{uuid.uuid4().hex[:8]}{result.detail}")
+        copy_file(source, target)
+        logger.info(f"🔎 {source.name} is actually {result.detail} ({result.kind}), parsing as {target.name}")
+        return target
 
     def _convert_office_to_new_format(self, file_path: str) -> str:
-        """将旧版 Office 格式转换为对应的 OOXML 新格式（供 MarkItDown / MinerU 处理）。
+        """将旧版 Office 格式转换为对应的 OOXML 新格式（供 MinerU 原生解析）。
         .doc → .docx   .xls → .xlsx   .ppt → .pptx
+
+        两个关键细节：
+        1. 每次转换分配独立的 UserInstallation profile。LibreOffice 是单实例模型，
+           多个进程共用默认 profile 时，后来的调用会把活交给已有实例然后直接退出，
+           表现为 exit 1 或 exit 0 但无产出。Worker 有多个进程并发，必须隔离。
+        2. 超时后按进程组清理。libreoffice 是包装脚本，会 fork 出 soffice.bin，
+           只杀直接子进程会留下孤儿进程，持续占内存并拖慢后续转换。
         """
         _fmt_map = {".doc": "docx", ".xls": "xlsx", ".ppt": "pptx"}
         input_file = Path(file_path)
@@ -1058,42 +983,99 @@ class MinerUWorkerAPI(ls.LitAPI):
         if not target_fmt:
             raise ValueError(f"Unsupported old format: {input_file.suffix}")
 
+        self._validate_source_file(file_path)
+
         final_new = input_file.parent / f"{input_file.stem}.{target_fmt}"
         if final_new.exists():
             final_new.unlink()
 
+        timeout = int(os.getenv("OFFICE_CONVERT_TIMEOUT", "180"))
+
         try:
             with tempfile.TemporaryDirectory(prefix="libreoffice_") as temp_dir:
                 temp_path = Path(temp_dir)
+                profile_path = temp_path / "profile"
+                profile_path.mkdir()
                 temp_input = temp_path / input_file.name
-                shutil.copy2(input_file, temp_input)
+                copy_file(input_file, temp_input)
 
-                # 独立 UserInstallation：避免多 worker 并发时 LibreOffice profile 锁冲突
-                user_install = f"file://{temp_path}/libreoffice_profile"
                 cmd = [
                     "libreoffice",
+                    f"-env:UserInstallation={profile_path.as_uri()}",
                     "--headless",
-                    f"-env:UserInstallation={user_install}",
                     "--convert-to",
                     target_fmt,
                     "--outdir",
                     str(temp_path),
                     str(temp_input),
                 ]
-                subprocess.run(cmd, check=True, timeout=600, capture_output=True, text=True)
+
+                stdout, stderr, returncode = self._run_with_process_group(cmd, timeout)
+
+                if returncode != 0:
+                    raise RuntimeError(
+                        f"libreoffice exited with {returncode}: {self._tail(stderr) or self._tail(stdout) or '(无输出)'}"
+                    )
 
                 temp_new = temp_path / f"{input_file.stem}.{target_fmt}"
                 if not temp_new.exists():
-                    raise RuntimeError(f"{target_fmt} output missing")
-                shutil.move(str(temp_new), str(final_new))
+                    # LibreOffice 转换失败时经常仍然返回 0，这里把它的输出带出来
+                    raise RuntimeError(
+                        f"{target_fmt} output missing (exit 0). "
+                        f"stdout={self._tail(stdout) or '(空)'} stderr={self._tail(stderr) or '(空)'}"
+                    )
+
+                move_file(temp_new, final_new)
                 logger.info(f"✅ Converted {input_file.suffix} → .{target_fmt}: {final_new}")
                 return str(final_new)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"LibreOffice conversion timeout (>600s): {input_file.name}")
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"LibreOffice {target_fmt} conversion failed: {e.stderr or 'no stderr'}")
         except Exception as e:
-            raise RuntimeError(f"Old format conversion failed: {e}")
+            raise RuntimeError(f"Old format conversion failed: {e}") from e
+
+    @staticmethod
+    def _tail(output: bytes, limit: int = 500) -> str:
+        """取子进程输出的尾部，用于放进错误信息"""
+        if not output:
+            return ""
+        text = output.decode("utf-8", errors="replace").strip()
+        # LibreOffice 每次都会打这条 Java 警告，与失败无关，滤掉避免干扰
+        lines = [ln for ln in text.splitlines() if "failed to launch javaldx" not in ln]
+        text = "\n".join(lines).strip()
+        return text[-limit:] if len(text) > limit else text
+
+    @staticmethod
+    def _run_with_process_group(cmd, timeout):
+        """运行子进程；超时时连同其派生的子孙进程一并清理
+
+        subprocess.run(timeout=...) 只杀直接子进程。libreoffice 会派生 soffice.bin，
+        孤儿进程会持有资源并影响后续转换，所以这里用独立进程组 + killpg。
+        """
+        import signal
+
+        popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+        if hasattr(os, "setsid"):
+            popen_kwargs["start_new_session"] = True
+
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return stdout, stderr, proc.returncode
+        except subprocess.TimeoutExpired:
+            if hasattr(os, "killpg"):
+                try:
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGTERM)
+                    try:
+                        proc.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(pgid, signal.SIGKILL)
+                        proc.communicate()
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+                    proc.communicate()
+            else:
+                proc.kill()
+                proc.communicate()
+            raise RuntimeError(f"转换超时（{timeout}s），已终止 LibreOffice 进程组")
 
     def _preprocess_remove_watermark(self, file_path: str, options: dict) -> Path:
         if not self.watermark_handler:
@@ -1117,79 +1099,21 @@ class MinerUWorkerAPI(ls.LitAPI):
 
         return self.watermark_handler.remove_watermark(input_path=file_path, output_path=str(output_file), **kwargs)
 
-    def _split_archive(self, task_id, file_path, task, options):
-        from utils.archive_utils import archive_documents
-
-        # Build in a fresh directory so failed extraction can be removed without affecting active files.
-        import tempfile
-
-        staging = Path(self.output_dir) / Path(file_path).stem / "_archive_inputs"
-        staging.mkdir(parents=True, exist_ok=True)
-        directory = Path(tempfile.mkdtemp(prefix=f"{task_id}_", dir=staging))
-        try:
-            documents = archive_documents(file_path, directory)
-            self.task_db.delete_child_tasks(task_id)
-            self.task_db.convert_to_parent_task(task_id, child_count=0)
-            children = []
-            for document in documents:
-                child_options = dict(
-                    options,
-                    archive_index=document["archive_index"],
-                    archive_member=document["archive_member"],
-                    archive_requested_backend=task.get("backend", "auto"),
-                )
-                children.append(
-                    {"file_name": document["file_name"], "file_path": document["file_path"], "options": child_options}
-                )
-            self.task_db.create_child_tasks_bulk(
-                task_id, children, backend="auto", priority=task.get("priority", 0), user_id=task.get("user_id")
-            )
-        except Exception:
-            shutil.rmtree(directory, ignore_errors=True)
-            raise
-
     def _should_split_pdf(self, task_id, file_path, task, options):
         from utils.pdf_utils import get_pdf_page_count, split_pdf_file
 
         if os.getenv("PDF_SPLIT_ENABLED", "true").lower() != "true":
             return False
 
-        threshold = int(os.getenv("PDF_SPLIT_THRESHOLD_PAGES", "500"))
-        chunk_size = int(os.getenv("PDF_SPLIT_CHUNK_SIZE", "500"))
-        # 文件大小阈值（MB）：页数不多但体积很大的 PDF（如高清扫描件、整页大图）同样会撑爆
-        # 显存，超过此值即强制按大小拆分以防 OOM（仅按页数判断会漏掉这类文件）。
-        size_mb_threshold = int(os.getenv("PDF_SPLIT_SIZE_MB", "20"))
+        threshold = int(os.getenv("PDF_SPLIT_THRESHOLD_PAGES", "40"))
+        chunk_size = int(os.getenv("PDF_SPLIT_CHUNK_SIZE", "20"))
 
         try:
             pages = get_pdf_page_count(Path(file_path))
-            file_size_mb = Path(file_path).stat().st_size / (1024 * 1024)
-            logger.info(
-                f"📄 PDF: {pages} pages, {file_size_mb:.1f}MB "
-                f"(page threshold={threshold}, size threshold={size_mb_threshold}MB)"
-            )
-
-            need_split_by_pages = pages > threshold
-            need_split_by_size = file_size_mb > size_mb_threshold and pages > 1
-            if not need_split_by_pages and not need_split_by_size:
+            if pages <= threshold:
                 return False
 
-            if need_split_by_size and not need_split_by_pages:
-                # 按大小触发时动态收缩 chunk_size，使每片体积约不超过阈值的 80%，控制单片内存
-                pages_per_mb = pages / file_size_mb
-                target_chunk_mb = size_mb_threshold * 0.8
-                chunk_size = max(1, min(chunk_size, pages - 1, int(pages_per_mb * target_chunk_mb)))
-                logger.warning(
-                    f"⚠️  Large file ({file_size_mb:.1f}MB) detected, force splitting to "
-                    f"prevent OOM (chunk_size={chunk_size} pages)"
-                )
-
-            logger.info(f"🔀 Splitting PDF ({pages} pages, {file_size_mb:.1f}MB) into chunks of {chunk_size} pages...")
-            # 清理上一轮拆分可能残留的子任务（OOM 重启后重拆场景），
-            # 避免重复子任务污染 child_completed 计数与结果合并。
-            stale = self.task_db.delete_child_tasks(task_id)
-            if stale:
-                logger.warning(f"🧹 Cleared {stale} stale child task(s) before re-splitting {task_id}")
-            # 先初始化父任务：is_parent=1, child_count=0, child_completed=0（在创建任何子任务之前清零，无竞态）
+            logger.info(f"🔀 Splitting PDF ({pages} pages)...")
             self.task_db.convert_to_parent_task(task_id, child_count=0)
             split_dir = Path(self.output_dir) / "splits" / task_id
             split_dir.mkdir(parents=True, exist_ok=True)
@@ -1208,6 +1132,7 @@ class MinerUWorkerAPI(ls.LitAPI):
                     }
                 )
 
+            # 单事务批量创建：切片数多时避免上百个背靠背的写事务反复锁住数据库
             self.task_db.create_child_tasks_bulk(
                 parent_task_id=task_id,
                 children=children,
@@ -1215,98 +1140,195 @@ class MinerUWorkerAPI(ls.LitAPI):
                 priority=task.get("priority", 0),
                 user_id=task.get("user_id"),
             )
-            # 批量事务一次设置完整计数；不能再次初始化父任务，否则会清掉已完成计数。
+
+            self.task_db.convert_to_parent_task(task_id, child_count=len(chunks))
             logger.info(f"✂️  Split into {len(chunks)} subtasks")
             return True
+        except (FileNotFoundError, ValueError) as e:
+            # 文件不存在 / 内容为空属于致命错误：继续往下走只会让解析引擎抛出
+            # 看不懂的内部异常（线上就是这样把空文件送进 pdfium 的），必须直接失败
+            logger.error(f"❌ PDF split aborted, source file unusable: {e}")
+            raise
         except Exception as e:
-            logger.error(f"❌ PDF split failed: {e}")
-            if task.get("parent_task_id"):
-                # An oversized ZIP member must not fall back to parsing the whole PDF.
-                raise
+            # 其它异常（页数读取失败等）只跳过拆分，仍让解析引擎试一次
+            logger.warning(f"⚠️  PDF split skipped ({e}); continuing without splitting")
             return False
+
+    # ZIP 解包安全限制：防 zip bomb 与恶意条目
+    ZIP_MAX_ENTRIES = 200
+    ZIP_MAX_TOTAL_SIZE = 2 * 1024 * 1024 * 1024  # 2GB
+
+    def _should_split_zip(self, task_id, file_path, task, options):
+        """将 zip 压缩包解包为多个子任务（每个可解析文件一个子任务）。返回 True 表示已拆分。"""
+        extract_dir = Path(self.output_dir) / "splits" / task_id
+
+        try:
+            if not zipfile.is_zipfile(file_path):
+                logger.error(f"❌ Invalid zip file: {file_path}")
+                return False
+
+            entries = []  # (原始条目名, 解压后的文件路径)
+            total_size = 0
+            used_names = set()
+            used_stems = set()
+
+            with zipfile.ZipFile(file_path) as zf:
+                infos = zf.infolist()
+                if len(infos) > self.ZIP_MAX_ENTRIES:
+                    logger.error(f"❌ ZIP has too many entries ({len(infos)} > {self.ZIP_MAX_ENTRIES})")
+                    return False
+
+                extract_dir.mkdir(parents=True, exist_ok=True)
+
+                for info in infos:
+                    # 跳过目录
+                    if info.is_dir():
+                        continue
+
+                    # 统一分隔符后取基名，剥离压缩包内目录成分
+                    entry_name = info.filename.replace("\\", "/")
+                    base_name = entry_name.rsplit("/", 1)[-1]
+
+                    # 跳过 macOS 资源叉与隐藏文件
+                    if entry_name.startswith("__MACOSX/") or base_name.startswith("."):
+                        continue
+
+                    ext = Path(base_name).suffix.lower()
+
+                    # 跳过嵌套压缩包，避免递归解包风险
+                    if ext == ".zip":
+                        logger.warning(f"⚠️  Skipping nested archive in zip: {entry_name}")
+                        continue
+
+                    # 仅解包平台支持解析的格式
+                    if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+                        logger.warning(f"⚠️  Skipping unsupported entry in zip: {entry_name}")
+                        continue
+
+                    # 防 zip bomb：按解压后大小逐条累计
+                    total_size += info.file_size
+                    if total_size > self.ZIP_MAX_TOTAL_SIZE:
+                        logger.error(
+                            f"❌ ZIP total extracted size exceeds limit ({self.ZIP_MAX_TOTAL_SIZE} bytes), aborting"
+                        )
+                        shutil.rmtree(extract_dir, ignore_errors=True)
+                        return False
+
+                    # 重名条目加序号后缀；stem 也需唯一（引擎按 stem 建输出目录，撞名会互相覆盖）
+                    stem, suffix = os.path.splitext(base_name)
+                    safe_name = base_name
+                    seq = 2
+                    while safe_name in used_names or os.path.splitext(safe_name)[0] in used_stems:
+                        safe_name = f"{stem}_{seq}{suffix}"
+                        seq += 1
+                    used_names.add(safe_name)
+                    used_stems.add(os.path.splitext(safe_name)[0])
+
+                    target_path = extract_dir / safe_name
+                    target_path.write_bytes(zf.read(info))
+                    entries.append((base_name, target_path))
+
+            # 全部条目都被跳过（无可解析文件）→ 走正常路由报不支持
+            if not entries:
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                logger.warning(f"⚠️  No parseable files in zip: {file_path}")
+                return False
+
+            self.task_db.convert_to_parent_task(task_id, child_count=0)
+
+            children = []
+            for i, (entry_name, extracted_path) in enumerate(entries, start=1):
+                c_ops = options.copy()
+                c_ops["chunk_info"] = {"index": i, "entry_name": entry_name}
+                children.append(
+                    {
+                        "file_name": entry_name,
+                        "file_path": str(extracted_path),
+                        "options": c_ops,
+                    }
+                )
+
+            # 与 PDF 拆分同理：条目多时逐个 INSERT 会产生同样多的写事务并反复更新父行
+            self.task_db.create_child_tasks_bulk(
+                parent_task_id=task_id,
+                children=children,
+                backend=task.get("backend", "auto"),
+                priority=task.get("priority", 0),
+                user_id=task.get("user_id"),
+            )
+
+            self.task_db.convert_to_parent_task(task_id, child_count=len(entries))
+            logger.info(f"📦 Extracted zip into {len(entries)} subtasks")
+            return True
+        except Exception as e:
+            logger.error(f"❌ ZIP split failed: {e}")
+            return False
+
+    def _finalize_parent_task(self, parent_task_id: str) -> None:
+        """合并子任务结果并收尾父任务；合并失败时父任务置为 failed 并通知"""
+        try:
+            self._merge_parent_task_results(parent_task_id)
+        except Exception as e:
+            logger.error(f"❌ Failed to merge parent task {parent_task_id}: {e}")
+            self.task_db.update_task_status(parent_task_id, "failed", error_message=str(e))
+            self._enqueue_webhook(parent_task_id, "task.failed")
 
     def _merge_parent_task_results(self, parent_task_id):
         parent_task = self.task_db.get_task_with_children(parent_task_id)
-        if parent_task and parent_task["status"] != "processing":
-            return
-        if not parent_task:
-            raise ValueError(f"Parent task {parent_task_id} not found")
         children = parent_task.get("children", [])
         if not children:
             return
 
-        # 完整性闸门：必须所有子任务都已 completed 才能合并。
-        # 万一计数错乱/竞态导致提前触发合并，这里直接跳过——绝不在子任务尚未全部完成时
-        # 合并并删除分片文件，避免"假完成 / 结果残缺 + 残留子任务 FileNotFoundError"。
-        # 待剩余子任务完成后，on_child_task_completed 会再次触发合并。
-        incomplete = [c for c in children if c["status"] != "completed"]
-        if incomplete:
-            logger.warning(
-                f"⏸️  Parent task {parent_task_id} merge skipped: "
-                f"{len(incomplete)}/{len(children)} child task(s) not completed yet; "
-                f"will merge when the remaining children finish."
-            )
-            return
+        # PDF 分片按 start_page 排序，zip 解包子任务按解包序号 index 排序
+        def _chunk_sort_key(child):
+            chunk_info = json.loads(child.get("options", "{}")).get("chunk_info", {})
+            return chunk_info.get("start_page") or chunk_info.get("index") or 0
 
-        if Path(parent_task["file_path"]).suffix.lower() == ".zip":
-            from utils.archive_utils import merge_archive_results
-
-            parent_out = Path(self.output_dir) / Path(parent_task["file_path"]).stem
-            merge_archive_results(children, parent_out)
-            shutil.rmtree(parent_out / "_archive_inputs", ignore_errors=True)
-            options = json.loads(parent_task.get("options") or "{}")
-            normalize_output(parent_out, use_rustfs=options.get("use_rustfs"), enable_caption=False)
-            self._complete_parent_merge(parent_task_id, parent_out, children)
-            return
-
-        children.sort(key=lambda x: json.loads(x.get("options", "{}")).get("chunk_info", {}).get("start_page", 0))
+        children.sort(key=_chunk_sort_key)
 
         parent_out = Path(self.output_dir) / Path(parent_task["file_path"]).stem
         parent_out.mkdir(parents=True, exist_ok=True)
 
+        parent_options = json.loads(parent_task.get("options") or "{}")
+        storage_choice = parent_options.get("use_rustfs")
+        keep_local_images = not (
+            storage_choice
+            if storage_choice is not None
+            else os.getenv("RUSTFS_ENABLED", "true").lower() in ("true", "1", "yes")
+        )
         md_parts, json_pages = [], []
 
-        for child_idx, child in enumerate(children):
+        for child in children:
             if child["status"] != "completed":
                 continue
             res_dir = Path(child["result_path"])
+            chunk_info = json.loads(child.get("options", "{}")).get("chunk_info", {})
 
-            md_candidates = list(res_dir.rglob("*.md"))
-            md_file = next((f for f in md_candidates if f.name == "result.md"), None) or (
-                md_candidates[0] if md_candidates else None
+            md_file = next((f for f in res_dir.rglob("*.md") if f.name == "result.md"), None) or next(
+                iter(res_dir.rglob("*.md")), None
             )
-            if md_file is None:
-                logger.warning(f"⚠️ 子任务输出目录无 .md 文件，合并时跳过该分片: {res_dir}")
+            if not md_file:
                 continue
             md_text = md_file.read_text(encoding="utf-8")
-
-            # 搬运子任务的本地图片到父输出目录。
-            # use_rustfs=false 时子任务 result.md 用相对引用 images/xxx.jpg，
-            # 仅拼接 md 而不搬运图片，合并后的父文档图片会全部失效，交接接口也枚举不到。
-            # 跨分片可能出现同名图片：内容相同则跳过；内容不同则改唯一名并改写本片引用。
             image_replacements = {}
-            child_images = res_dir / "images"
-            if child_images.is_dir():
-                parent_images = parent_out / "images"
-                parent_images.mkdir(parents=True, exist_ok=True)
-                for img in sorted(child_images.iterdir()):
-                    if not img.is_file():
-                        continue
-                    dest = parent_images / img.name
-                    if dest.exists() and not filecmp.cmp(dest, img, shallow=False):
-                        uniq = f"{img.stem}_c{child_idx}{img.suffix}"
-                        dest = parent_images / uniq
-                        from utils.image_references import replace_image_references
+            if keep_local_images:
+                from utils.image_references import replace_image_references
 
-                        image_replacements[img.name] = f"images/{uniq}"
-                        md_text = replace_image_references(md_text, image_replacements)
-                    if dest.exists():
-                        continue
-                    try:
-                        shutil.copy2(img, dest)
-                    except Exception as e:
-                        logger.warning(f"⚠️  复制子任务图片失败 {img.name}: {e}")
-
+                child_images = res_dir / "images"
+                if child_images.is_dir() and not child_images.is_symlink():
+                    parent_images = parent_out / "images"
+                    parent_images.mkdir(exist_ok=True)
+                    for img in child_images.iterdir():
+                        if not img.is_file() or img.is_symlink():
+                            continue
+                        name = f"{child['task_id']}_{img.name}"
+                        copy_file(img, parent_images / name)
+                        image_replacements[img.name] = f"images/{name}"
+                    md_text = replace_image_references(md_text, image_replacements)
+            # zip 解包子任务按条目名加章节头；PDF 分片是连续文本，保持原样
+            entry_name = chunk_info.get("entry_name")
+            if entry_name:
+                md_text = f"## {entry_name}\n\n{md_text}"
             md_parts.append(md_text)
 
             json_file = next((f for f in res_dir.rglob("*.json") if "result" in f.name or "content" in f.name), None)
@@ -1317,7 +1339,9 @@ class MinerUWorkerAPI(ls.LitAPI):
                     data = replace_json_image_references(
                         json.loads(json_file.read_text(encoding="utf-8")), image_replacements
                     )
-                    offset = json.loads(child.get("options", "{}")).get("chunk_info", {}).get("start_page", 1) - 1
+                    # 仅 PDF 分片需要页码偏移；zip 子任务（MarkItDown 等）通常没有版面 json
+                    start_page = chunk_info.get("start_page")
+                    offset = (start_page - 1) if start_page else 0
 
                     # 兼容不同的 JSON 格式
                     pages = []
@@ -1340,36 +1364,27 @@ class MinerUWorkerAPI(ls.LitAPI):
                 json.dumps(json_pages, indent=2, ensure_ascii=False), encoding="utf-8"
             )
 
-        # [修复] 复制父任务的源文件到输出
+        # [修复] 复制父任务的源文件到输出（zip 父任务源文件非 PDF 且无 layout pdf，返回 None，无碍）
         self._ensure_pdf_in_output(parent_task["file_path"], parent_out)
 
-        # 子任务由父任务拆分而来，RustFS 开关沿用父任务的任务级设置
-        try:
-            parent_options = json.loads(parent_task.get("options") or "{}")
-        except (TypeError, ValueError):
-            parent_options = parent_task.get("options") or {}
-        normalize_output(parent_out, use_rustfs=parent_options.get("use_rustfs"), enable_caption=False)
-        self._complete_parent_merge(parent_task_id, parent_out, children)
-
-    def _complete_parent_merge(self, parent_task_id, parent_out, children):
-        if not self.task_db.update_task_status(parent_task_id, "completed", result_path=str(parent_out)):
-            return
+        normalize_output(parent_out, use_rustfs=parent_options.get("use_rustfs"))
+        self.task_db.update_task_status(parent_task_id, "completed", result_path=str(parent_out))
+        self._enqueue_webhook(parent_task_id, "task.completed")
         self._cleanup_child_task_files(children)
-        # A merged PDF can itself be a ZIP member. Advance that parent only after PDF merge succeeds.
-        ancestor = self.task_db.on_child_task_completed(parent_task_id)
-        if ancestor:
-            try:
-                self._merge_parent_task_results(ancestor)
-            except Exception as exc:
-                if self.task_db.update_task_status(ancestor, "failed", error_message=str(exc)):
-                    self.task_db.on_child_task_failed(ancestor, str(exc))
-                raise
 
     def _cleanup_child_task_files(self, children):
         for child in children:
             try:
                 if child.get("file_path"):
                     Path(child["file_path"]).unlink(missing_ok=True)
+            except Exception:
+                pass
+        # 清理拆分遗留的空目录（PDF 分片与 zip 解压文件都在 splits/{task_id}/ 下）
+        split_dirs = {Path(c["file_path"]).parent for c in children if c.get("file_path")}
+        for d in split_dirs:
+            try:
+                if d.is_dir() and not any(d.iterdir()):
+                    d.rmdir()
             except Exception:
                 pass
 
@@ -1383,7 +1398,7 @@ class MinerUWorkerAPI(ls.LitAPI):
         elif action == "poll":
             if self.enable_worker_loop:
                 return {"status": "skipped", "message": "Auto-loop active"}
-            task = self.task_db.get_next_task(worker_id=self.worker_id)
+            task = self.task_db.pull_task()
             if task:
                 try:
                     self._process_task(task)
@@ -1410,8 +1425,6 @@ def start_litserve_workers(
     port=8001,
     poll_interval=0.5,
     enable_worker_loop=True,
-    paddleocr_vl_vllm_engine_enabled=False,
-    paddleocr_vl_vllm_api_list=[],
     mineru_vllm_api_list=[],
 ):
     def resolve_auto_accelerator():
@@ -1421,10 +1434,12 @@ def start_litserve_workers(
             distribution("torch")
             if check_cuda_with_nvidia_smi() > 0:
                 return "cuda"
+            # Apple Silicon: 使用 MPS 加速（LitServe 原生支持 mps）
             import platform
+
             import torch
 
-            if platform.machine() in ("arm64", "arm") and torch.backends.mps.is_available():
+            if torch.backends.mps.is_available() and platform.machine() in ("arm64", "arm"):
                 return "mps"
         except Exception:
             pass
@@ -1442,8 +1457,6 @@ def start_litserve_workers(
         output_dir=output_dir,
         poll_interval=poll_interval,
         enable_worker_loop=enable_worker_loop,
-        paddleocr_vl_vllm_engine_enabled=paddleocr_vl_vllm_engine_enabled,
-        paddleocr_vl_vllm_api_list=paddleocr_vl_vllm_api_list,
         mineru_vllm_api_list=mineru_vllm_api_list,
     )
 
@@ -1454,6 +1467,11 @@ def start_litserve_workers(
         workers_per_device=workers_per_device,
         timeout=False,
     )
+
+    # 子进程在 server.run() 里才 spawn，此时写入的环境变量会被继承，用于均分 CPU 线程
+    total_workers = len(getattr(server, "inference_workers_config", None) or []) or workers_per_device
+    os.environ[TOTAL_WORKERS_ENV] = str(total_workers)
+    logger.info(f"🧵 Total inference workers: {total_workers}")
 
     def graceful_shutdown(signum=None, frame=None):
         if hasattr(api, "teardown"):
@@ -1478,8 +1496,6 @@ if __name__ == "__main__":
     parser.add_argument("--devices", type=str, default="auto")
     parser.add_argument("--poll-interval", type=float, default=0.5)
     parser.add_argument("--disable-worker-loop", action="store_true")
-    parser.add_argument("--paddleocr-vl-vllm-engine-enabled", action="store_true")
-    parser.add_argument("--paddleocr-vl-vllm-api-list", type=parse_list_arg, default=[])
     parser.add_argument("--mineru-vllm-api-list", type=parse_list_arg, default=[])
     args = parser.parse_args()
 
@@ -1509,7 +1525,5 @@ if __name__ == "__main__":
         port=port,
         poll_interval=args.poll_interval,
         enable_worker_loop=not args.disable_worker_loop,
-        paddleocr_vl_vllm_engine_enabled=args.paddleocr_vl_vllm_engine_enabled,
-        paddleocr_vl_vllm_api_list=args.paddleocr_vl_vllm_api_list,
         mineru_vllm_api_list=args.mineru_vllm_api_list,
     )

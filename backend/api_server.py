@@ -10,60 +10,51 @@ MinerU Tianshu - API Server
 
 import json
 import os
-import re
 import uuid
-import shutil  # ✅ 用于删除非空目录
-import mimetypes  # ✅ 用于自动识别文件类型
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Literal
-from urllib.parse import quote, unquote, parse_qsl, urlencode
+from typing import Optional
+from urllib.parse import quote, unquote
 
 import anyio
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Depends, APIRouter
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException, Query, Depends, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from loguru import logger
 from starlette.types import ASGIApp, Receive, Scope, Send  # ✅ 用于底层中间件
 
-from auth.dependencies import get_current_user_flexible
-from utils.file_utils import sanitize_filename, ensure_within_directory, FilenameValidationError
-
 # 导入认证模块
 from auth import (
     User,
+    UserRole,
     Permission,
     get_current_active_user,
     require_permission,
+    require_role,
 )
 from auth.auth_db import AuthDB
+from auth.dependencies import get_current_user_flexible
 from auth.routes import router as auth_router
+from auth.audit import record_audit, query_audit_logs
 from task_db import TaskDB
-
-# ✅ [优化] 预注册 MIME 类型，防止精简环境识别失败导致浏览器强制下载
-mimetypes.add_type("application/pdf", ".pdf")
-mimetypes.add_type("image/png", ".png")
-mimetypes.add_type("image/jpeg", ".jpg")
-mimetypes.add_type("image/jpeg", ".jpeg")
-mimetypes.add_type("text/markdown", ".md")
-mimetypes.add_type("application/json", ".json")
+from utils import (
+    FilenameValidationError,
+    encrypted_document_message,
+    ensure_within_directory,
+    sanitize_filename,
+    sniff_office_file,
+)
 
 # 初始化 FastAPI 应用
 app = FastAPI(
     title="MinerU Tianshu API",
     description="天枢 - 企业级 AI 数据预处理平台 | 支持文档、图片、音频、视频等多模态数据处理 | 企业级认证授权",
     version="2.0.0",
+    # OpenAPI 挂到 /api/v1 下，与 nginx 对 /api/ 的原样转发匹配（前端 Scalar 文档页消费）
     openapi_url="/api/v1/openapi.json",
     # 不设置 servers，让 FastAPI 自动根据请求的 Host 生成
 )
-
-
-@app.get("/openapi.json", include_in_schema=False)
-@app.get("/api/openapi.json", include_in_schema=False)
-def legacy_openapi():
-    """保留直连与旧版前端文档地址。"""
-    return app.openapi()
 
 
 # ============================================================================
@@ -85,26 +76,38 @@ class NginxPathRewriteMiddleware:
                 # 某些底层组件匹配强依赖 raw_path，也一并修改
                 if "raw_path" in scope:
                     scope["raw_path"] = b"/api" + scope["raw_path"]
-            # Keep preview JWTs out of backend access logs; pass only through internal state.
-            if scope.get("path", "").startswith("/api/v1/files/"):
-                query = parse_qsl(scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True)
-                tokens = [value for key, value in query if key == "token"]
-                if tokens:
-                    scope.setdefault("state", {})["file_token"] = tokens[-1]
-                    scope["query_string"] = urlencode([(key, value) for key, value in query if key != "token"]).encode()
         await self.app(scope, receive, send)
 
 
 # 必须最先添加此中间件！
 app.add_middleware(NginxPathRewriteMiddleware)
 
-# 添加 CORS 中间件
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """兜底异常处理：对外隐藏内部细节，完整堆栈仅记录日志"""
+    logger.exception(f"❌ Unhandled exception on {request.url.path}: {exc}")
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
+def _parse_allowed_origins() -> list:
+    """解析允许跨域的来源列表；未配置或含通配符时回退本地开发默认值（避免裸奔）"""
+    default_origins = ["http://localhost:3000", "http://localhost:5173"]
+    raw = os.getenv("ALLOWED_ORIGINS", ",".join(default_origins))
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    if not origins or "*" in origins:
+        logger.warning("⚠️  ALLOWED_ORIGINS 未配置或包含通配符 '*'，CORS 回退到本地开发默认来源")
+        return default_origins
+    return origins
+
+
+# 添加 CORS 中间件（不允许携带凭据，来源白名单化）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip() and o.strip() != "*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_parse_allowed_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # 获取项目根目录（backend 的父目录）
@@ -130,36 +133,6 @@ auth_db = AuthDB()
 
 # 注册认证路由
 app.include_router(auth_router)
-from feature_routes import router as feature_router
-
-app.include_router(feature_router)
-
-
-@app.middleware("http")
-async def audit_mutations(request, call_next):
-    response = await call_next(request)
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-        from auth.audit import record_audit
-
-        path = request.url.path
-        task_match = re.search(r"/tasks/([^/]+)", path)
-        resource = task_match.group(1) if task_match else None
-        action = re.sub(r"/tasks/[^/]+", "/tasks/{task_id}", path) if task_match else path
-        record_audit(
-            action,
-            user=getattr(request.state, "audit_user", None),
-            request=request,
-            resource_type="task" if task_match else "system",
-            resource_id=resource,
-            detail={
-                "method": request.method,
-                "status_code": response.status_code,
-                **getattr(request.state, "audit_detail", {}),
-            },
-            result="success" if response.status_code < 400 else "failure",
-        )
-    return response
-
 
 # ==============================================================================
 # 目录配置 (Output & Upload)
@@ -187,36 +160,46 @@ else:
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 logger.info(f"📁 Upload directory: {UPLOAD_DIR}")
 
+# 文件响应 MIME 白名单：仅 PDF 与常见图片允许内联预览，其余一律强制下载，
+# 防止用户上传的 HTML/SVG 等被浏览器内联解析造成存储型 XSS
+INLINE_MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+def _build_file_response(full_path: Path) -> FileResponse:
+    """构造安全的文件下载/预览响应（MIME 白名单 + 安全响应头）"""
+    media_type = INLINE_MIME_TYPES.get(full_path.suffix.lower())
+    disposition = "inline" if media_type else "attachment"
+    headers = {
+        "Content-Disposition": f"{disposition}; filename*=utf-8''{quote(full_path.name)}",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+    }
+    return FileResponse(path=str(full_path), media_type=media_type or "application/octet-stream", headers=headers)
+
 
 # 注意：此函数已废弃，Worker 已自动上传图片到 RustFS 并替换 URL
 def process_markdown_images_legacy(md_content: str, image_dir: Path, result_path: str):
-    """Resolve local image references without altering remote URLs or escaped alt text."""
     from utils.image_references import replace_image_references
 
-    if not image_dir.is_dir():
-        return md_content
     try:
         relative = Path(result_path).resolve().relative_to(OUTPUT_DIR.resolve())
-        mapping = {
-            file.name: "/api/v1/files/output/" + quote((relative / "images" / file.name).as_posix(), safe="/")
-            for file in image_dir.iterdir()
-            if file.is_file()
-        }
-        return replace_image_references(md_content, mapping)
-    except (OSError, ValueError):
+    except ValueError:
         return md_content
-
-
-@app.get("/", tags=["系统信息"])
-async def root():
-    """API根路径"""
-    return {
-        "service": "MinerU Tianshu",
-        "version": "2.0.0",
-        "description": "天枢 - 企业级 AI 数据预处理平台",
-        "features": "文档、图片、音频、视频等多模态数据处理",
-        "docs": "/docs",
+    if not image_dir.is_dir():
+        return md_content
+    mapping = {
+        file.name: "/api/v1/files/output/" + quote((relative / "images" / file.name).as_posix(), safe="/")
+        for file in image_dir.iterdir()
+        if file.is_file() and not file.is_symlink()
     }
+    return replace_image_references(md_content, mapping)
 
 
 # ============================================================================
@@ -230,7 +213,7 @@ async def submit_task(
     file: UploadFile = File(..., description="文件: PDF/图片/Office/HTML/音频/视频等多种格式"),
     backend: str = Form(
         "auto",
-        description="处理后端: pipeline, hybrid-auto-engine, vlm-auto-engine, hybrid-http-client, vlm-http-client, paddleocr-vl, etc.",
+        description="处理后端: pipeline, hybrid-auto-engine, vlm-auto-engine, hybrid-http-client, vlm-http-client, sensevoice, video, etc.",
     ),
     lang: str = Form("auto", description="语言: ch/en/auto..."),
     method: str = Form("auto", description="解析方法: auto/txt/ocr"),
@@ -252,87 +235,75 @@ async def submit_task(
     draw_span: bool = Form(True, description="[兼容旧版] 是否绘制文本Span边框"),
     keep_audio: bool = Form(False, description="视频处理时是否保留提取的音频文件"),
     enable_keyframe_ocr: bool = Form(False, description="是否启用视频关键帧OCR识别（实验性功能）"),
-    ocr_backend: str = Form("paddleocr-vl", description="关键帧OCR引擎: paddleocr-vl"),
+    ocr_backend: str = Form("mineru", description="关键帧OCR引擎: mineru"),
     keep_keyframes: bool = Form(False, description="是否保留提取的关键帧图像"),
     enable_speaker_diarization: bool = Form(False, description="是否启用说话人分离"),
     remove_watermark: bool = Form(False, description="是否启用水印去除"),
     watermark_conf_threshold: float = Form(0.35, description="水印检测置信度阈值"),
     watermark_dilation: int = Form(10, description="水印掩码膨胀大小"),
-    office_parser: Literal["compatible", "mineru"] = Form(
-        "compatible", description="Office parser; compatible preserves existing custom processing"
-    ),
-    convert_office_to_pdf: bool = Form(False, description="是否将 Office 文件转换为 PDF 后再处理"),
-    useDocOrientationClassify: bool = Form(False, description="文档方向分类"),
-    useDocUnwarping: bool = Form(False, description="文档去弯曲"),
-    useLayoutDetection: bool = Form(True, description="是否启用版面分析"),
-    useChartRecognition: bool = Form(False, description="是否启用图表识别"),
-    useSealRecognition: bool = Form(True, description="是否启用印章识别"),
-    useOcrForImageBlock: bool = Form(False, description="是否对图像块进行OCR"),
-    mergeTables: bool = Form(True, description="是否合并表格"),
-    relevelTitles: bool = Form(True, description="是否重构标题层级"),
-    layoutShapeMode: str = Form("auto", description="版面形状模式"),
-    promptLabel: str = Form("ocr", description="提示词标签"),
-    repetitionPenalty: float = Form(1.0, description="重复惩罚"),
-    temperature: float = Form(0.0, description="温度"),
-    topP: float = Form(1.0, description="Top P"),
-    minPixels: int = Form(147384, description="最小像素"),
-    maxPixels: int = Form(2822400, description="最大像素"),
-    layoutNms: bool = Form(True, description="是否启用版面 NMS"),
-    restructurePages: bool = Form(True, description="是否重构页面"),
-    markdownIgnoreLabels: str = Form(
-        "header,header_image,footer,footer_image,number,footnote,aside_text", description="忽略的标签 (逗号分隔)"
-    ),
+    webhook_url: Optional[str] = Form(None, description="任务级 Webhook 回调地址（任务终态时推送通知）"),
     use_rustfs: Optional[bool] = Form(
-        None,
-        description="是否上传图片到 RustFS 对象存储（任务级开关）。"
-        "不传=由 RUSTFS_ENABLED 环境变量决定（向后兼容）；true=强制上传；"
-        "false=保留图片在本地，通过 /files/output 下载",
+        None, description="图片存储：不传跟随环境配置，true 上传 RustFS，false 保留本地图片供交接"
     ),
-    webhook_url: Optional[str] = Form(
-        None, max_length=2048, description="可选任务回调地址；私网目标需管理员配置 host:port 白名单"
-    ),
+    password: Optional[str] = Form(None, description="加密文档打开密码（PDF / Office / ZIP，可选，仅存任务 options）"),
     current_user: User = Depends(require_permission(Permission.TASK_SUBMIT)),
 ):
-    from webhooks import subscription
+    # 校验并净化文件名（路径穿越或不支持的类型直接 400）
+    try:
+        safe_name = sanitize_filename(file.filename or "")
+    except FilenameValidationError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid file name: {e}")
+
+    # 任务级 webhook 地址先做 SSRF 校验，不合法直接拒绝提交
+    webhook_url = (webhook_url or "").strip()
+    if webhook_url:
+        from webhook.delivery import validate_webhook_url
+
+        try:
+            validate_webhook_url(webhook_url)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid webhook_url: {e}")
 
     try:
-        webhook_config = await anyio.to_thread.run_sync(
-            lambda: subscription(webhook_url, db.db_path, getattr(current_user, "api_key_id", None))
-        )
-    except (ValueError, OSError):
-        raise HTTPException(status_code=400, detail="Invalid webhook endpoint or host not allowed")
-    try:
-        safe_filename = sanitize_filename(file.filename)
-        from runtime_modes import validate_pipeline_task
-
-        validate_pipeline_task(safe_filename, backend)
-    except (FilenameValidationError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    try:
-        unique_filename = f"{uuid.uuid4().hex}_{safe_filename}"
+        # 落盘文件名完全由服务端生成（UUID + 白名单扩展名），不使用任何用户输入
+        unique_filename = f"{uuid.uuid4().hex}{Path(safe_name).suffix}"
         temp_file_path = ensure_within_directory(UPLOAD_DIR / unique_filename, UPLOAD_DIR)
-        uploaded_bytes = 0
-        max_bytes = int(os.getenv("MAX_FILE_SIZE", "0"))
 
+        # 异步写盘：同步的 temp_file.write() 会在写入期间冻结事件循环，uvicorn 期间
+        # 不读取任何 socket —— 包括其它正在上传的连接。块大小从 8MB 降到 1MB，让出更均匀。
+        written = 0
         async with await anyio.open_file(temp_file_path, "wb") as temp_file:
             while True:
                 chunk = await file.read(1 << 20)
                 if not chunk:
                     break
-                if uploaded_bytes == 0 and os.getenv("UPLOAD_VALIDATE_CONTENT", "false").lower() == "true":
-                    from utils.upload_validation import validate_signature
-
-                    try:
-                        validate_signature(safe_filename, chunk)
-                    except ValueError as exc:
-                        raise HTTPException(status_code=400, detail=str(exc))
-                uploaded_bytes += len(chunk)
-                if max_bytes > 0 and uploaded_bytes > max_bytes:
-                    raise HTTPException(status_code=413, detail="File too large")
+                written += len(chunk)
                 await temp_file.write(chunk)
 
-        if uploaded_bytes == 0 and os.getenv("UPLOAD_VALIDATE_CONTENT", "false").lower() == "true":
-            raise HTTPException(status_code=400, detail="Empty file")
+        # 空文件直接拒绝：放进队列只会占用 Worker，几十秒后抛一个用户看不懂的
+        # 解析器内部异常（如 PdfiumError: Data format error），用户往往反复重试。
+        if written == 0:
+            temp_file_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=400,
+                detail=f"文件内容为空（0 字节）: {safe_name}。如果源文件在网盘/云盘上，请先下载到本地再上传。",
+            )
+
+        # 加密的 Office 文件：带了密码则放行入队（worker 前置解密，失败在任务层面报错，
+        # 便于补密码重试）；无密码维持当场拒绝。改了扩展名的旧版格式 / HTML 照常入队，
+        # 由 worker 按真实格式解析
+        try:
+            sniffed = sniff_office_file(temp_file_path)
+        except OSError as e:
+            logger.warning(f"⚠️ Office format sniffing failed for {safe_name}: {e}")
+            sniffed = None
+        if sniffed is not None and sniffed.kind == "encrypted":
+            if not password:
+                temp_file_path.unlink(missing_ok=True)
+                logger.info(f"🔒 Rejected encrypted Office upload ({sniffed.detail}): {safe_name}")
+                raise HTTPException(400, detail=encrypted_document_message(sniffed.detail, safe_name))
+            logger.info(f"🔐 Encrypted Office upload accepted with password: {safe_name}")
+
         options = {
             "lang": lang,
             "method": method,
@@ -359,32 +330,19 @@ async def submit_task(
             "remove_watermark": remove_watermark,
             "watermark_conf_threshold": watermark_conf_threshold,
             "watermark_dilation": watermark_dilation,
-            "convert_office_to_pdf": convert_office_to_pdf,
-            "office_parser": office_parser,
-            "useDocOrientationClassify": useDocOrientationClassify,
-            "useDocUnwarping": useDocUnwarping,
-            "useLayoutDetection": useLayoutDetection,
-            "useChartRecognition": useChartRecognition,
-            "useSealRecognition": useSealRecognition,
-            "useOcrForImageBlock": useOcrForImageBlock,
-            "mergeTables": mergeTables,
-            "relevelTitles": relevelTitles,
-            "layoutShapeMode": layoutShapeMode,
-            "promptLabel": promptLabel,
-            "repetitionPenalty": repetitionPenalty,
-            "temperature": temperature,
-            "topP": topP,
-            "minPixels": minPixels,
-            "maxPixels": maxPixels,
-            "layoutNms": layoutNms,
-            "restructurePages": restructurePages,
-            "markdownIgnoreLabels": [label.strip() for label in markdownIgnoreLabels.split(",") if label.strip()],
         }
 
-        options["upload_images"] = os.getenv("RUSTFS_ENABLED", "true").lower() == "true"
-        # 任务级 RustFS 开关：None=按 RUSTFS_ENABLED 环境变量；True/False=按任务强制
-        options["use_rustfs"] = use_rustfs
+        if webhook_url:
+            options["webhook_url"] = webhook_url
 
+        if password:
+            options["password"] = password
+
+        options["use_rustfs"] = use_rustfs
+        options["upload_images"] = os.getenv("RUSTFS_ENABLED", "true").lower() == "true"
+
+        # 本端点必须保持 async（要 await file.read()），因此把同步的 SQLite 写入
+        # 显式丢到线程池，避免拿不到写锁时冻结整个事件循环。
         task_id = await anyio.to_thread.run_sync(
             lambda: db.create_task(
                 file_name=file.filename,
@@ -393,8 +351,7 @@ async def submit_task(
                 options=options,
                 priority=priority,
                 user_id=current_user.user_id,
-                webhook_config=webhook_config,
-                api_key_id=getattr(current_user, "api_key_id", None),
+                api_key_id=current_user.api_key_id,
             )
         )
 
@@ -409,18 +366,11 @@ async def submit_task(
             "created_at": datetime.now().isoformat(),
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ Failed to submit task: {e}")
-        # 清理已落盘但未入库的上传文件，避免产生无 DB 记录、定时清理也扫不到的孤儿文件
-        temp_path = locals().get("temp_file_path")
-        if temp_path is not None:
-            try:
-                await anyio.to_thread.run_sync(lambda: Path(temp_path).unlink(missing_ok=True))
-            except Exception:
-                pass
-        if isinstance(e, HTTPException):
-            raise
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail="Failed to submit task")
 
 
 @router.get("/tasks/{task_id}", tags=["任务管理"])
@@ -436,7 +386,7 @@ def get_task_status(
         raise HTTPException(status_code=404, detail="Task not found")
 
     if not current_user.has_permission(Permission.TASK_VIEW_ALL):
-        if task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_VIEW_OWN):
+        if task.get("user_id") != current_user.user_id:
             raise HTTPException(status_code=403, detail="Permission denied: You can only view your own tasks")
 
     source_url = None
@@ -483,7 +433,6 @@ def get_task_status(
                 {
                     "task_id": child["task_id"],
                     "status": child["status"],
-                    "file_name": child["file_name"],
                     "chunk_info": json.loads(child.get("options", "{}")).get("chunk_info"),
                     "error_message": child.get("error_message"),
                 }
@@ -504,8 +453,7 @@ def get_task_status(
             json_files = [
                 f
                 for f in result_dir.rglob("*.json")
-                if not f.parent.name.startswith("page_")
-                and (f.name in ["content.json", "result.json"] or "_content_list.json" in f.name)
+                if f.name in ["content.json", "result.json"] or "_content_list.json" in f.name
             ]
 
             if md_files or json_files:
@@ -524,11 +472,8 @@ def get_task_status(
                             if "_span.pdf" in pdf.name:
                                 preview_pdf = pdf
                                 break
-                    if not preview_pdf:
-                        for pdf in pdf_files:
-                            if not pdf.name.startswith("page_"):
-                                preview_pdf = pdf
-                                break
+                    if not preview_pdf and pdf_files:
+                        preview_pdf = pdf_files[0]
 
                     if preview_pdf:
                         try:
@@ -554,7 +499,7 @@ def get_task_status(
                     if format in ["json", "both"] and json_files:
                         import json as json_lib
 
-                        json_file = next((f for f in json_files if f.name == "result.json"), json_files[0])
+                        json_file = json_files[0]
                         try:
                             with open(json_file, "r", encoding="utf-8") as f:
                                 json_content = json_lib.load(f)
@@ -575,6 +520,11 @@ def get_task_status(
             logger.error(f"❌ Result directory does not exist: {result_dir}")
 
     return response
+
+
+# ========================================================================
+# 🚨 终极修复：物理清理任务接口（解决清理失败、任务依然存在问题）
+# ========================================================================
 
 
 @router.get("/tasks/{task_id}/images", tags=["任务管理"])
@@ -619,8 +569,13 @@ def get_task_images(
             "message": "Result files have been cleaned up",
         }
 
-    result_dir = Path(task["result_path"])
+    try:
+        result_dir = ensure_within_directory(Path(task["result_path"]), OUTPUT_DIR)
+    except ValueError:
+        raise HTTPException(404, "Result directory unavailable")
     image_dir = result_dir / "images"
+    if image_dir.is_symlink():
+        raise HTTPException(404, "Image directory unavailable")
 
     if not image_dir.exists():
         return {
@@ -653,14 +608,14 @@ def get_task_images(
     images = []
 
     for img_file in sorted(image_dir.iterdir()):
-        if not img_file.is_file() or img_file.suffix.lower() not in image_extensions:
+        if not img_file.is_file() or img_file.is_symlink() or img_file.suffix.lower() not in image_extensions:
             continue
         # 如果解析到了 MD 引用，只返回被引用的图片
         if referenced_filenames and img_file.name not in referenced_filenames:
             continue
         try:
-            relative_path = img_file.relative_to(OUTPUT_DIR)
-            download_url = f"/api/v1/files/output/{relative_path.as_posix()}"
+            relative_path = img_file.resolve().relative_to(OUTPUT_DIR.resolve())
+            download_url = f"/api/v1/files/output/{quote(relative_path.as_posix(), safe='/')}"
         except ValueError:
             logger.warning(f"⚠️  Image file outside OUTPUT_DIR, skipping: {img_file}")
             continue
@@ -684,93 +639,8 @@ def get_task_images(
     }
 
 
-# ========================================================================
-# 🚨 终极修复：物理清理任务接口（解决清理失败、任务依然存在问题）
-# ========================================================================
-
-
-def _remove_task_output(task):
-    """
-    删除任务的输出目录。worker 的输出目录按【处理时的文件名 stem】命名（Path(file_path).stem），
-    既不是 task_id。早期代码误用 OUTPUT_DIR/task_id 删除，导致输出从未被真正清理（磁盘泄漏）。
-
-    这里用两个候选都尝试删，以覆盖不同任务状态：
-      - result_path：已完成任务最权威（worker 写入的真实目录）
-      - OUTPUT_DIR/Path(file_path).stem：未完成/失败任务 result_path 为空时的兜底
-        （已知边界：去水印 / Office→PDF 等预处理会改 file_path，这类任务的部分输出
-         可能定位不到，属次要残留，由定时清理兜底）
-    """
-    targets = set()
-    rp = task.get("result_path")
-    if rp and rp != "CLEARED":
-        targets.add(Path(rp))
-
-    fp = task.get("file_path")
-    if fp:
-        stem = Path(fp).stem
-        # worker 输出目录按【处理时的文件名 stem】命名；去水印等预处理会派生
-        # <stem>_no_watermark/（输出目录）和 <stem>_no_watermark.pdf（中间文件）等。
-        # 所有衍生物都以 <stem> 为前缀，而 <stem> 带唯一 uuid 前缀（submit 时的
-        # f"{uuid}_{filename}"），故按前缀匹配既能一并清理、又不会误删其它任务。
-        try:
-            for entry in OUTPUT_DIR.iterdir():
-                if entry.name == stem or entry.name.startswith(f"{stem}_"):
-                    targets.add(entry)
-        except FileNotFoundError:
-            pass
-
-    for d in targets:
-        try:
-            resolved = d.resolve()
-            if resolved == OUTPUT_DIR.resolve() or not resolved.is_relative_to(OUTPUT_DIR.resolve()):
-                logger.warning("Skipping task output outside the output directory")
-                continue
-            if d.is_dir():
-                shutil.rmtree(d, ignore_errors=True)
-            elif d.exists():
-                d.unlink()  # 去水印中间文件等
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to remove {d}: {e}")
-
-
-def _purge_task_files(task, child_tasks):
-    """
-    删除任务(及其子任务)的全部磁盘产物：
-      - 本任务 + 各子任务的输出目录/衍生(含去水印 _no_watermark 等)
-      - PDF 拆分的分片临时目录 OUTPUT_DIR/splits/<父task_id>/
-      - 本任务 + 各子任务的上传/分片源文件
-    用于父任务(大 PDF 拆分)删除时级联清理,避免子任务输出/分片残留。
-    """
-    for t in [task] + (child_tasks or []):
-        _remove_task_output(t)
-
-    for item in [task] + (child_tasks or []):
-        tid = item.get("task_id")
-        if tid:
-            split_dir = OUTPUT_DIR / "splits" / tid
-            if split_dir.resolve().is_relative_to(OUTPUT_DIR.resolve()) and split_dir.exists():
-                shutil.rmtree(split_dir, ignore_errors=True)
-
-    for t in [task] + (child_tasks or []):
-        fp = t.get("file_path")
-        if fp:
-            p = Path(fp)
-            try:
-                resolved = p.resolve()
-                if (
-                    any(
-                        resolved != root.resolve() and resolved.is_relative_to(root.resolve())
-                        for root in (UPLOAD_DIR, OUTPUT_DIR)
-                    )
-                    and p.is_file()
-                ):
-                    p.unlink()
-            except Exception as e:
-                logger.warning(f"⚠️ Failed to delete source file {p}: {e}")
-
-
 @router.delete("/tasks/{task_id}", tags=["任务管理"])
-def delete_task(task_id: str, current_user: User = Depends(get_current_active_user)):
+def delete_task(task_id: str, request: Request, current_user: User = Depends(get_current_active_user)):
     """
     【重构】彻底删除任务及其本地文件
     不仅取消 pending 的任务，还会物理抹除文件和数据库记录。
@@ -782,44 +652,41 @@ def delete_task(task_id: str, current_user: User = Depends(get_current_active_us
 
     # 权限检查
     if not current_user.has_permission(Permission.TASK_DELETE_ALL):
-        if task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_DELETE_OWN):
+        if task.get("user_id") != current_user.user_id:
             raise HTTPException(status_code=403, detail="Permission denied: You can only delete your own tasks")
 
-    # 收集子任务（大 PDF 拆分会产生 parent_task_id 指向本任务的子任务）
-    children = db.get_descendant_tasks(task_id)
+    # 物理删除源文件与解析产物（带目录逃逸防护）并移除记录；父任务连同全部子任务一起删除
+    deleted = db.delete_task_tree(task)
 
-    # 1. 物理删除：本任务 + 所有子任务的输出/衍生、splits 分片临时目录、上传源文件
-    _purge_task_files(task, children)
-
-    # 2. 从数据库彻底移除记录（级联删子任务：task_id 自身 或 parent_task_id 指向它）
-    db.delete_task_tree(task_id)
-
-    logger.info(f"🗑️ Task completely deleted: {task_id} by user {current_user.username}")
+    logger.info(f"🗑️ Task completely deleted: {task_id} ({deleted} records) by user {current_user.username}")
+    record_audit(
+        "task.delete",
+        user=current_user,
+        request=request,
+        resource_type="task",
+        resource_id=task_id,
+        detail={"file_name": task.get("file_name")},
+    )
     return {"success": True, "message": "Task and files completely deleted."}
 
 
 @router.delete("/tasks/failed/clear", tags=["任务管理"])
-def clear_failed_tasks_endpoint(current_user: User = Depends(require_permission(Permission.TASK_DELETE_ALL))):
+def clear_failed_tasks_endpoint(
+    request: Request, current_user: User = Depends(require_permission(Permission.TASK_DELETE_ALL))
+):
     """
     【重构】一键清理所有失败的任务，包含物理清除文件
     """
-    # 1. 查所有 failed 任务（完整字段）
-    with db.get_cursor() as cursor:
-        cursor.execute("SELECT * FROM tasks WHERE status = 'failed'")
-        failed_tasks = [dict(row) for row in cursor.fetchall()]
+    deleted_count = db.clear_failed_tasks()
 
-    # 2. 逐个清理磁盘产物（含各自的子任务），放事务外避免 cursor 嵌套
-    for task in failed_tasks:
-        children = db.get_descendant_tasks(task["task_id"])
-        _purge_task_files(task, children)
-
-    # 3. 批量从数据库删除（父 + 子级联）
-    deleted_count = 0
-    for task in failed_tasks:
-        db.delete_task_tree(task["task_id"])
-        deleted_count += 1
-
-    logger.info(f"🧹 Cleared {deleted_count} failed tasks from DB and Disk.")
+    logger.info(f"🧹 Cleared {deleted_count} failed tasks from DB and Disk by {current_user.username}.")
+    record_audit(
+        "task.clear_failed",
+        user=current_user,
+        request=request,
+        resource_type="task",
+        detail={"deleted_count": deleted_count},
+    )
     return {
         "success": True,
         "deleted_count": deleted_count,
@@ -833,38 +700,103 @@ def clear_failed_tasks_endpoint(current_user: User = Depends(require_permission(
 
 
 @router.post("/tasks/{task_id}/retry", tags=["任务管理"])
-def retry_task(task_id: str, current_user: User = Depends(get_current_active_user)):
+def retry_task(
+    task_id: str,
+    password: Optional[str] = Form(None),
+    current_user: User = Depends(get_current_active_user),
+):
     """
     重试失败的任务
+
+    可选表单参数 password：仅对 failed 状态任务生效，用于修正加密文档的打开密码后重试
     """
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # 🚨 修复属性名称错误
     if not current_user.has_permission(Permission.TASK_DELETE_ALL):
-        if task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_DELETE_OWN):
+        if task.get("user_id") != current_user.user_id:
             raise HTTPException(status_code=403, detail="Permission denied")
 
-    # 清理在任务重新变为 pending 之前完成，防止 Worker 已开始新一轮处理后输出被删除。
-    if db.retry_task(task_id, cleanup=lambda: _remove_task_output(task)):
-        return {"success": True, "message": "Task submitted for retry"}
+    # 提供新密码时只允许 failed 任务更新（空串视为未提供，保持原密码不变）
+    if password:
+        if task.get("status") != "failed":
+            raise HTTPException(status_code=400, detail="Password can only be updated when retrying a failed task")
+        db.update_task_options_key(task_id, "password", password)
 
-    raise HTTPException(status_code=409, detail="Retry requires a failed root task with no active children")
+    # 先清理旧的解析产物（保留上传源文件供重试使用），再重新入队：
+    # 反过来的话，worker 可能刚拉到任务写出新产物，就被这里删掉
+    db.delete_task_files(task, include_source=False)
+    retried_children = []
+    if task.get("is_parent") and (task.get("child_count") or 0) > 0:
+        # 父任务重试 = 重跑失败 / 已取消的子任务，它们的旧产物同样先清掉
+        retried_children = db.get_children_to_retry(task_id)
+        for child in retried_children:
+            db.delete_task_files(child, include_source=False)
+
+    if db.retry_task(task_id):
+        message = "Task submitted for retry"
+        if retried_children:
+            message = f"Task submitted for retry ({len(retried_children)} subtasks requeued)"
+        return {"success": True, "message": message, "retried_subtasks": len(retried_children)}
+
+    raise HTTPException(status_code=404, detail="Task not found")
+
+
+@router.get("/tasks/{task_id}/children", tags=["任务管理"])
+def list_task_children(task_id: str, current_user: User = Depends(get_current_active_user)):
+    """父任务的子任务列表（任务列表页展开分组用），按分片页码 / 解包序号排序"""
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if not current_user.has_permission(Permission.TASK_VIEW_ALL):
+        if task.get("user_id") != current_user.user_id:
+            raise HTTPException(status_code=403, detail="Permission denied: You can only view your own tasks")
+
+    children = []
+    for child in db.get_child_tasks(task_id):
+        try:
+            chunk_info = json.loads(child.get("options") or "{}").get("chunk_info")
+        except (json.JSONDecodeError, TypeError):
+            chunk_info = None
+        children.append(
+            {
+                "task_id": child["task_id"],
+                "file_name": child["file_name"],
+                "status": child["status"],
+                "chunk_info": chunk_info,
+                "error_message": child.get("error_message"),
+                "created_at": child["created_at"],
+                "started_at": child.get("started_at"),
+                "completed_at": child.get("completed_at"),
+                "retry_count": child.get("retry_count"),
+                "result_path": child.get("result_path"),
+            }
+        )
+    children.sort(key=lambda c: (c["chunk_info"] or {}).get("start_page") or (c["chunk_info"] or {}).get("index") or 0)
+    return {"success": True, "task_id": task_id, "count": len(children), "children": children}
 
 
 @router.post("/tasks/{task_id}/cancel", tags=["任务管理"])
 def cancel_task_endpoint(task_id: str, current_user: User = Depends(get_current_active_user)):
+    """
+    取消任务：仅对 pending / processing / paused 状态的任务生效
+    """
     task = db.get_task(task_id)
     if not task:
-        raise HTTPException(404, "Task not found")
-    if not current_user.has_permission(Permission.TASK_DELETE_ALL) and (
-        task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_DELETE_OWN)
-    ):
-        raise HTTPException(403, "Permission denied")
-    if not db.cancel_task(task_id):
-        raise HTTPException(409, "Task is no longer cancellable")
-    return {"success": True, "task_id": task_id, "status": "cancelled", "message": "Task group cancelled"}
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if not current_user.has_permission(Permission.TASK_DELETE_ALL):
+        if task.get("user_id") != current_user.user_id:
+            raise HTTPException(status_code=403, detail="Permission denied")
+
+    if db.cancel_task(task_id):
+        return {"success": True, "message": "Task cancelled"}
+
+    raise HTTPException(
+        status_code=409, detail="Task cannot be cancelled (must be in pending/processing/paused status)"
+    )
 
 
 @router.post("/tasks/{task_id}/pause", tags=["任务管理"])
@@ -876,9 +808,8 @@ def pause_task_endpoint(task_id: str, current_user: User = Depends(get_current_a
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # 🚨 修复属性名称错误
     if not current_user.has_permission(Permission.TASK_DELETE_ALL):
-        if task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_DELETE_OWN):
+        if task.get("user_id") != current_user.user_id:
             raise HTTPException(status_code=403, detail="Permission denied")
 
     if db.pause_task(task_id):
@@ -896,9 +827,8 @@ def resume_task_endpoint(task_id: str, current_user: User = Depends(get_current_
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # 🚨 修复属性名称错误
     if not current_user.has_permission(Permission.TASK_DELETE_ALL):
-        if task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_DELETE_OWN):
+        if task.get("user_id") != current_user.user_id:
             raise HTTPException(status_code=403, detail="Permission denied")
 
     if db.resume_task(task_id):
@@ -908,23 +838,32 @@ def resume_task_endpoint(task_id: str, current_user: User = Depends(get_current_
 
 
 @router.post("/tasks/{task_id}/clear-cache", tags=["任务管理"])
-def clear_task_cache_endpoint(task_id: str, current_user: User = Depends(get_current_active_user)):
+def clear_task_cache_endpoint(task_id: str, request: Request, current_user: User = Depends(get_current_active_user)):
     """
-    清理任务缓存：仅删除 output 文件夹
+    清理任务缓存：删除解析产物并标记 result_path 为已清理
     """
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
     if not current_user.has_permission(Permission.TASK_DELETE_ALL):
-        if task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_DELETE_OWN):
+        if task.get("user_id") != current_user.user_id:
             raise HTTPException(status_code=403, detail="Permission denied")
 
-    # 用 result_path 删除输出（非 task_id）
-    _remove_task_output(task)
-
-    if db.clear_task_cache(task_id):
-        return {"success": True, "message": "Task cache cleared, space freed"}
+    try:
+        if db.clear_task_cache(task_id):
+            record_audit(
+                "task.clear_cache",
+                user=current_user,
+                request=request,
+                resource_type="task",
+                resource_id=task_id,
+                detail={"file_name": task.get("file_name")},
+            )
+            return {"success": True, "message": "Task cache cleared, space freed"}
+    except Exception as e:
+        logger.error(f"❌ Failed to clear cache for task {task_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to clear cache")
 
     raise HTTPException(status_code=404, detail="Task not found")
 
@@ -949,17 +888,25 @@ def list_tasks(
     page_size: int = Query(20, ge=1, le=100, description="每页数量"),
     backend: Optional[str] = Query(None, description="筛选后端引擎"),
     search: Optional[str] = Query(None, description="搜索文件名或任务ID"),
+    include_children: bool = Query(False, description="是否包含拆分出的子任务（默认只返回顶层任务）"),
     current_user: User = Depends(get_current_active_user),
 ):
     can_view_all = current_user.has_permission(Permission.TASK_VIEW_ALL)
-    if not can_view_all and not current_user.has_permission(Permission.TASK_VIEW_OWN):
-        raise HTTPException(status_code=403, detail="Permission denied")
     conditions = []
     params = []
 
     if not can_view_all:
         conditions.append("user_id = ?")
         params.append(current_user.user_id)
+
+    # 默认只列顶层任务（子任务在父任务下展开查看）；按完整任务 ID 搜索时子任务也能直接命中
+    if not include_children:
+        exact_id = (search or "").strip()
+        if exact_id:
+            conditions.append("(parent_task_id IS NULL OR task_id = ?)")
+            params.append(exact_id)
+        else:
+            conditions.append("parent_task_id IS NULL")
 
     if status:
         conditions.append("status = ?")
@@ -982,15 +929,41 @@ def list_tasks(
         cursor.execute(count_sql, params)
         total = cursor.fetchone()[0]
 
+        # 先只按 rowid 排序分页，再回表取整行：排序阶段不碰 data 列（整份 Markdown / 版面 JSON，
+        # 单行可达数 MB）。用不上 idx_parent_created 的查询（如 include_children + 状态筛选）也不会退化成读全表大字段。
+        # rowid 作为同一时刻的次序键：子任务批量创建时 created_at 相同，缺它翻页会重复 / 漏行
         query_params = params + [page_size, offset]
         data_sql = f"""
             SELECT * FROM tasks
-            {where_clause}
-            ORDER BY created_at DESC
-            LIMIT ? OFFSET ?
+            WHERE rowid IN (
+                SELECT rowid FROM tasks
+                {where_clause}
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ? OFFSET ?
+            )
+            ORDER BY created_at DESC, rowid DESC
         """
         cursor.execute(data_sql, query_params)
         tasks = [dict(row) for row in cursor.fetchall()]
+
+    # options 里可能含用户提交的文档密码，列表接口绝不回显明文（密码只能通过重试原样复用）
+    for t in tasks:
+        raw_options = t.get("options")
+        if raw_options:
+            try:
+                opts = json.loads(raw_options)
+                if "password" in opts:
+                    opts["password"] = "********"
+                    t["options"] = json.dumps(opts, ensure_ascii=False)
+            except (ValueError, TypeError):
+                continue
+
+    # 父任务附带子任务状态统计，列表页据此显示分片进度，展开时再按需拉取明细
+    parent_ids = [t["task_id"] for t in tasks if t.get("is_parent") and (t.get("child_count") or 0) > 0]
+    children_stats = db.get_children_stats(parent_ids)
+    for t in tasks:
+        if t["task_id"] in children_stats:
+            t["children_stats"] = children_stats[t["task_id"]]
 
     return {
         "success": True,
@@ -1005,11 +978,19 @@ def list_tasks(
 
 @router.post("/admin/cleanup", tags=["系统管理"])
 def cleanup_old_tasks(
+    request: Request,
     days: int = Query(7, description="清理N天前的任务"),
     current_user: User = Depends(require_permission(Permission.QUEUE_MANAGE)),
 ):
     deleted_count = db.cleanup_old_task_records(days)
     logger.info(f"🧹 Cleaned up {deleted_count} old tasks by {current_user.username}")
+    record_audit(
+        "admin.cleanup",
+        user=current_user,
+        request=request,
+        resource_type="task",
+        detail={"days": days, "deleted_count": deleted_count},
+    )
     return {
         "success": True,
         "deleted_count": deleted_count,
@@ -1019,20 +1000,86 @@ def cleanup_old_tasks(
 
 @router.post("/admin/reset-stale", tags=["系统管理"])
 def reset_stale_tasks(
+    request: Request,
     timeout_minutes: int = Query(60, description="超时时间（分钟）"),
     current_user: User = Depends(require_permission(Permission.QUEUE_MANAGE)),
 ):
-    reset_count = db.reset_stale_tasks(timeout_minutes)
-    logger.info(f"🔄 Reset {reset_count} stale tasks by {current_user.username}")
+    from stale_tasks import handle_stale_tasks
+
+    result = handle_stale_tasks(db, timeout_minutes)
+    reset_count = result["reset_count"]
+    failed_count = result["failed_count"]
+    logger.info(
+        f"🔄 Stale tasks handled by {current_user.username}: {reset_count} reset, {failed_count} failed "
+        f"(max retries: {result['max_retries']})"
+    )
+    record_audit(
+        "admin.reset_stale",
+        user=current_user,
+        request=request,
+        resource_type="task",
+        detail={
+            "timeout_minutes": timeout_minutes,
+            "reset_count": reset_count,
+            "failed_count": failed_count,
+            "max_retries": result["max_retries"],
+        },
+    )
     return {
         "success": True,
         "reset_count": reset_count,
-        "message": f"Reset tasks processing for more than {timeout_minutes} minutes",
+        "failed_count": failed_count,
+        "max_retries": result["max_retries"],
+        "message": (
+            f"Tasks processing for more than {timeout_minutes} minutes: "
+            f"{reset_count} reset to pending, {failed_count} failed after reaching retry limit"
+        ),
+    }
+
+
+@router.get("/admin/audit-logs", tags=["系统管理"])
+def list_audit_logs(
+    user_id: Optional[str] = Query(None, description="按用户ID筛选"),
+    action: Optional[str] = Query(None, description="按动作筛选，如 auth.login"),
+    result: Optional[str] = Query(None, description="按结果筛选: success/failure/denied"),
+    start: Optional[str] = Query(None, description="起始时间 (ISO 格式)"),
+    end: Optional[str] = Query(None, description="结束时间 (ISO 格式)"),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(50, ge=1, le=200, description="每页数量"),
+    current_user: User = Depends(require_role(UserRole.ADMIN)),
+):
+    """
+    查询审计日志 (仅管理员)
+
+    返回内容不含密码、API Key 等敏感信息（写入端已脱敏）。
+    """
+    items, total = query_audit_logs(
+        user_id=user_id,
+        action=action,
+        result=result,
+        start=start,
+        end=end,
+        page=page,
+        page_size=page_size,
+    )
+    return {
+        "success": True,
+        "data": {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        },
     }
 
 
 @router.get("/engines", tags=["系统信息"])
 def list_engines(current_user: User = Depends(get_current_active_user)):
+    """需要认证。返回系统中所有可用的处理引擎信息。
+
+    体内全是同步调用（torch.cuda 探测 + importlib.metadata 遍历），仪表盘会轮询该端点，
+    因此用普通 def 交给 FastAPI 线程池，避免阻塞事件循环。
+    """
     import importlib.util
     import importlib.metadata
     import sys
@@ -1043,39 +1090,13 @@ def list_engines(current_user: User = Depends(get_current_active_user)):
         except Exception:
             return "N/A"
 
-    # ── 运行环境信息 ──────────────────────────────────────────
-    cuda_version = "N/A"
-    gpu_name = "N/A"
-    gpu_memory_gb = None
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            cuda_version = torch.version.cuda or "N/A"
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_memory_gb = round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 1)
-    except Exception:
-        pass
-
+    # ── 运行环境信息（仅保留平台标识，不暴露 Python/CUDA/GPU/依赖版本等内部细节）──
     system_info = {
-        "python": sys.version.split()[0],
         "platform": sys.platform,
-        "cuda": cuda_version,
-        "gpu": gpu_name,
-        "gpu_memory_gb": gpu_memory_gb,
-        "packages": {
-            "mineru": _pkg_version("mineru"),
-            "paddleocr": _pkg_version("paddleocr"),
-            "paddlepaddle-gpu": _pkg_version("paddlepaddle-gpu"),
-            "torch": _pkg_version("torch"),
-            "transformers": _pkg_version("transformers"),
-            "litserve": _pkg_version("litserve"),
-        },
     }
 
     # ── 引擎列表 ──────────────────────────────────────────────
-    mineru_ver = system_info["packages"]["mineru"]
-    paddleocr_ver = system_info["packages"]["paddleocr"]
+    mineru_ver = _pkg_version("mineru")
 
     engines = {
         "document": [
@@ -1084,21 +1105,21 @@ def list_engines(current_user: User = Depends(get_current_active_user)):
                 "display_name": "Standard Pipeline",
                 "version": mineru_ver,
                 "description": "基于 PDF-Extract-Kit 的传统多模型管道，速度快，无幻觉，适合大多数文档。",
-                "supported_formats": [".pdf", ".png", ".jpg", ".jpeg", ".docx"],
+                "supported_formats": [".pdf", ".png", ".jpg", ".jpeg", ".docx", ".pptx"],
             },
             {
                 "name": "vlm-auto-engine",
                 "display_name": "MinerU VLM (视觉大模型)",
                 "version": mineru_ver,
-                "description": "基于 MinerU 3.X (1.2B) 视觉模型，擅长处理复杂排版、图表和非标准文档。DOCX 文件将使用原生解析。",
-                "supported_formats": [".pdf", ".png", ".jpg", ".jpeg", ".docx"],
+                "description": "基于 MinerU 3.X (1.2B) 视觉模型，擅长处理复杂排版、图表和非标准文档。Office 文件将使用原生解析。",
+                "supported_formats": [".pdf", ".png", ".jpg", ".jpeg", ".docx", ".pptx"],
             },
             {
                 "name": "hybrid-auto-engine",
                 "display_name": "Hybrid High-Precision (高精度混合)",
                 "version": mineru_ver,
-                "description": "结合 Pipeline 的稳定性与 VLM 的理解能力，提供最高精度的解析效果。DOCX 文件将使用原生解析。",
-                "supported_formats": [".pdf", ".png", ".jpg", ".jpeg", ".docx"],
+                "description": "结合 Pipeline 的稳定性与 VLM 的理解能力，提供最高精度的解析效果。Office 文件将使用原生解析。",
+                "supported_formats": [".pdf", ".png", ".jpg", ".jpeg", ".docx", ".pptx"],
             },
         ],
         "ocr": [],
@@ -1110,50 +1131,18 @@ def list_engines(current_user: User = Depends(get_current_active_user)):
                 "name": "MarkItDown (快速)",
                 "value": "auto",
                 "version": _pkg_version("markitdown"),
-                "description": "Office 文档和文本文件转换引擎（快速但图片提取可能不完整）",
-                "supported_formats": [
-                    ".docx",
-                    ".xlsx",
-                    ".pptx",
-                    ".doc",
-                    ".xls",
-                    ".ppt",
-                    ".html",
-                    ".txt",
-                    ".csv",
-                    ".epub",
-                    ".zip",
-                ],
+                "description": "轻量文本、HTML/CSV 与 Excel 表格（.xlsx/.xls 直接读取，无需转换）转换引擎",
+                "supported_formats": [".html", ".txt", ".csv", ".xlsx", ".xls"],
             },
             {
-                "name": "LibreOffice + MinerU (完整)",
+                "name": "LibreOffice 转换器（旧版 Office）",
                 "value": "auto",
                 "version": mineru_ver,
-                "description": "将 Office 文件转为 PDF 后使用 MinerU 处理（慢但图片提取完整）",
-                "supported_formats": [".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt"],
+                "description": "将旧版 .doc/.ppt 转换为新版格式后由 MinerU 原生解析",
+                "supported_formats": [".doc", ".ppt"],
             },
         ],
     }
-
-    if importlib.util.find_spec("paddleocr_vl") is not None:
-        engines["ocr"].append(
-            {
-                "name": "paddleocr_vl",
-                "display_name": "PaddleOCR-VL v1.5 (0.9B)",
-                "version": paddleocr_ver,
-                "supported_formats": [".pdf", ".png", ".jpg", ".jpeg"],
-            }
-        )
-
-    if importlib.util.find_spec("paddleocr_vl_vllm") is not None:
-        engines["ocr"].append(
-            {
-                "name": "paddleocr-vl-vllm",
-                "display_name": "PaddleOCR-VL v1.5 (0.9B) (vLLM)",
-                "version": paddleocr_ver,
-                "supported_formats": [".pdf", ".png", ".jpg", ".jpeg"],
-            }
-        )
 
     if importlib.util.find_spec("audio_engines") is not None:
         engines["audio"].append(
@@ -1201,63 +1190,40 @@ def list_engines(current_user: User = Depends(get_current_active_user)):
 
 @router.get("/health", tags=["系统信息"])
 def health_check():
+    """健康检查（无需鉴权，供容器 healthcheck / 负载均衡探针使用）
+
+    返回体刻意保持最小化：不带队列统计、组件状态、异常细节等任何内部信息，
+    避免未鉴权端点成为信息收集入口。详细统计走需授权的 /queue/stats。
+    """
     try:
-        db.get_queue_stats()
-        return {
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "database": "connected",
-        }
+        db.ping()
+        return {"status": "healthy"}
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        return JSONResponse(status_code=503, content={"status": "unhealthy", "error": "Internal server error"})
-
-
-INLINE_MIME_TYPES = {
-    ".pdf": "application/pdf",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-}
-
-
-def _build_file_response(full_path: Path) -> FileResponse:
-    """构造安全的文件下载/预览响应（MIME 白名单 + 安全响应头）"""
-    media_type = INLINE_MIME_TYPES.get(full_path.suffix.lower())
-    disposition = "inline" if media_type else "attachment"
-    headers = {
-        "Content-Disposition": f"{disposition}; filename*=utf-8''{quote(full_path.name)}",
-        "X-Content-Type-Options": "nosniff",
-        "Cache-Control": "private, no-store",
-        "Referrer-Policy": "no-referrer",
-        "Content-Security-Policy": "default-src 'none'; sandbox",
-    }
-    return FileResponse(path=str(full_path), media_type=media_type or "application/octet-stream", headers=headers)
+        return JSONResponse(status_code=503, content={"status": "unhealthy"})
 
 
 @router.get("/files/output/{file_path:path}", tags=["文件服务"])
 def serve_output_file(file_path: str, current_user: User = Depends(get_current_user_flexible)):
-    """提供输出文件的访问服务"""
+    """提供输出文件的访问服务（需认证，仅任务所有者或全局查看权限可访问）"""
     try:
         decoded_path = unquote(file_path).lstrip("/")
         full_path = (OUTPUT_DIR / decoded_path).resolve()
-
-        logger.debug(f"📥 Serving output file: {full_path}")
 
         if not full_path.is_relative_to(OUTPUT_DIR.resolve()) or not full_path.is_file():
             logger.warning(f"❌ Access denied or file not found: {full_path}")
             raise HTTPException(status_code=404, detail="File not found or access denied")
 
-        task = db.get_task_by_file_path(full_path, OUTPUT_DIR, output=True)
-        if not current_user.has_permission(Permission.TASK_VIEW_ALL):
-            if (
-                task is None
-                or task.get("user_id") != current_user.user_id
-                or not current_user.has_permission(Permission.TASK_VIEW_OWN)
-            ):
+        # 归属校验：孤儿文件（任务已被删除的残留产物）仅全局查看权限可访问
+        task = db.get_task_by_output_path(decoded_path)
+        if task is None:
+            if not current_user.has_permission(Permission.TASK_VIEW_ALL):
                 raise HTTPException(status_code=403, detail="Permission denied")
+        elif not current_user.has_permission(Permission.TASK_VIEW_ALL) and (
+            task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_VIEW_OWN)
+        ):
+            raise HTTPException(status_code=403, detail="Permission denied")
+
         return _build_file_response(full_path)
 
     except HTTPException:
@@ -1269,25 +1235,25 @@ def serve_output_file(file_path: str, current_user: User = Depends(get_current_u
 
 @router.get("/files/upload/{file_path:path}", tags=["文件服务"])
 def serve_upload_file(file_path: str, current_user: User = Depends(get_current_user_flexible)):
-    """提供上传源文件的访问服务"""
+    """提供上传源文件的访问服务（需认证，仅任务所有者或全局查看权限可访问）"""
     try:
         decoded_path = unquote(file_path).lstrip("/")
         full_path = (UPLOAD_DIR / decoded_path).resolve()
-
-        logger.debug(f"📥 Serving upload file: {full_path}")
 
         if not full_path.is_relative_to(UPLOAD_DIR.resolve()) or not full_path.is_file():
             logger.warning(f"❌ Access denied or file not found: {full_path}")
             raise HTTPException(status_code=404, detail="File not found or access denied")
 
-        task = db.get_task_by_file_path(full_path, UPLOAD_DIR, output=False)
-        if not current_user.has_permission(Permission.TASK_VIEW_ALL):
-            if (
-                task is None
-                or task.get("user_id") != current_user.user_id
-                or not current_user.has_permission(Permission.TASK_VIEW_OWN)
-            ):
+        # 归属校验：孤儿文件（任务已被删除的残留源文件）仅全局查看权限可访问
+        task = db.get_task_by_upload_path(decoded_path)
+        if task is None:
+            if not current_user.has_permission(Permission.TASK_VIEW_ALL):
                 raise HTTPException(status_code=403, detail="Permission denied")
+        elif not current_user.has_permission(Permission.TASK_VIEW_ALL) and (
+            task.get("user_id") != current_user.user_id or not current_user.has_permission(Permission.TASK_VIEW_OWN)
+        ):
+            raise HTTPException(status_code=403, detail="Permission denied")
+
         return _build_file_response(full_path)
 
     except HTTPException:

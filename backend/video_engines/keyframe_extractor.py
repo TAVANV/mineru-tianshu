@@ -81,14 +81,7 @@ class KeyframeExtractor:
         返回: [(timestamp, frame_number), ...]
         """
         cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            logger.error(f"❌ 无法打开视频文件（损坏或编码不支持）: {video_path}")
-            cap.release()
-            return []
         fps = cap.get(cv2.CAP_PROP_FPS)
-        if not fps or fps <= 0:
-            logger.warning(f"⚠️ 视频 FPS 无效 ({fps})，回退为 25.0 以避免除零")
-            fps = 25.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         scene_frames = []
@@ -250,7 +243,7 @@ class KeyframeExtractor:
 class VideoOCREngine:
     """视频 OCR 引擎：关键帧提取 + OCR 识别"""
 
-    def __init__(self, ocr_backend: str = "paddleocr-vl", keep_keyframes: bool = False):
+    def __init__(self, ocr_backend: str = "mineru", keep_keyframes: bool = False):
         self.ocr_backend = ocr_backend
         self.keep_keyframes = keep_keyframes
         self.keyframe_extractor = KeyframeExtractor()
@@ -261,10 +254,10 @@ class VideoOCREngine:
         if self._ocr_engine is not None:
             return self._ocr_engine
 
-        if self.ocr_backend == "paddleocr-vl":
-            from paddleocr_vl import PaddleOCRVLEngine
+        if self.ocr_backend == "mineru":
+            from mineru_pipeline import MinerUPipelineEngine
 
-            self._ocr_engine = PaddleOCRVLEngine()
+            self._ocr_engine = MinerUPipelineEngine()
         else:
             raise ValueError(f"不支持的 OCR 引擎: {self.ocr_backend}")
 

@@ -143,7 +143,7 @@ class RedisTaskQueue:
             pipe = self.client.pipeline()
 
             # 添加到优先级队列
-            pipe.zadd(self.config.queue_key, {task_id: score}, nx=True)
+            pipe.zadd(self.config.queue_key, {task_id: score})
 
             # 存储任务数据（可选，用于快速访问）
             if task_data:
@@ -305,18 +305,6 @@ class RedisTaskQueue:
         except Exception as e:
             logger.error(f"❌ Failed to prune processing set: {e}")
             return 0
-
-    def remove_tasks(self, task_ids):
-        if not task_ids:
-            return
-        try:
-            pipe = self.client.pipeline()
-            pipe.zrem(self.config.queue_key, *task_ids)
-            pipe.hdel(self.config.processing_key, *task_ids)
-            pipe.delete(*(f"{self.config.task_data_prefix}{tid}" for tid in task_ids))
-            pipe.execute()
-        except Exception as e:
-            logger.warning(f"Redis cancellation cleanup deferred: {type(e).__name__}")
 
     def heartbeat(self, task_id: str, worker_id: str) -> bool:
         """
@@ -483,10 +471,12 @@ def get_redis_queue() -> Optional[RedisTaskQueue]:
         try:
             _queue_instance = RedisTaskQueue()
             if _queue_instance.is_available():
-                logger.info(f"✅ Redis queue connected: {_queue_instance.config.host}:{_queue_instance.config.port}")
+                logger.info(
+                    f"✅ Redis queue connected: " f"{_queue_instance.config.host}:{_queue_instance.config.port}"
+                )
             else:
                 logger.warning("⚠️  Redis queue not available, falling back to SQLite")
-                # 保留客户端：启动时 Redis 暂不可用，恢复后对账仍能通过同一连接池补队列。
+                _queue_instance = False  # 标记为已检查且不可用
         except Exception as e:
             logger.error(f"❌ Failed to initialize Redis queue: {e}")
             _queue_instance = False  # 标记为已检查且初始化失败

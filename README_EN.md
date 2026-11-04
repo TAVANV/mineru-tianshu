@@ -1,4 +1,4 @@
-> Custom branch: see the [phase 4 upgrade guide](docs/phase4-compatible-upstream-completion.md) for MinerU 3.4.5, incremental offline model preparation, and compatibility details. This code integration does not download model weights.
+> This fork merges upstream v2.2.1 (`46af54c`). Only external-model compatibility, per-task RustFS selection and the image handoff API remain, plus migration and essential dependency/rendering fixes. Build this repository with `bash setup.sh` or `docker-compose.build.yml`; upstream GHCR images do not include these adapters. See the [upgrade and compatibility notes](README.md#从旧定制版本升级) in the Chinese README (section “从旧定制版本升级”). Drain old workers, stop all old services and back up the database before upgrading. Legacy webhook records are archived, not automatically resent; consumers must adopt the upstream webhook protocol. PaddleOCR, custom Office processing, scheduling and MCP now follow upstream.
 
 <div align="center">
 
@@ -45,6 +45,49 @@ English | [简体中文](./README.md)
 ---
 
 ## 📝 Latest Updates
+
+### 2026-10-16 🚀 v2.2.1: Prebuilt Docker Images
+
+- ✅ **Prebuilt images**: GPU backend, CPU backend and frontend images are published to GHCR with each release (`ghcr.io/magicyuan876/tianshu-backend` / `tianshu-backend-cpu` / `tianshu-frontend`), so deployments pull them instead of building locally
+- ✅ **compose pulls released images by default**: `docker-compose.yml` pulls images by `TIANSHU_IMAGE_REGISTRY` / `TIANSHU_VERSION` from `.env`; building from source and mounting local code moved to `docker-compose.build.yml`, which `setup.sh` layers on by default, so its behavior is unchanged
+- ✅ **Slimmer GPU image**: base image switched from `cudnn-devel` to `cudnn-runtime`, shrinking the compressed base from 4.32GB to 2.0GB
+- ✅ **Pinned third-party images**: vLLM pinned to `v0.31.0` and RustFS to `1.0.1`, overridable via `VLLM_VERSION` / `RUSTFS_VERSION`
+- 🐛 **Fix**: the worker was missing `JWT_SECRET_KEY`, so webhook notifications failed to enqueue after a task finished
+
+### 2026-10-12 🚀 v2.2.0: Encrypted Document Parsing
+
+- ✅ **Encrypted PDFs**: password-protected PDFs are supported; documents with empty or owner-only passwords are unlocked automatically without manual input
+- ✅ **Encrypted Office**: encrypted DOCX / XLSX / PPTX and legacy DOC / XLS / PPT (decrypted via msoffcrypto-tool before normal parsing)
+- ✅ **Encrypted ZIPs**: ZipCrypto and AES encrypted archives, auto-unpacked into parent/child batch tasks after decryption
+- ✅ **password parameter across the board**: an optional document-open password can be passed at submission — API form, frontend advanced options, the MCP `parse_document` tool and the Dify plugin all support it
+- ✅ **Retry with a corrected password**: decryption failures produce a friendly error; the correct password can be entered when retrying from the task detail page, no need to resubmit
+- 🔒 **Password safety**: passwords live only in task options (always masked in API responses) and are never logged; decrypted plaintext copies are kept in an isolated directory and cleaned up automatically when the task finishes
+
+### 2026-09-13 🚀 v2.1.0: Webhook Notifications, Audit Logs & UI Overhaul
+
+- ✅ **Webhook Task Notifications**: when a task completes or fails, an HMAC-signed callback is pushed to the integration (task metadata + result URL only, no parsed content); periodic delivery by the scheduler with exponential-backoff retries up to a dead-letter state, SSRF protection throughout, and queryable delivery records
+- ✅ **Per-API-Key Callbacks**: each integrating system self-configures its callback URL, signing secret and outbound auth (Bearer / Basic / custom header) on its own API key in "API Token Management", with test delivery; admins can review and manage all integrations from System Settings; ad-hoc scenarios can pass `webhook_url` per task at submission
+- ✅ **Audit Logs**: logins, config changes, API key and task-sensitive operations are all recorded (with IP/UA), with visual filtering in System Settings and automatic retention-based cleanup
+- ✅ **UI Overhaul**: settings center rebuilt with a navigation layout, globally adaptive fluid page widths and a well-organized top bar; the English interface is now fully translated with complete Chinese/English bilingual coverage
+
+### 2026-09-12 🚀 v2.0.0 Stable: Multimodal Image Captioning, ZIP/EPUB Support & System Improvements
+
+- ✅ **Image Captioning (Multimodal LLM)**: images in parsing results can be automatically described by a multimodal LLM, written back to the Markdown image alt text and the JSON `img_caption` field; admins enable and configure the model from the system settings page (OpenAI-compatible API), with connection testing and concurrency control
+- ✅ **ZIP Archive Parsing**: uploaded zip files are automatically unpacked into parent/child tasks for batch parsing (entry count / total size limits, Zip Slip protection), with results merged per entry; EPUB format support added (MarkItDown)
+- ✅ **Invite-Code Registration**: admins can require an invite code for public registration from the settings page
+- ✅ **Task Cancellation**: cancel tasks in pending/processing/paused states (PR #83)
+- ✅ **MinerU 3.4.5 Upgrade**: native Office parsing (DOCX/XLSX/PPTX), native macOS MPS support; engines consolidated on MinerU, PaddleOCR engines removed
+- ✅ **Unified Deployment**: single interactive `setup.sh` entry point (GPU / pipeline-only / CPU / native / offline), with new pipeline-only and offline deployment options
+- ⚡ **Performance & Stability**: SQLite WAL mode eliminates read/write blocking between workers and the API; API endpoints moved off the event loop; periodic Redis↔SQLite queue reconciliation; child tasks created in a single transaction; on-demand cold start for the vLLM container
+- 🔒 **Security Hardening**: system-wide improvements including credential strength enforcement, authenticated file serving with download protection, object storage credential and network tightening, and dependency upgrades (regenerate your `.env` per the docs before upgrading)
+- 🔧 **Fixes**: image parsing failures caused by invalid EXIF orientation, model caches lost on container rebuild, and source preview failures for image files
+
+### 2026-09-11 🚀 MinerU 3.4.5 Upgrade
+
+- ✅ **MinerU 3.4.5 Upgrade**: `mineru[all]>=3.4.5`, with `mineru-vl-utils>=1.0.5,<2` and `pypdf>=5.6.0` synced
+- ✅ **VLM Model Update**: `MinerU2.5-2509-1.2B` → `MinerU2.5-Pro-2605-1.2B` (model download script, `mineru.json`, and vLLM service updated accordingly)
+- ✅ **Compatibility Confirmed**: `do_parse` API, `vlm/hybrid` backend names (legacy `*-auto-engine` aliases still supported), and pipeline model directory structure (PP-DocLayoutV2, etc.) remain unchanged
+- ✅ **Native macOS Support**: Apple Silicon auto-enables MPS acceleration (`--accelerator mps`), VLM backend runs via MLX; audio/video auxiliary engines fall back to CPU on macOS
 
 ### 2026-04-12 🔧 MinerU 3.0.9 Upgrade & Office Format Enhancement
 
@@ -94,16 +137,13 @@ English | [简体中文](./README.md)
 ### 2025-10-30 🐳 Docker Deployment + Enterprise Authentication
 
 - ✅ **Docker Containerization Support**
-  - **One-Click Deployment**: Complete full-stack deployment with `make setup` or deployment scripts
+  - **One-Click Deployment**: Full-stack deployment via the interactive `setup.sh` script (or `make setup`)
   - **Multi-Stage Build**: Optimized image size, separated dependency and application layers
   - **GPU Support**: NVIDIA CUDA 12.6 + Container Toolkit integration
   - **Service Orchestration**: Complete orchestration of frontend, backend, Worker, MCP (docker-compose)
-  - **Developer Friendly**: Hot reload, remote debugging (debugpy), real-time logs
+  - **Developer Friendly**: source is bind-mounted into the containers — `make reload` picks up edits; `make smoke` verifies the parsing pipeline end to end
   - **Production Ready**: Health checks, data persistence, zero-downtime deployment, resource limits
-  - **Cross-Platform Scripts**:
-    - Linux/Mac: `scripts/docker-setup.sh` or `Makefile`
-    - Windows: `scripts/docker-setup.bat`
-  - **Complete Documentation**: `scripts/DOCKER_QUICK_START.txt`, `scripts/docker-commands.sh`
+  - **Multiple Deployment Modes**: GPU standard, pipeline-only, Mac CPU local dev, offline deployment, dev hot-reload
   - See: Docker configuration files (`docker-compose.yml`, `backend/Dockerfile`, `frontend/Dockerfile`)
 
 - ✅ **Enterprise-Grade User Authentication & Authorization**
@@ -187,7 +227,6 @@ English | [简体中文](./README.md)
 - Support for 109+ language automatic recognition without manual specification
 - Enhanced features: document orientation, text unwarping, layout detection
 - Native PDF multi-page support with automatic model download
-- Documentation: [backend/paddleocr_vl/README.md](backend/paddleocr_vl/README.md)
 
 ---
 
@@ -195,7 +234,7 @@ English | [简体中文](./README.md)
 
 MinerU Tianshu is an **Enterprise-grade AI Data Preprocessing Platform** that converts unstructured data into AI-ready structured formats:
 
-- **📄 Documents**: PDF, Word, Excel, PPT → Markdown/JSON (MinerU, PaddleOCR-VL 109+ languages, Watermark Removal🧪)
+- **📄 Documents**: PDF, Word, Excel, PPT → Markdown/JSON (MinerU, Watermark Removal🧪)
 - **🎬 Videos**: MP4, AVI, MKV → Speech Transcription + Keyframe OCR🧪 (FFmpeg + SenseVoice)
 - **🎙️ Audio**: MP3, WAV, M4A → Transcription + Speaker Diarization (SenseVoice Multi-language)
 - **🖼️ Images**: JPG, PNG → Text Extraction + Structuring (Multiple OCR Engines + Watermark Removal🧪)
@@ -234,14 +273,17 @@ MinerU Tianshu is an **Enterprise-grade AI Data Preprocessing Platform** that co
 
 - ✅ **User Auth**: JWT authentication, role-based access, API key management
 - ✅ **Task Management**: Drag-drop upload, batch processing, real-time tracking, Markdown/JSON preview
+- ✅ **Encrypted Document Parsing**: encrypted PDFs (empty/owner-only passwords auto-removed), encrypted Office, encrypted ZIPs; optional password at submission, wrong password can be corrected on retry
 - ✅ **Queue Management**: System monitoring, timeout reset, file cleanup
+- ✅ **Webhook Notifications**: Per-API-key callbacks, signed terminal-state pushes with retries
+- ✅ **Audit Logs**: Sensitive operations recorded with visual querying and automatic cleanup
 - ✅ **MCP Protocol**: Seamless AI assistant (Claude Desktop) integration
 - ✅ **Docker Deployment**: One-click deployment, GPU support, full containerization
 
 ### Supported File Formats
 
-- 📄 **Documents**: PDF, Word, Excel, PPT (MinerU, PaddleOCR-VL, MarkItDown)
-- 🖼️ **Images**: JPG, PNG, BMP, TIFF (MinerU, PaddleOCR-VL)
+- 📄 **Documents**: PDF, Word, Excel, PPT (MinerU, MarkItDown; encrypted documents supported — provide the password at submission)
+- 🖼️ **Images**: JPG, PNG, BMP, TIFF (MinerU)
 - 🎙️ **Audio**: MP3, WAV, M4A, FLAC (SenseVoice multi-language, speaker diarization, emotion recognition)
 - 🎬 **Video**: MP4, AVI, MKV, MOV, WebM (audio transcription + keyframe OCR🧪)
 - 🧬 **Bio Formats**: FASTA, GenBank (sequence statistics, base analysis, GC content)
@@ -266,9 +308,8 @@ mineru-server/
 │   ├── remove_watermark/  # Watermark Removal (YOLO11x + LaMa)
 │   └── requirements.txt
 │
-├── scripts/               # Deployment Scripts
-│   ├── docker-setup.sh    # Linux/Mac Deployment
-│   └── docker-setup.bat   # Windows Deployment
+├── setup.sh               # One-click deployment script (interactive + non-interactive flags)
+├── scripts/               # Helper scripts (docker-entrypoint.sh, init-models.sh)
 │
 ├── docker-compose.yml     # Docker Orchestration
 └── Makefile               # Shortcuts
@@ -281,18 +322,50 @@ mineru-server/
 **Prerequisites**: Docker 20.10+, Docker Compose 2.0+, NVIDIA Container Toolkit (GPU optional)
 
 ```bash
-# One-click deployment
-make setup
+# One-click deployment (interactive wizard)
+bash setup.sh
 
-# Or use scripts
-./scripts/docker-setup.sh    # Linux/Mac
-scripts\docker-setup.bat     # Windows
+# Non-interactive deployment (for CI / advanced users)
+bash setup.sh --mode pipeline --yes
 
-# Common commands
+# Preview the configuration (no build, no start)
+bash setup.sh --mode gpu --dry-run
+```
+
+> Windows users: run `setup.sh` via Git Bash or WSL.
+
+`setup.sh` supports six deployment modes:
+
+| Mode | Description |
+|---|---|
+| `gpu` | GPU standard deployment (docker-compose.yml, default) |
+| `pipeline` | Pipeline-only deployment (downloads PDF-Extract-Kit models only, lighter) |
+| `cpu` | Mac CPU local development (docker-compose.cpu.yml + .env.cpu) |
+| `native` | Native host deployment (no Docker; auto MPS acceleration on Apple Silicon, VLM via MLX) |
+| `offline-build` / `offline-deploy` | Offline deployment: build the bundle online / deploy on the production host |
+
+The wizard asks for network environment (China mirrors / overseas direct), GPU count (auto-detected), worker concurrency, model source (HuggingFace/ModelScope), Redis, RustFS public URL and ports, and automatically generates the JWT secret, computes `MINERU_VIRTUAL_VRAM_SIZE`/`WORKER_MEMORY_LIMIT`, creates directories and runs health checks.
+
+> The network environment can also be set via flag: `--network cn` (China mirrors, default) or `--network global` (overseas/proxy, direct official sources). It applies to Docker image builds (apt/pip/npm) and native-mode pip installs alike.
+
+Common commands:
+
+```bash
 make start    # Start services
 make stop     # Stop services
 make logs     # View logs
 ```
+
+**Using prebuilt images (no local build)**: without `setup.sh`, deploy straight from the released images.
+
+```bash
+cp .env.example .env   # fill in JWT_SECRET_KEY, TIANSHU_ADMIN_PASSWORD, RUSTFS_*, RUSTFS_PUBLIC_URL and other required keys
+mkdir -p models/huggingface_cache models/modelscope_cache data/uploads data/output data/db          logs/backend logs/worker logs/mcp logs/scheduler
+docker compose -f docker-compose.yml -f docker-compose.pipeline.yml up -d   # pipeline only
+docker compose -f docker-compose.yml -f docker-compose.vllm.yml up -d       # full GPU engines (with local vLLM)
+```
+
+> The image version is set by `TIANSHU_VERSION` in `.env`; if pulling from GHCR is slow, point `TIANSHU_IMAGE_REGISTRY` at a synced mirror registry.
 
 **Service Access**:
 - Frontend: http://localhost:80
@@ -385,8 +458,7 @@ npm run dev                  # http://localhost:3000
 - **Automatic Cleanup**: Periodically clean old result files, retain database records
 - **Multiple Parsing Engines**:
   - **MinerU**: Complete document parsing with table and formula recognition
-  - **PaddleOCR-VL**: Multi-language OCR (109+ languages), document enhancement processing
-  - **MarkItDown**: Office document and web page parsing
+  - **MarkItDown**: Web page and text file parsing
 - **MCP Protocol**: AI assistants can call document parsing service via standard protocol
 
 ## ⚙️ Configuration
@@ -493,7 +565,7 @@ MCP Server provides 4 tools:
 
 1. **parse_document** - Parse documents to Markdown format
    - Input methods: Base64 encoding or URL
-   - Supported formats: PDF, images, Office documents, web pages and text
+   - Supported formats: PDF, images, Office documents (DOCX/XLSX/PPTX via MinerU native), legacy Office (DOC/XLS/PPT via LibreOffice), web pages and text
    - File size: Configurable via MAX_FILE_SIZE in .env (default 500MB)
 
 2. **get_task_status** - Query task status and results
@@ -555,6 +627,28 @@ See [frontend/README.md](frontend/README.md) for details.
 
 ## 🚢 Production Deployment
 
+### Offline Deployment
+
+Tianshu supports **fully offline (air-gapped) deployment**, in two stages:
+
+```bash
+# 1. Build the offline bundle on an online machine (Linux/Mac, output in docker-images/)
+bash setup.sh --mode offline-build
+
+# 2. Transfer to the production server
+rsync -avz docker-images/ user@prod-server:/opt/tianshu/
+
+# 3. Deploy on the production server
+cd /opt/tianshu
+bash setup.sh --mode offline-deploy
+```
+
+**Highlights**:
+- ✅ **Cross-Platform Build**: Build Linux amd64 images on Mac (Apple Silicon/Intel)
+- ✅ **Fully Offline**: All models (~15GB) and dependencies pre-packaged
+- ✅ **One-Click Deploy**: Auto-configures environment variables, JWT secret, RustFS object storage
+- ✅ **Office Document Support**: MinerU natively parses .docx/.xlsx/.pptx; legacy .doc/.xls/.ppt converted via LibreOffice before parsing
+
 ### Frontend Build
 
 ```bash
@@ -598,6 +692,25 @@ Use systemd or supervisor to manage backend services:
 # Start backend
 cd backend
 python start_all.py --api-port 8000 --worker-port 9000
+```
+
+### Appendix: Common Docker Commands
+
+```bash
+# Build and start
+docker compose build --parallel        # Build all images in parallel
+docker compose up -d                   # Start all services in background
+docker compose down                    # Stop and remove containers
+
+# Status and logs
+docker compose ps                      # Show service status
+docker compose logs -f                 # Follow all logs
+docker compose logs -f backend         # Follow a single service's logs
+
+# Exec and debug
+docker compose exec backend bash       # Enter the backend container
+docker compose exec worker nvidia-smi  # Check GPU inside the container
+docker stats                           # Container resource usage
 ```
 
 ## 📚 Tech Stack
@@ -692,7 +805,6 @@ This project is built upon the following excellent open-source projects:
 **Core Engines**
 
 - [MinerU](https://github.com/opendatalab/MinerU) - PDF/Image document parsing
-- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) - Multi-language OCR engine
 - [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) - Speech recognition & speaker diarization
 - [FunASR](https://github.com/modelscope/FunASR) - Speech recognition framework
 - [MarkItDown](https://github.com/microsoft/markitdown) - Document conversion tool

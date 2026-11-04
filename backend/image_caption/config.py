@@ -11,7 +11,7 @@ from loguru import logger
 # 默认 Prompt：控制描述长度，避免 alt 文本过长影响排版
 DEFAULT_PROMPT = "请用简体中文简要描述这张图片的内容，100字以内，直接输出描述文本，不要输出其他内容。"
 
-DEFAULT_API_BASE = ""
+DEFAULT_API_BASE = "https://api.openai.com/v1"
 DEFAULT_MAX_IMAGES = 30
 DEFAULT_CONCURRENCY = 4
 DEFAULT_TIMEOUT = 60
@@ -43,14 +43,11 @@ class ImageCaptionConfig:
         """
         from auth.system_config import SystemConfig
 
-        try:
-            values = SystemConfig().get_all_configs()
-        except Exception as exc:
-            logger.warning(f"Image caption configuration unavailable: {type(exc).__name__}")
-            return None
+        config = SystemConfig()
 
         def get(key: str, default: str) -> str:
-            return values.get(key, default)
+            value = config.get_config(key)
+            return value if value is not None else default
 
         enabled = get("image_caption_enabled", "false").lower() in ("true", "1", "yes")
         if not enabled:

@@ -4,7 +4,7 @@
 # 使用方式: make [命令]
 # 例如: make setup, make start, make logs
 
-.PHONY: help setup build start stop restart status logs clean dev test
+.PHONY: help setup build start stop restart status logs clean reload smoke test
 
 # 默认目标
 .DEFAULT_GOAL := help
@@ -28,6 +28,12 @@ ifeq ($(REDIS_ENABLED),true)
 else
     COMPOSE_PROFILE :=
     REDIS_STATUS := disabled
+endif
+
+# 从 .env 读取 API 端口（默认 8000）
+API_PORT := $(shell [ -f .env ] && grep -E "^API_PORT=" .env | cut -d= -f2- | tr -d '[:space:]')
+ifeq ($(strip $(API_PORT)),)
+    API_PORT := 8000
 endif
 
 # 颜色输出
@@ -59,38 +65,8 @@ help: ## 显示帮助信息
 # ============================================================================
 # 安装和配置
 # ============================================================================
-setup: ## 全新部署（配置环境 + 构建镜像 + 启动服务）
-	@echo "$(BLUE)[INFO]$(NC) 开始全新部署..."
-	@if [ ! -f .env ]; then \
-		if [ -f .env.example ]; then \
-			cp .env.example .env; \
-			echo "$(GREEN)[OK]$(NC) .env 文件已创建"; \
-			echo "$(YELLOW)[WARNING]$(NC) 请编辑 .env 文件，特别是 JWT_SECRET_KEY"; \
-		else \
-			echo "$(RED)[ERROR]$(NC) .env.example 文件不存在"; \
-			exit 1; \
-		fi; \
-	else \
-		echo "$(GREEN)[OK]$(NC) .env 文件已存在"; \
-	fi
-	@mkdir -p models data/uploads data/output data/db logs/backend logs/worker logs/mcp
-	@echo "$(GREEN)[OK]$(NC) 目录结构创建完成"
-	@$(MAKE) build
-	@$(MAKE) start
-	@$(MAKE) info
-
-check: ## 检查系统依赖
-	@echo "$(BLUE)[INFO]$(NC) 检查系统依赖..."
-	@command -v docker >/dev/null 2>&1 || { echo "$(RED)[ERROR]$(NC) Docker 未安装"; exit 1; }
-	@echo "$(GREEN)[OK]$(NC) Docker: $$(docker --version)"
-	@$(COMPOSE_CMD) version >/dev/null 2>&1 || { echo "$(RED)[ERROR]$(NC) Docker Compose 未安装"; exit 1; }
-	@echo "$(GREEN)[OK]$(NC) Docker Compose: $$($(COMPOSE_CMD) version)"
-	@if command -v nvidia-smi >/dev/null 2>&1; then \
-		echo "$(GREEN)[OK]$(NC) 检测到 NVIDIA GPU"; \
-		nvidia-smi --query-gpu=gpu_name,driver_version --format=csv,noheader; \
-	else \
-		echo "$(YELLOW)[WARNING]$(NC) 未检测到 NVIDIA GPU"; \
-	fi
+setup: ## 交互式部署（调用根目录 setup.sh：配置环境 + 构建镜像 + 启动服务）
+	@./setup.sh
 
 # ============================================================================
 # 构建
@@ -140,20 +116,20 @@ restart: ## 重启所有服务
 	@echo "$(GREEN)[OK]$(NC) 服务已重启"
 
 # ============================================================================
-# 开发环境
+# 开发
+#
+# 源码构建部署（COMPOSE_FILE 含 docker-compose.build.yml，setup.sh 默认如此）会把
+# ./backend 挂载进容器，改完代码 restart 即可生效，无需重新 build。
+# 直接使用发布镜像时没有源码挂载，reload 只是重启。
+# 前端本机开发用 frontend/ 下的 vite（vite.config.ts 已把 /api 代理到 :8000）。
 # ============================================================================
-dev: ## 启动开发环境
-	@echo "$(BLUE)[INFO]$(NC) 启动开发环境..."
-	@$(COMPOSE_CMD) -f docker-compose.dev.yml up -d
-	@echo "$(GREEN)[OK]$(NC) 开发环境启动中..."
-	@sleep 10
-	@$(COMPOSE_CMD) -f docker-compose.dev.yml ps
+reload: ## 重启后端与 Worker，加载本地改动的代码（仅源码构建部署）
+	@echo "$(BLUE)[INFO]$(NC) 重启 backend / worker 以加载代码改动..."
+	@$(COMPOSE_CMD) $(COMPOSE_PROFILE) restart backend worker
+	@echo "$(GREEN)[OK]$(NC) 已重启"
 
-dev-stop: ## 停止开发环境
-	@$(COMPOSE_CMD) -f docker-compose.dev.yml down
-
-dev-logs: ## 查看开发环境日志
-	@$(COMPOSE_CMD) -f docker-compose.dev.yml logs -f
+smoke: ## 对已启动的部署跑一次解析自检
+	@bash setup.sh --smoke-only
 
 # ============================================================================
 # 日志和状态
@@ -192,11 +168,13 @@ test-gpu: ## 测试 GPU 可用性
 	@echo "$(BLUE)[INFO]$(NC) 测试 GPU..."
 	@$(COMPOSE_CMD) exec worker nvidia-smi || echo "$(YELLOW)[WARNING]$(NC) GPU 不可用"
 	@$(COMPOSE_CMD) exec worker python -c "import torch; print('PyTorch CUDA:', torch.cuda.is_available())"
-	@$(COMPOSE_CMD) exec worker python -c "import paddle; print('Paddle CUDA:', paddle.device.is_compiled_with_cuda())"
 
 test-api: ## 测试 API 是否可访问
-	@echo "$(BLUE)[INFO]$(NC) 测试 API..."
-	@curl -f http://localhost:8000/health && echo "$(GREEN)[OK]$(NC) API 正常" || echo "$(RED)[ERROR]$(NC) API 不可访问"
+	@echo "$(BLUE)[INFO]$(NC) 测试 API (http://localhost:$(API_PORT)/api/v1/health)..."
+	@curl -f http://localhost:$(API_PORT)/api/v1/health && echo "" && echo "$(GREEN)[OK]$(NC) API 正常" || echo "$(RED)[ERROR]$(NC) API 不可访问"
+
+test: ## 运行后端生产事故防线测试
+	@PYTHONPATH=backend python -m pytest backend/tests -q
 
 health: ## 检查所有服务健康状态
 	@echo "$(BLUE)[INFO]$(NC) 检查服务健康状态..."
@@ -208,8 +186,8 @@ health: ## 检查所有服务健康状态
 backup-db: ## 备份数据库
 	@echo "$(BLUE)[INFO]$(NC) 备份数据库..."
 	@mkdir -p backups
-	@$(COMPOSE_CMD) exec -T backend python /app/backend/backup_db.py /tmp/mineru_tianshu.db.backup
-	@$(COMPOSE_CMD) cp backend:/tmp/mineru_tianshu.db.backup ./backups/mineru_tianshu_$$(date +%Y%m%d_%H%M%S).db
+	@$(COMPOSE_CMD) exec -T backend cp mineru_tianshu.db mineru_tianshu.db.backup
+	@docker cp tianshu-backend:/app/backend/mineru_tianshu.db.backup ./backups/mineru_tianshu_$$(date +%Y%m%d_%H%M%S).db
 	@echo "$(GREEN)[OK]$(NC) 数据库备份完成"
 
 clean: ## 清理所有数据（危险操作！）

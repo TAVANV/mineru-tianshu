@@ -55,7 +55,6 @@ ROLE_PERMISSIONS = {
     UserRole.ADMIN: [p for p in Permission],  # 管理员拥有所有权限
     UserRole.MANAGER: [
         Permission.TASK_SUBMIT,
-        Permission.TASK_VIEW_OWN,
         Permission.TASK_VIEW_ALL,
         Permission.TASK_DELETE_OWN,
         Permission.QUEUE_VIEW,
@@ -90,9 +89,8 @@ class User(BaseModel):
     sso_subject: Optional[str] = None  # SSO 用户唯一标识
     created_at: datetime
     last_login: Optional[datetime] = None
-    token_epoch: int = Field(0, exclude=True)
-    api_key_id: Optional[str] = None
     api_key_scopes: Optional[List[str]] = None  # API Key 作用域，None 表示不限
+    api_key_id: Optional[str] = None  # 通过 API Key 认证时记录所用 Key，供 Key 级 webhook 路由
 
     def has_permission(self, permission: Permission) -> bool:
         """检查用户是否拥有指定权限"""
@@ -111,6 +109,17 @@ class User(BaseModel):
         return user_level >= required_level
 
 
+class RegisterRequest(BaseModel):
+    """注册请求（公开注册入口，不允许指定角色，角色恒为普通用户）"""
+
+    username: str = Field(..., min_length=3, max_length=50, pattern="^[a-zA-Z0-9_-]+$")
+    email: EmailStr
+    password: str = Field(..., min_length=8, max_length=100)
+    full_name: Optional[str] = Field(None, max_length=100)
+    # 管理员在系统配置中设置邀请码后，注册时必须携带
+    invite_code: Optional[str] = Field(None, max_length=100)
+
+
 class UserCreate(BaseModel):
     """创建用户请求"""
 
@@ -119,10 +128,6 @@ class UserCreate(BaseModel):
     password: str = Field(..., min_length=8, max_length=100)
     full_name: Optional[str] = Field(None, max_length=100)
     role: UserRole = UserRole.USER
-
-
-class RegisterRequest(UserCreate):
-    invite_code: Optional[str] = Field(None, max_length=100)
 
 
 class UserUpdate(BaseModel):
@@ -184,7 +189,9 @@ class APIKeyCreate(BaseModel):
     """创建 API Key 请求"""
 
     name: str = Field(..., min_length=1, max_length=100)
-    expires_days: int = Field(90, gt=0, le=3650)  # 默认 90 天，最长 10 年，必须限期
+    # 必须限期：不提供永久 Key。上限 30 年（10950 天）用于长期运行的内部集成，
+    # 前端最长选项与此保持一致，避免出现前端可选、后端拒绝的组合。
+    expires_days: int = Field(90, gt=0, le=10950)
     scopes: Optional[List[str]] = None  # 权限作用域（Permission 枚举值），None 表示不限
 
     @field_validator("scopes")
@@ -196,6 +203,27 @@ class APIKeyCreate(BaseModel):
         invalid = [s for s in v if s not in valid]
         if invalid:
             raise ValueError(f"Invalid scopes: {invalid}")
+        return v
+
+
+class APIKeyWebhookUpdate(BaseModel):
+    """Key 级 webhook 回调配置（敏感字段回传掩码表示不修改）"""
+
+    enabled: bool = False
+    url: str = Field("", max_length=2000)
+    secret: Optional[str] = Field(None, max_length=200)
+    auth_type: str = "none"
+    auth_token: Optional[str] = Field(None, max_length=500)
+    auth_username: Optional[str] = Field(None, max_length=200)
+    auth_password: Optional[str] = Field(None, max_length=200)
+    auth_header_name: Optional[str] = Field(None, max_length=100)
+    auth_header_value: Optional[str] = Field(None, max_length=500)
+
+    @field_validator("auth_type")
+    @classmethod
+    def validate_auth_type(cls, v: str) -> str:
+        if v not in ("none", "bearer", "basic", "api_key"):
+            raise ValueError(f"Invalid auth_type: {v}")
         return v
 
 
@@ -222,24 +250,3 @@ class SSOConfig(BaseModel):
     # SAML 特定配置
     saml_metadata_url: Optional[str] = None
     saml_entity_id: Optional[str] = None
-
-
-class APIKeyWebhookUpdate(BaseModel):
-    """Key 级 webhook 回调配置（敏感字段回传掩码表示不修改）"""
-
-    enabled: bool = False
-    url: str = Field("", max_length=2000)
-    secret: Optional[str] = Field(None, max_length=200)
-    auth_type: str = "none"
-    auth_token: Optional[str] = Field(None, max_length=500)
-    auth_username: Optional[str] = Field(None, max_length=200)
-    auth_password: Optional[str] = Field(None, max_length=200)
-    auth_header_name: Optional[str] = Field(None, max_length=100)
-    auth_header_value: Optional[str] = Field(None, max_length=500)
-
-    @field_validator("auth_type")
-    @classmethod
-    def validate_auth_type(cls, v: str) -> str:
-        if v not in ("none", "bearer", "basic", "api_key"):
-            raise ValueError(f"Invalid auth_type: {v}")
-        return v

@@ -1,6 +1,5 @@
 <template>
   <div class="space-y-6">
-    <KeyWebhookDialog v-if="webhookTarget" :key-id="webhookTarget.key_id" :key-name="webhookTarget.name" @close="webhookTarget = null" @saved="loadAPIKeys" />
     <!-- 标题和创建按钮 -->
     <div class="flex justify-between items-center">
       <h3 class="text-lg font-semibold text-gray-900">{{ $t('apiKey.title') }}</h3>
@@ -32,12 +31,18 @@
           <div class="flex-1">
             <div class="flex items-center gap-3">
               <h4 class="text-base font-medium text-gray-900">{{ key.name }}</h4>
-              <span v-if="key.webhook_enabled" class="text-xs text-primary-600">{{ $t('apiKey.webhookTitle') }}</span>
               <span
                 :class="isExpired(key.expires_at) ? 'bg-red-100 text-red-800' : 'bg-green-100 text-green-800'"
                 class="px-2 py-0.5 text-xs font-medium rounded"
               >
                 {{ isExpired(key.expires_at) ? $t('apiKey.expired') : $t('apiKey.valid') }}
+              </span>
+              <span
+                v-if="key.webhook_enabled"
+                class="px-2 py-0.5 text-xs font-medium rounded bg-indigo-100 text-indigo-700"
+                :title="key.webhook_url"
+              >
+                {{ $t('apiKey.webhookConfigured') }}
               </span>
             </div>
 
@@ -57,20 +62,34 @@
             </div>
           </div>
 
-          <button @click="webhookTarget = key" class="ml-4 p-2 text-primary-600 hover:bg-blue-50 rounded-lg" :title="$t('apiKey.webhookTitle')">
-            <Webhook class="w-4 h-4" />
-            <span class="sr-only">{{ $t('apiKey.webhookTitle') }}</span>
-          </button>
-          <button
-            @click="confirmDelete(key)"
-            class="ml-4 p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-            :title="$t('common.delete')"
-          >
-            <Trash2 class="w-4 h-4" />
-          </button>
+          <div class="ml-4 flex items-center gap-1">
+            <button
+              @click="webhookTarget = key"
+              class="p-2 text-gray-500 hover:bg-gray-100 hover:text-primary-600 rounded-lg transition-colors"
+              :title="$t('apiKey.webhookTitle')"
+            >
+              <Webhook class="w-4 h-4" />
+            </button>
+            <button
+              @click="confirmDelete(key)"
+              class="p-2 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+              :title="$t('common.delete')"
+            >
+              <Trash2 class="w-4 h-4" />
+            </button>
+          </div>
         </div>
       </div>
     </div>
+
+    <!-- Key 级 Webhook 回调配置对话框 -->
+    <KeyWebhookDialog
+      v-if="webhookTarget"
+      :key-id="webhookTarget.key_id"
+      :key-name="webhookTarget.name"
+      @close="webhookTarget = null"
+      @saved="loadAPIKeys"
+    />
 
     <!-- 创建 Token 对话框 -->
     <div
@@ -109,17 +128,10 @@
               <option :value="90">{{ $t('apiKey.days90') }}</option>
               <option :value="180">{{ $t('apiKey.days180') }}</option>
               <option :value="365">{{ $t('apiKey.days365') }}</option>
+              <option :value="10950">{{ $t('apiKey.years30') }}</option>
             </select>
           </div>
 
-          <div>
-            <label class="block text-sm font-medium text-gray-700 mb-1">{{ $t('apiKey.scopeLabel') }}</label>
-            <select v-model="scopePreset" class="w-full px-3 py-2 border border-gray-300 rounded-lg">
-              <option value="all">{{ $t('apiKey.scopeAll') }}</option>
-              <option value="read">{{ $t('apiKey.scopeRead') }}</option>
-              <option value="parse">{{ $t('apiKey.scopeParse') }}</option>
-            </select>
-          </div>
           <div class="flex gap-3 pt-4">
             <button
               type="submit"
@@ -202,14 +214,14 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
-import KeyWebhookDialog from './KeyWebhookDialog.vue'
-import { Webhook, Key, Calendar, Clock, Trash2, CheckCircle, Copy } from 'lucide-vue-next'
+import { Key, Calendar, Clock, Trash2, CheckCircle, Copy, Webhook } from 'lucide-vue-next'
 import * as authApi from '@/api/authApi'
 import type { APIKeyResponse } from '@/api/types'
 import { formatDate } from '@/utils/format'
 import { showToast } from '@/utils/toast'
 import LoadingSpinner from './LoadingSpinner.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
+import KeyWebhookDialog from './KeyWebhookDialog.vue'
 
 const { t } = useI18n()
 const loading = ref(false)
@@ -217,10 +229,9 @@ const creating = ref(false)
 const apiKeys = ref<any[]>([])
 const showCreateDialog = ref(false)
 const newToken = ref<string | null>(null)
-const webhookTarget = ref<any | null>(null)
 const deleteTarget = ref<any | null>(null)
+const webhookTarget = ref<any | null>(null)
 
-const scopePreset = ref('all')
 const createForm = ref({
   name: '',
   expires_days: 90,
@@ -253,13 +264,11 @@ async function handleCreate() {
     const response = await authApi.createAPIKey({
       name: createForm.value.name,
       expires_days: createForm.value.expires_days,
-      scopes: scopePreset.value === 'all' ? undefined : scopePreset.value === 'read' ? ['task:view:own'] : ['task:submit', 'task:view:own', 'task:delete:own', 'queue:view'],
     })
 
     newToken.value = response.api_key
     showCreateDialog.value = false
     createForm.value = { name: '', expires_days: 90 }
-    scopePreset.value = 'all'
 
     // 重新加载列表
     await loadAPIKeys()

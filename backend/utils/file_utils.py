@@ -8,13 +8,6 @@ from pathlib import Path
 
 # 平台支持的解析格式全集（文档/图片/音频/视频/生物格式），上传时按此白名单校验
 ALLOWED_UPLOAD_EXTENSIONS = {
-    ".gif",
-    ".ogg",
-    ".flv",
-    ".wmv",
-    ".odt",
-    ".ods",
-    ".odp",
     # 文档
     ".pdf",
     ".docx",
@@ -99,8 +92,6 @@ def sanitize_filename(name: str) -> str:
     # 去掉结尾点号与空格（Windows 会自动折叠，避免名实不符）
     basename = basename.rstrip(". ").strip()
 
-    if len(basename.encode("utf-8")) > 200:
-        raise FilenameValidationError("Filename too long")
     if not basename:
         raise FilenameValidationError("Filename is empty after sanitization")
 

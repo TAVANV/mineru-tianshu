@@ -1,38 +1,41 @@
 <template>
-  <div class="h-[calc(100vh-4rem)] flex flex-col">
+  <div class="h-[calc(100vh-4rem)] lg:h-[calc(100vh-5rem)] flex flex-col">
     <div class="flex items-center justify-between mb-4 px-1 flex-shrink-0">
       <div class="flex items-center gap-4">
         <button @click="$router.back()" class="text-sm text-gray-600 hover:text-gray-900 flex items-center transition-colors">
-          <ArrowLeft class="w-4 h-4 mr-1" /> {{ $t('legacyUi.extra0') }}
+          <ArrowLeft class="w-4 h-4 mr-1" /> {{ $t('common.back') }}
         </button>
         <div class="h-4 w-px bg-gray-300"></div>
-        <h1 class="text-xl font-bold text-gray-900 truncate max-w-md" :title="task?.file_name">{{ task?.file_name || uiText('legacyUi.text42') }}</h1>
+        <h1 class="text-xl font-bold text-gray-900 truncate max-w-md" :title="task?.file_name">{{ task?.file_name || $t('task.taskDetail') }}</h1>
         <StatusBadge v-if="task" :status="task.status" />
       </div>
 
       <div class="flex items-center gap-3">
         <template v-if="task">
-            <button v-if="['pending', 'processing', 'paused'].includes(task.status)" @click="initiateAction('cancel')" :disabled="actionLoading" class="btn btn-secondary btn-sm">{{ $t('task.cancelTask') }}</button>
+            <button v-if="['pending', 'processing', 'paused'].includes(task.status)" @click="initiateAction('cancel')" :disabled="actionLoading" class="btn btn-white text-gray-600 border-gray-200 hover:bg-red-50 hover:text-red-600 hover:border-red-200 btn-sm flex items-center shadow-sm transition-all disabled:opacity-50" :title="$t('task.cancelTaskTip')">
+              <XCircle :class="{'animate-pulse': actionLoading && currentAction === 'cancel'}" class="w-4 h-4 mr-1.5" />
+              <span>{{ $t('task.cancelTask') }}</span>
+            </button>
             <button v-if="task.status === 'failed'" @click="initiateAction('retry')" :disabled="actionLoading" class="btn btn-white text-blue-600 border-gray-200 hover:bg-blue-50 btn-sm flex items-center shadow-sm transition-all disabled:opacity-50">
               <RotateCw :class="{'animate-spin': actionLoading && currentAction === 'retry'}" class="w-4 h-4 mr-1.5" />
-              <span>{{ uiText('legacyUi.text32') }}</span>
+              <span>{{ $t('task.retryTask') }}</span>
             </button>
             <button v-if="['completed', 'failed'].includes(task.status) && task.result_path !== 'CLEARED'" @click="initiateAction('clearCache')" :disabled="actionLoading" class="btn btn-white text-orange-600 border-gray-200 hover:bg-orange-50 btn-sm flex items-center shadow-sm transition-all disabled:opacity-50">
               <Eraser :class="{'animate-pulse': actionLoading && currentAction === 'clearCache'}" class="w-4 h-4 mr-1.5" />
-              <span>{{ uiText('legacyUi.text33') }}</span>
+              <span>{{ $t('task.clearCache') }}</span>
             </button>
-            <button @click="initiateAction('delete')" :disabled="actionLoading" class="btn btn-white text-red-600 border-gray-200 hover:bg-red-50 btn-sm flex items-center shadow-sm transition-all disabled:opacity-50" :title="uiText('legacyUi.text35')">
+            <button @click="initiateAction('delete')" :disabled="actionLoading" class="btn btn-white text-red-600 border-gray-200 hover:bg-red-50 btn-sm flex items-center shadow-sm transition-all disabled:opacity-50" :title="$t('task.deletePermanentlyTip')">
               <Trash2 class="w-4 h-4 mr-1.5" />
-              <span class="hidden sm:inline">{{ uiText('legacyUi.text34') }}</span>
+              <span class="hidden sm:inline">{{ $t('task.deletePermanently') }}</span>
             </button>
         </template>
 
-        <div v-if="task?.status === 'completed' && (pdfUrl || imageUrl) && task?.result_path !== 'CLEARED'" class="flex items-center bg-gray-100 rounded-lg p-1">
+        <div v-if="task?.status === 'completed' && pdfUrl && task?.result_path !== 'CLEARED'" class="flex items-center bg-gray-100 rounded-lg p-1">
           <button @click="setMode('single')" :class="['px-3 py-1.5 text-xs font-medium rounded-md transition-all flex items-center', layoutMode === 'single' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700']">
-            <FileText class="w-3.5 h-3.5 mr-1.5" /> {{ $t('legacyUi.extra1') }}
+            <FileText class="w-3.5 h-3.5 mr-1.5" /> {{ $t('task.singleColumnView') }}
           </button>
           <button @click="setMode('split')" :class="['px-3 py-1.5 text-xs font-medium rounded-md transition-all flex items-center', layoutMode === 'split' ? 'bg-white text-primary-600 shadow-sm' : 'text-gray-500 hover:text-gray-700']">
-            <Columns class="w-3.5 h-3.5 mr-1.5" /> {{ $t('legacyUi.extra2') }}
+            <Columns class="w-3.5 h-3.5 mr-1.5" /> {{ $t('task.doubleColumnView') }}
           </button>
         </div>
 
@@ -40,30 +43,30 @@
       </div>
     </div>
 
-    <div v-if="loading && !task" class="flex-1 flex items-center justify-center"><LoadingSpinner size="lg" :text="uiText('legacyUi.text14')" /></div>
+    <div v-if="loading && !task" class="flex-1 flex items-center justify-center"><LoadingSpinner size="lg" :text="$t('common.loading')" /></div>
     <div v-else-if="error" class="card bg-red-50 border-red-200 mx-1 p-4 mb-4"><div class="flex items-center text-red-800"><AlertCircle class="w-6 h-6 mr-3" /> {{ error }}</div></div>
 
     <div v-else-if="task" class="flex-1 min-h-0 relative">
       <div v-if="['pending', 'processing', 'paused'].includes(task.status)" class="max-w-3xl mx-auto mt-16 space-y-6 px-4">
          <div class="card p-10 text-center shadow-sm">
-            <h2 class="text-xl font-semibold text-gray-900 mb-2">{{ uiText('legacyUi.text38') }}</h2>
-            <div class="mt-8 flex justify-center"><LoadingSpinner size="lg" /></div>
-            <div v-if="task.subtask_progress" class="mt-4 space-y-2 text-sm">
-              <p>{{ task.subtask_progress.completed }} / {{ task.subtask_progress.total }} ({{ task.subtask_progress.percentage }}%)</p>
-              <progress :value="task.subtask_progress.completed" :max="task.subtask_progress.total" class="w-full" />
-              <ul class="max-h-64 overflow-auto text-left divide-y">
-                <li v-for="child in task.subtasks" :key="child.task_id" class="py-2 flex justify-between gap-3">
-                  <span class="truncate">{{ child.file_name || child.task_id }}</span><StatusBadge :status="child.status" />
-                </li>
-              </ul>
+            <h2 class="text-xl font-semibold text-gray-900 mb-2">{{ $t('task.processing') }}</h2>
+            <div v-if="task.is_parent && task.subtask_progress" class="mt-6 max-w-md mx-auto">
+              <div class="flex justify-between text-sm text-gray-600 mb-2">
+                <span>{{ $t('task.subtaskProgress') }}</span>
+                <span>{{ task.subtask_progress.completed }}/{{ task.subtask_progress.total }} ({{ task.subtask_progress.percentage }}%)</span>
+              </div>
+              <div class="w-full bg-gray-200 rounded-full h-2">
+                <div class="bg-primary-600 h-2 rounded-full transition-all" :style="{ width: task.subtask_progress.percentage + '%' }"></div>
+              </div>
             </div>
+            <div class="mt-8 flex justify-center"><LoadingSpinner size="lg" /></div>
          </div>
       </div>
       <div v-else-if="['failed', 'cancelled'].includes(task.status)" class="max-w-3xl mx-auto mt-10 space-y-6 px-4">
          <div class="card p-8 text-center border-red-100 bg-red-50/50">
             <div class="flex justify-center mb-4"><div class="p-3 bg-red-100 rounded-full text-red-500"><AlertCircle class="w-8 h-8" /></div></div>
-            <h2 class="text-xl font-semibold text-red-700 mb-2">{{ task.status === 'cancelled' ? $t('task.cancelledLabel') : uiText('legacyUi.text41') }}</h2>
-            <div class="text-red-600 bg-white p-4 rounded-lg border border-red-200 font-mono text-sm text-left overflow-auto max-h-64 break-all shadow-sm">{{ task.status === 'cancelled' ? $t('task.cancelledHelp') : task.error_message || uiText('legacyUi.text45') }}</div>
+            <h2 class="text-xl font-semibold text-red-700 mb-2">{{ $t('task.taskFailed') }}</h2>
+            <div class="text-red-600 bg-white p-4 rounded-lg border border-red-200 font-mono text-sm text-left overflow-auto max-h-64 break-all shadow-sm">{{ task.error_message || $t('error.unknownError') }}</div>
          </div>
       </div>
 
@@ -71,33 +74,41 @@
 
         <div v-if="showPdf" :class="['card p-0 flex flex-col h-full border border-gray-200 relative shadow-sm min-w-0 transition-all duration-300', layoutMode === 'split' ? 'flex-1 basis-1/2' : 'flex-1 basis-full']">
           <div class="bg-gray-50 px-3 py-2 border-b border-gray-200 flex justify-between items-center shrink-0">
-            <span class="text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ imageUrl ? uiText('legacyUi.text46') : uiText('legacyUi.text47') }}</span>
+            <span class="text-xs font-semibold text-gray-500 uppercase tracking-wider">{{ isImageSource ? $t('task.sourceImagePreview') : $t('task.sourceDocPreviewInteractive') }}</span>
           </div>
 
-          <div class="flex-1 relative overflow-auto min-h-0 bg-gray-200">
-            <img v-if="imageUrl" :src="imageUrl" :alt="task.file_name" referrerpolicy="no-referrer" class="max-w-full h-auto mx-auto" />
+          <div class="flex-1 relative overflow-hidden min-h-0 bg-gray-200">
             <VirtualPdfViewer
-              v-if="!imageUrl && pdfUrl"
+              v-if="!isImageSource"
               ref="pdfViewerRef"
               :src="pdfUrl"
               :layout-data="layoutData"
               @block-click="handlePdfBlockClick"
             />
+            <div v-else class="h-full w-full overflow-auto flex items-start justify-center p-4">
+              <img
+                v-if="sourceImageUrl"
+                :src="sourceImageUrl"
+                :alt="task?.file_name"
+                class="max-w-full h-auto shadow-md bg-white"
+              />
+              <div v-else class="text-sm text-gray-400 mt-10">{{ $t('task.sourceFileUnavailable') }}</div>
+            </div>
           </div>
         </div>
 
         <div v-if="showMarkdown" :class="['card p-0 flex flex-col h-full shadow-sm border border-gray-200 min-w-0 transition-all duration-300', layoutMode === 'split' ? 'flex-1 basis-1/2' : 'flex-1 basis-full']">
           <div class="bg-gray-50 px-3 py-2 border-b border-gray-200 flex justify-between items-center shrink-0">
             <div class="flex items-center bg-gray-200 rounded p-0.5">
-              <button @click="activeTab = 'markdown'" :class="['tab-btn', activeTab==='markdown' ? 'active' : '']">{{ uiText('legacyUi.text39') }}</button>
+              <button @click="activeTab = 'markdown'" :class="['tab-btn', activeTab==='markdown' ? 'active' : '']">{{ $t('task.fullDocument') }}</button>
               <button @click="activeTab = 'sync'" :class="['tab-btn flex items-center gap-1', activeTab==='sync' ? 'active' : '']">
-                {{ $t('legacyUi.extra3') }}
+                {{ $t('task.twoWaySync') }}
                 <span v-if="activeBlockId" class="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
               </button>
               <button @click="activeTab = 'json'" :class="['tab-btn', activeTab==='json' ? 'active' : '']">JSON</button>
             </div>
             <button @click="downloadMarkdown" class="text-xs text-primary-600 hover:underline flex items-center">
-              <Download class="w-3 h-3 mr-1"/> {{ $t('legacyUi.extra4') }}
+              <Download class="w-3 h-3 mr-1"/> {{ $t('task.downloadFile') }}
             </button>
           </div>
 
@@ -113,7 +124,7 @@
             <div v-else-if="activeTab === 'sync'" class="w-full max-w-[800px] mx-auto">
               <div v-if="layoutData.length > 0" class="flex flex-col gap-3">
                 <div class="text-xs text-gray-500 bg-blue-50 p-2.5 rounded-lg mb-3 border border-blue-100">
-                  {{ $t('legacyUi.extra8') }}
+                  {{ $t('task.syncViewHint') }}
                 </div>
 
                 <div
@@ -125,10 +136,10 @@
                            activeBlockId === block.id
                              ? 'bg-yellow-50 border-yellow-400 shadow-sm ring-2 ring-yellow-200'
                              : 'bg-white border-gray-100 hover:bg-gray-50 hover:border-gray-300']"
-                  :title="uiText('legacyUi.text48')"
+                  :title="$t('task.clickToLocateInPdf')"
                 >
-                  <div v-if="block.type === 'image'" class="text-blue-500 text-xs font-semibold mb-1 flex items-center gap-1 select-none"><Image class="w-3.5 h-3.5"/> {{ uiText('legacyUi.text36') }}</div>
-                  <div v-else-if="block.type === 'table'" class="text-green-500 text-xs font-semibold mb-1 flex items-center gap-1 select-none"><Table class="w-3.5 h-3.5"/> {{ uiText('legacyUi.text37') }}</div>
+                  <div v-if="block.type === 'image'" class="text-blue-500 text-xs font-semibold mb-1 flex items-center gap-1 select-none"><Image class="w-3.5 h-3.5"/> {{ $t('task.extractedImage') }}</div>
+                  <div v-else-if="block.type === 'table'" class="text-green-500 text-xs font-semibold mb-1 flex items-center gap-1 select-none"><Table class="w-3.5 h-3.5"/> {{ $t('task.extractedTable') }}</div>
                   <div v-else-if="block.type === 'doc_title'" class="text-lg font-bold text-gray-900 mb-1 border-b pb-1">{{ block.text }}</div>
 
                   <div v-if="block.type === 'table'" class="w-full overflow-x-auto mt-2 markdown-table-override">
@@ -137,7 +148,7 @@
                   <div v-else-if="block.type !== 'doc_title'" class="whitespace-pre-wrap font-mono text-gray-600">{{ block.text }}</div>
                 </div>
               </div>
-              <div v-else class="text-gray-500 text-sm italic text-center mt-10">{{ uiText('legacyUi.text40') }}</div>
+              <div v-else class="text-gray-500 text-sm italic text-center mt-10">{{ $t('task.noLayoutData') }}</div>
             </div>
 
             <div v-else class="h-full w-full flex-1 flex min-h-0">
@@ -151,18 +162,44 @@
     </div>
 
     <ConfirmDialog v-model="showConfirm" :title="confirmTitle" :message="confirmMessage" :type="confirmType" @confirm="executeAction" />
+
+    <!-- 重试对话框：允许修正加密文档的打开密码（留空沿用原密码） -->
+    <Teleport to="body">
+      <div v-if="showRetryDialog" class="fixed inset-0 z-50 overflow-y-auto">
+        <div class="fixed inset-0 bg-black bg-opacity-50 transition-opacity" @click="showRetryDialog = false"></div>
+        <div class="flex min-h-screen items-center justify-center p-4">
+          <div class="relative bg-white rounded-lg shadow-xl max-w-md w-full p-6">
+            <h3 class="text-lg font-semibold text-gray-900 mb-4">{{ t('task.retryTask') }}</h3>
+            <p class="text-sm text-gray-600 mb-4">{{ t('task.confirmRetry') }}</p>
+            <label class="block text-xs font-bold text-gray-600 uppercase tracking-wide mb-2">{{ t('task.newPasswordLabel') }}</label>
+            <input
+              v-model="retryPassword"
+              type="password"
+              class="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              :placeholder="$t('task.newPasswordHint')"
+            />
+            <p class="mt-1 text-[10px] text-gray-400">{{ t('task.newPasswordNote') }}</p>
+            <div class="flex justify-end gap-3 mt-6">
+              <button @click="showRetryDialog = false" class="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">
+                {{ t('common.cancel') }}
+              </button>
+              <button @click="confirmRetry" class="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700">
+                {{ t('common.confirm') }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
 <script setup lang="ts">
-import { useI18n as useUiI18n } from 'vue-i18n'
-const { t: uiText } = useUiI18n()
-import { authenticatedFileUrl } from '@/api/fileUrl'
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { useTaskStore } from '@/stores'
-import { ArrowLeft, AlertCircle, RefreshCw, FileText, Columns, Download, RotateCw, Eraser, Pause, Image, Table, Trash2 } from 'lucide-vue-next'
+import { useTaskStore, useAuthStore } from '@/stores'
+import { ArrowLeft, AlertCircle, RefreshCw, FileText, Columns, Download, RotateCw, Eraser, Pause, Image, Table, Trash2, XCircle } from 'lucide-vue-next'
 import StatusBadge from '@/components/StatusBadge.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import MarkdownViewer from '@/components/MarkdownViewer.vue'
@@ -174,6 +211,7 @@ const { t } = useI18n()
 const router = useRouter()
 const route = useRoute()
 const taskStore = useTaskStore()
+const authStore = useAuthStore()
 
 const taskId = computed(() => route.params.id as string)
 const task = computed(() => taskStore.currentTask)
@@ -187,11 +225,24 @@ const layoutMode = ref<'split' | 'single'>('split')
 const activeBlockId = ref<string | number | null>(null)
 const pdfViewerRef = ref<InstanceType<typeof VirtualPdfViewer> | null>(null)
 
-const pdfUrl = computed(() => task.value?.data?.pdf_path ? authenticatedFileUrl(`/api/v1/files/output/${task.value.data.pdf_path}`) : null)
-const imageUrl = computed(() => /\.(png|jpe?g|gif|webp|bmp|tiff?)$/i.test(task.value?.file_name || '')
-  ? (task.value?.source_url ? authenticatedFileUrl(task.value.source_url) : null) : null)
-const showPdf = computed(() => Boolean(imageUrl.value || pdfUrl.value))
-const showMarkdown = computed(() => layoutMode.value === 'split' || !showPdf.value)
+const pdfUrl = computed(() => task.value?.data?.pdf_path ? `/api/v1/files/output/${task.value.data.pdf_path}` : null)
+
+// 图片源文件不产出 PDF，左栏改为直接预览原图
+const IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp', '.gif']
+const isImageSource = computed(() => {
+  const name = task.value?.file_name?.toLowerCase() || ''
+  return IMAGE_EXTS.some(ext => name.endsWith(ext))
+})
+const sourceImageUrl = computed(() => {
+  const url = task.value?.source_url
+  if (!isImageSource.value || !url) return null
+  // 文件服务接口需要鉴权，<img> 无法携带请求头，追加 token 查询参数
+  const token = authStore.token
+  return token ? `${url}?token=${encodeURIComponent(token)}` : url
+})
+
+const showPdf = computed(() => layoutMode.value === 'split' || (layoutMode.value === 'single' && (pdfUrl.value || sourceImageUrl.value)))
+const showMarkdown = computed(() => layoutMode.value === 'split' || layoutMode.value !== 'single')
 
 const layoutData = computed(() => {
   const jsonContent = task.value?.data?.json_content
@@ -337,33 +388,43 @@ const confirmTitle = ref('')
 const confirmMessage = ref('')
 const confirmType = ref<'info' | 'warning' | 'danger'>('info')
 const currentAction = ref<'retry' | 'clearCache' | 'delete' | 'cancel' | null>(null)
+const showRetryDialog = ref(false)
+const retryPassword = ref('')
 
 function initiateAction(action: 'retry' | 'clearCache' | 'delete' | 'cancel') {
   currentAction.value = action
-  if (action === 'cancel') {
-    confirmTitle.value = t('task.cancelTask'); confirmMessage.value = t('task.cancelGroupConfirm'); confirmType.value = 'warning'
-  } else if (action === 'retry') {
-    confirmTitle.value = uiText('legacyUi.text32'); confirmMessage.value = uiText('legacyUi.text50'); confirmType.value = 'info'
+  if (action === 'retry') {
+    retryPassword.value = ''
+    showRetryDialog.value = true
+    return
   } else if (action === 'clearCache') {
-    confirmTitle.value = uiText('legacyUi.text33'); confirmMessage.value = uiText('legacyUi.text49'); confirmType.value = 'warning'
+    confirmTitle.value = t('task.clearCache'); confirmMessage.value = t('task.confirmClearCache'); confirmType.value = 'warning'
   } else if (action === 'delete') {
-    confirmTitle.value = uiText('legacyUi.text43'); confirmMessage.value = uiText('legacyUi.text44'); confirmType.value = 'danger'
+    confirmTitle.value = t('task.deleteTask'); confirmMessage.value = t('task.confirmDeletePermanent'); confirmType.value = 'danger'
+  } else if (action === 'cancel') {
+    confirmTitle.value = t('task.cancelTask'); confirmMessage.value = t('task.cancelTaskConfirm'); confirmType.value = 'warning'
   }
   showConfirm.value = true
+}
+
+async function confirmRetry() {
+  showRetryDialog.value = false
+  currentAction.value = 'retry'
+  await executeAction()
 }
 
 async function executeAction() {
   if (!currentAction.value) return
   actionLoading.value = true
   try {
-    if (currentAction.value === 'cancel') {
-      await taskStore.cancelTask(taskId.value); await refreshTask();
-    } else if (currentAction.value === 'retry') {
-      await taskStore.retryTask(taskId.value); await refreshTask(); startPolling();
+    if (currentAction.value === 'retry') {
+      await taskStore.retryTask(taskId.value, retryPassword.value || undefined); await refreshTask(); startPolling();
     } else if (currentAction.value === 'clearCache') {
       await taskStore.clearTaskCache(taskId.value); await refreshTask();
     } else if (currentAction.value === 'delete') {
       await taskStore.deleteTask(taskId.value); router.back();
+    } else if (currentAction.value === 'cancel') {
+      await taskStore.cancelTask(taskId.value); await refreshTask();
     }
   } catch (err: any) { error.value = err.message || 'Action failed' }
   finally { actionLoading.value = false; currentAction.value = null }

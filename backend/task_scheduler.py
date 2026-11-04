@@ -127,6 +127,7 @@ class TaskScheduler:
         health_check_counter = 0
         stale_task_counter = 0
         cleanup_counter = 0
+        webhook_counter = 0
 
         async with aiohttp.ClientSession() as session:
             while self.running:
@@ -163,37 +164,40 @@ class TaskScheduler:
                     if stale_task_counter * self.monitor_interval >= self.stale_task_timeout * 60:
                         stale_task_counter = 0
                         try:
-                            reset_count = self.db.reset_stale_tasks(self.stale_task_timeout)
-                            if reset_count > 0:
+                            from stale_tasks import handle_stale_tasks
+
+                            result = handle_stale_tasks(self.db, self.stale_task_timeout)
+                            if result["reset_count"] > 0 or result["failed_count"] > 0:
                                 logger.warning(
-                                    f"⚠️  Reset {reset_count} stale tasks (timeout: {self.stale_task_timeout}m)"
+                                    f"⚠️  Stale tasks (timeout: {self.stale_task_timeout}m, "
+                                    f"max retries: {result['max_retries']}): "
+                                    f"{result['reset_count']} reset, {result['failed_count']} failed"
                                 )
-                            # 父任务兜底回收（超时阈值取 stale 的 4 倍，父任务生命周期更长）
-                            reaped = self.db.reap_stale_parent_tasks(self.stale_task_timeout * 4)
-                            if reaped > 0:
-                                logger.warning(f"🩺 Reaped {reaped} stale parent task(s)")
                         except Exception as e:
                             logger.error(f"Failed to reset stale tasks: {e}")
 
-                    # SQLite 为准，补回 Redis 重启或入队失败遗漏的任务。
+                    # 3.5 对账 Redis 队列与 SQLite
+                    # Redis 掉数据、入队失败、或 worker 在认领途中被杀，都会让队列少掉
+                    # 本该在的任务。它们不会丢（SQLite 抢锁路径兜底），但会绕开 Redis，
+                    # 退化成锁竞争。每轮补一次差集，无差异时无任何写操作。
                     try:
-                        resynced = await asyncio.to_thread(self.db.sync_pending_to_redis)
+                        resynced = self.db.sync_pending_to_redis()
                         if resynced:
-                            logger.warning(f"🔄 Re-enqueued {resynced} pending task(s) into Redis")
+                            logger.warning(f"🔄 Re-enqueued {resynced} pending task(s) into the Redis queue")
                     except Exception as e:
                         logger.error(f"Failed to resync Redis queue: {e}")
 
-                    # Notifications run independently so a slow receiver cannot stall recovery/heartbeats.
-                    if not hasattr(self, "_webhook_dispatch") or self._webhook_dispatch.done():
-                        from webhooks import dispatch
+                    # 3.6 Webhook 到期投递：约每 30 秒扫一次 pending 队列，
+                    # 单条失败仅影响该 delivery，不能拖垮调度器主循环
+                    webhook_counter += 1
+                    if webhook_counter * self.monitor_interval >= 30:
+                        webhook_counter = 0
+                        try:
+                            from webhook.dispatcher import process_pending_deliveries
 
-                        async def deliver():
-                            try:
-                                await asyncio.to_thread(dispatch, self.db)
-                            except Exception as e:
-                                logger.warning(f"Webhook dispatch deferred: {type(e).__name__}")
-
-                        self._webhook_dispatch = asyncio.create_task(deliver())
+                            await asyncio.to_thread(process_pending_deliveries)
+                        except Exception as e:
+                            logger.error(f"Failed to process webhook deliveries: {e}")
 
                     # 4. 定期清理旧任务文件
                     cleanup_counter += 1
@@ -201,14 +205,6 @@ class TaskScheduler:
                     cleanup_interval_cycles = (24 * 3600) / max(1, self.monitor_interval)
                     if cleanup_counter >= cleanup_interval_cycles:
                         cleanup_counter = 0
-                        try:
-                            from auth.audit import cleanup_expired_audit_logs
-                            from feature_config import load_config
-
-                            retention = int(load_config(self.db.db_path)["audit_retention_days"])
-                            await asyncio.to_thread(cleanup_expired_audit_logs, retention)
-                        except Exception as e:
-                            logger.warning(f"Audit cleanup deferred: {type(e).__name__}")
                         if self.cleanup_old_files_days > 0:
                             try:
                                 logger.info(f"🧹 Cleaning up tasks older than {self.cleanup_old_files_days} days...")
@@ -217,6 +213,19 @@ class TaskScheduler:
                                     logger.info(f"✅ Cleaned up {record_count} old tasks")
                             except Exception as e:
                                 logger.error(f"Failed to cleanup old tasks: {e}")
+
+                        # 过期审计日志清理（保留期走 system_config 的 audit_retention_days，读取端默认 90 天）
+                        try:
+                            from auth.system_config import SystemConfig
+                            from auth.audit import cleanup_expired_audit_logs
+
+                            raw_retention = SystemConfig().get_config("audit_retention_days")
+                            retention_days = int(raw_retention) if raw_retention else 90
+                            deleted_logs = cleanup_expired_audit_logs(retention_days)
+                            if deleted_logs > 0:
+                                logger.info(f"🧹 Cleaned up {deleted_logs} audit logs older than {retention_days} days")
+                        except Exception as e:
+                            logger.error(f"Failed to cleanup expired audit logs: {e}")
 
                     # 等待下一次监控
                     await asyncio.sleep(self.monitor_interval)

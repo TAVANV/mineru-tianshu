@@ -5,15 +5,17 @@ MinerU Tianshu - Authentication Routes
 提供用户注册、登录、API Key 管理、SSO 等接口
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status, Request, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, status, Request, UploadFile, File
 from fastapi.responses import RedirectResponse
 from typing import List
-from datetime import timedelta, datetime
+from datetime import datetime, timedelta
 from loguru import logger
 
 from .models import (
     User,
+    RegisterRequest,
     UserCreate,
+    UserRole,
     UserUpdate,
     UserLogin,
     PasswordChange,
@@ -24,49 +26,85 @@ from .models import (
     Permission,
 )
 from .auth_db import AuthDB
-from .jwt_handler import create_access_token, JWT_EXPIRE_MINUTES, decode_token_payload
+from .jwt_handler import create_access_token, decode_token_payload, JWT_EXPIRE_MINUTES
 from .dependencies import (
     get_auth_db,
     get_current_active_user,
     require_permission,
+    require_role,
 )
 from .sso import get_sso_config, create_sso_provider, OIDC_AVAILABLE
 from .system_config import SystemConfig
+from .audit import record_audit
 from storage.rustfs_client import get_rustfs_client
-
-from .models import RegisterRequest, UserRole
-import hmac
 
 # 创建路由
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
 
 
 @router.post("/register", response_model=User, status_code=status.HTTP_201_CREATED)
-def register(user_data: RegisterRequest, request: Request, auth_db: AuthDB = Depends(get_auth_db)):
+async def register(user_data: RegisterRequest, request: Request, auth_db: AuthDB = Depends(get_auth_db)):
     """
     用户注册
 
-    创建新用户账户。默认角色为 'user'，需要管理员才能创建其他角色。
+    创建新用户账户。角色恒为 'user'，需要管理员才能创建其他角色。
     """
-    config = SystemConfig(auth_db.db_path)
-    if config.get_config("allow_registration") == "false":
-        raise HTTPException(status_code=403, detail="Registration is disabled")
-    required = (config.get_config("registration_invite_code") or "").strip()
-    if required and not hmac.compare_digest((user_data.invite_code or "").strip().encode(), required.encode()):
-        raise HTTPException(status_code=403, detail="Invalid invite code")
+    # 注册开关 fail-closed：配置缺失或读取失败一律拒绝注册
     try:
-        values = user_data.model_dump(exclude={"invite_code"})
-        values["role"] = UserRole.USER
-        user = auth_db.create_user(UserCreate(**values))
-        request.state.audit_user = user
+        allow_registration = SystemConfig().get_config("allow_registration")
+    except Exception as e:
+        logger.error(f"❌ Failed to read allow_registration config: {e}")
+        allow_registration = None
+
+    if allow_registration != "true":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Registration is disabled")
+
+    # 邀请码校验：管理员配置后注册必须携带，比对用常量时间比较防止时序侧信道
+    try:
+        required_invite_code = (SystemConfig().get_config("registration_invite_code") or "").strip()
+    except Exception as e:
+        logger.error(f"❌ Failed to read registration_invite_code config: {e}")
+        required_invite_code = ""
+
+    if required_invite_code:
+        import hmac
+
+        provided = (user_data.invite_code or "").strip()
+        if not provided or not hmac.compare_digest(provided, required_invite_code):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid invite code")
+
+    try:
+        # 公开注册入口不允许指定角色，固定为普通用户
+        user = auth_db.create_user(
+            UserCreate(
+                username=user_data.username,
+                email=user_data.email,
+                password=user_data.password,
+                full_name=user_data.full_name,
+                role=UserRole.USER,
+            )
+        )
         logger.info(f"✅ User registered: {user.username} ({user.email})")
+        record_audit("auth.register", user=user, request=request, resource_type="user", resource_id=user.user_id)
         return user
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        # 不回显具体冲突字段，防止账号枚举
+        logger.warning(f"⚠️ Registration failed for username '{user_data.username}': {e}")
+        record_audit(
+            "auth.register",
+            request=request,
+            resource_type="user",
+            detail={"username": user_data.username},
+            result="failure",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Registration failed, please try different credentials",
+        )
 
 
 @router.post("/login", response_model=Token)
-def login(credentials: UserLogin, request: Request, auth_db: AuthDB = Depends(get_auth_db)):
+async def login(credentials: UserLogin, request: Request, auth_db: AuthDB = Depends(get_auth_db)):
     """
     用户登录
 
@@ -75,6 +113,14 @@ def login(credentials: UserLogin, request: Request, auth_db: AuthDB = Depends(ge
     user = auth_db.authenticate_user(credentials.username, credentials.password)
 
     if not user:
+        # 只记用户名，绝不记密码
+        record_audit(
+            "auth.login_failed",
+            request=request,
+            resource_type="user",
+            detail={"username": credentials.username},
+            result="failure",
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
@@ -82,38 +128,54 @@ def login(credentials: UserLogin, request: Request, auth_db: AuthDB = Depends(ge
         )
 
     if not user.is_active:
+        record_audit(
+            "auth.login_failed",
+            request=request,
+            resource_type="user",
+            detail={"username": credentials.username, "reason": "account_disabled"},
+            result="denied",
+        )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled")
-
-    # 生成 JWT Token
+    # 生成 JWT Token（携带当前令牌代次，改密后旧令牌失效）
     access_token = create_access_token(
         user_id=user.user_id,
         username=user.username,
         role=user.role,
-        epoch=user.token_epoch,
         expires_delta=timedelta(minutes=JWT_EXPIRE_MINUTES),
+        epoch=auth_db.get_token_epoch(user.user_id),
     )
 
-    request.state.audit_user = user
     logger.info(f"✅ User logged in: {user.username}")
+    record_audit("auth.login", user=user, request=request, resource_type="user", resource_id=user.user_id)
 
     return Token(access_token=access_token, token_type="bearer", expires_in=JWT_EXPIRE_MINUTES * 60)
 
 
 @router.post("/logout")
-def logout(
-    request: Request, current_user: User = Depends(get_current_active_user), auth_db: AuthDB = Depends(get_auth_db)
+async def logout(
+    request: Request,
+    current_user: User = Depends(get_current_active_user),
+    auth_db: AuthDB = Depends(get_auth_db),
 ):
-    authorization = request.headers.get("Authorization", "")
-    if authorization.lower().startswith("bearer "):
-        payload = decode_token_payload(authorization[7:])
-        if payload and payload.get("jti"):
-            auth_db.revoke_token(payload["jti"], current_user.user_id, datetime.utcfromtimestamp(payload["exp"]))
-        elif payload:
-            # Historical JWTs have no jti: invalidate the user's pre-migration sessions.
-            with auth_db.get_cursor() as cursor:
-                cursor.execute(
-                    "UPDATE users SET token_epoch = token_epoch + 1 WHERE user_id = ?", (current_user.user_id,)
-                )
+    """
+    用户登出
+
+    将当前 JWT 写入吊销表，Token 到期前无法再使用。API Key 认证用户无 JWT 可吊销，直接返回成功。
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[len("Bearer ") :]
+        payload = decode_token_payload(token)
+        if payload:
+            jti = payload.get("jti")
+            exp = payload.get("exp")
+            if jti and exp:
+                auth_db.revoke_token(jti, current_user.user_id, datetime.utcfromtimestamp(exp))
+                logger.info(f"✅ Token revoked on logout: {current_user.username} (jti: {jti[:8]}...)")
+
+    record_audit(
+        "auth.logout", user=current_user, request=request, resource_type="user", resource_id=current_user.user_id
+    )
     return {"success": True}
 
 
@@ -138,8 +200,6 @@ async def update_current_user(
 
     用户可以更新自己的邮箱和全名，不能更新角色。
     """
-    if current_user.api_key_scopes is not None:
-        raise HTTPException(status_code=403, detail="Use a login session to update account details")
     # 用户不能更改自己的角色
     if user_update.role is not None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot change your own role")
@@ -162,6 +222,7 @@ async def update_current_user(
 @router.post("/me/change-password")
 async def change_password(
     password_data: PasswordChange,
+    request: Request,
     current_user: User = Depends(get_current_active_user),
     auth_db: AuthDB = Depends(get_auth_db),
 ):
@@ -170,8 +231,6 @@ async def change_password(
 
     用户需要提供旧密码和新密码。SSO 用户不能修改密码。
     """
-    if current_user.api_key_scopes is not None:
-        raise HTTPException(status_code=403, detail="Use a login session to change password")
     try:
         success = auth_db.change_password(
             current_user.user_id,
@@ -181,11 +240,26 @@ async def change_password(
 
         if success:
             logger.info(f"✅ Password changed: {current_user.username}")
+            record_audit(
+                "auth.change_password",
+                user=current_user,
+                request=request,
+                resource_type="user",
+                resource_id=current_user.user_id,
+            )
             return {"success": True, "message": "Password changed successfully"}
         else:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Failed to change password")
 
     except ValueError as e:
+        record_audit(
+            "auth.change_password",
+            user=current_user,
+            request=request,
+            resource_type="user",
+            resource_id=current_user.user_id,
+            result="failure",
+        )
         error_message = str(e)
         if "Incorrect old password" in error_message:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Incorrect old password")
@@ -201,6 +275,7 @@ async def change_password(
 @router.post("/apikeys", response_model=APIKeyResponse, status_code=status.HTTP_201_CREATED)
 async def create_api_key(
     key_data: APIKeyCreate,
+    request: Request,
     current_user: User = Depends(require_permission(Permission.APIKEY_CREATE)),
     auth_db: AuthDB = Depends(get_auth_db),
 ):
@@ -209,9 +284,6 @@ async def create_api_key(
 
     为当前用户创建一个新的 API Key。API Key 只会在创建时返回一次，请妥善保管。
     """
-    if current_user.api_key_scopes is not None:
-        if key_data.scopes is None or not set(key_data.scopes).issubset(current_user.api_key_scopes):
-            raise HTTPException(status_code=403, detail="Child key scopes must not exceed caller scopes")
     key_info = auth_db.create_api_key(
         user_id=current_user.user_id,
         name=key_data.name,
@@ -220,6 +292,16 @@ async def create_api_key(
     )
 
     logger.info(f"✅ API Key created: {key_info['prefix']}... for user {current_user.username}")
+
+    # 只记 key 名称与权限范围，绝不记 key 本体
+    record_audit(
+        "api_key.create",
+        user=current_user,
+        request=request,
+        resource_type="api_key",
+        resource_id=key_info["key_id"],
+        detail={"name": key_data.name, "scopes": key_data.scopes},
+    )
 
     return APIKeyResponse(
         key_id=key_info["key_id"],
@@ -248,6 +330,7 @@ async def list_api_keys(
 @router.delete("/apikeys/{key_id}")
 async def delete_api_key(
     key_id: str,
+    request: Request,
     current_user: User = Depends(require_permission(Permission.APIKEY_DELETE)),
     auth_db: AuthDB = Depends(get_auth_db),
 ):
@@ -262,6 +345,13 @@ async def delete_api_key(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="API Key not found")
 
     logger.info(f"✅ API Key deleted: {key_id} by user {current_user.username}")
+    record_audit(
+        "api_key.delete",
+        user=current_user,
+        request=request,
+        resource_type="api_key",
+        resource_id=key_id,
+    )
     return {"success": True, "message": "API Key deleted successfully"}
 
 
@@ -292,18 +382,14 @@ def _serialize_key_webhook(row: dict) -> dict:
 
 def _get_key_webhook_row(auth_db: AuthDB, key_id: str, current_user: User) -> dict:
     """读取 Key 配置行并校验归属：非所有者且非管理员一律 404，不暴露 Key 存在性"""
-    if current_user.api_key_scopes is not None:
-        raise HTTPException(status_code=403, detail="Use a login session to configure callbacks")
     row = auth_db.get_api_key_webhook(key_id)
-    if not row or (
-        row["user_id"] != current_user.user_id and not current_user.has_permission(Permission.APIKEY_LIST_ALL)
-    ):
+    if not row or (row["user_id"] != current_user.user_id and not current_user.has_role(UserRole.ADMIN)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="API Key not found")
     return row
 
 
 @router.get("/apikeys/{key_id}/webhook")
-def get_api_key_webhook(
+async def get_api_key_webhook(
     key_id: str,
     current_user: User = Depends(require_permission(Permission.APIKEY_LIST_OWN)),
     auth_db: AuthDB = Depends(get_auth_db),
@@ -319,7 +405,7 @@ def get_api_key_webhook(
 
 
 @router.put("/apikeys/{key_id}/webhook")
-def update_api_key_webhook(
+async def update_api_key_webhook(
     key_id: str,
     body: APIKeyWebhookUpdate,
     request: Request,
@@ -353,23 +439,24 @@ def update_api_key_webhook(
         "webhook_auth_header_value": resolve(body.auth_header_value, row.get("webhook_auth_header_value")),
     }
 
-    from webhooks import validate_key_webhook
-
-    try:
-        validate_key_webhook(config, auth_db.db_path)
-    except (ValueError, OSError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid callback URL or authentication configuration") from exc
     # 管理员可改任意 Key，普通用户限定自己的 Key
-    owner_scope = None if current_user.has_permission(Permission.APIKEY_LIST_ALL) else current_user.user_id
+    owner_scope = None if current_user.has_role(UserRole.ADMIN) else current_user.user_id
     auth_db.update_api_key_webhook(key_id, config, user_id=owner_scope)
 
     logger.info(f"✅ API Key webhook updated: {key_id} by user {current_user.username} (enabled={body.enabled})")
-    request.state.audit_detail = {"key_id": key_id, "enabled": body.enabled}
+    record_audit(
+        "api_key.webhook_update",
+        user=current_user,
+        request=request,
+        resource_type="api_key",
+        resource_id=key_id,
+        detail={"enabled": body.enabled, "url": url},
+    )
     return {"success": True, "webhook": _serialize_key_webhook(auth_db.get_api_key_webhook(key_id))}
 
 
 @router.post("/apikeys/{key_id}/webhook/test")
-def test_api_key_webhook(
+async def test_api_key_webhook(
     key_id: str,
     current_user: User = Depends(require_permission(Permission.APIKEY_CREATE)),
     auth_db: AuthDB = Depends(get_auth_db),
@@ -379,31 +466,53 @@ def test_api_key_webhook(
 
     不走投递队列表，同步投递并返回结果；目标 URL 同样过 SSRF 校验。
     """
-    import json
+    import asyncio
     import uuid
-    from webhooks import key_subscription, send
-    from feature_config import load_config
+    from datetime import datetime, timezone
 
-    row = _get_key_webhook_row(auth_db, key_id, current_user)
-    config = key_subscription(row, load_config(auth_db.db_path))
-    if not config or not config["url"]:
-        raise HTTPException(400, "Enable and save a callback first")
-    event_id = uuid.uuid4().hex
+    from webhook.config import get_webhook_config
+    from webhook.delivery import get_key_webhook, post_webhook, validate_webhook_url
+
+    _get_key_webhook_row(auth_db, key_id, current_user)
+    key_cfg = get_key_webhook(key_id)
+    if not key_cfg or not key_cfg["url"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Webhook URL 未配置，请先保存")
+
     try:
-        status_code = send(
-            config,
-            json.dumps({"event_id": event_id, "status": "test"}).encode(),
-            event_id,
-            load_config(auth_db.db_path)["webhook_allowed_hosts"],
-        )
-    except Exception:
-        raise HTTPException(400, "Callback failed; check endpoint, allowlist and credentials")
-    return {"success": True, "status_code": status_code}
+        validate_webhook_url(key_cfg["url"])
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Webhook URL 不合法: {e}")
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    payload = {
+        "event": "webhook.test",
+        "task_id": None,
+        "file_name": None,
+        "status": "test",
+        "error_message": None,
+        "created_at": now,
+        "completed_at": now,
+        "result_url": None,
+        "delivery_id": uuid.uuid4().hex,
+    }
+
+    timeout = get_webhook_config()["timeout"]
+
+    def _deliver():
+        try:
+            code = post_webhook(key_cfg["url"], payload, secret=key_cfg["secret"], timeout=timeout, auth=key_cfg)
+            return {"success": 200 <= code < 300, "status_code": code}
+        except Exception as e:
+            return {"success": False, "error": f"{type(e).__name__}: {e}"}
+
+    result = await asyncio.to_thread(_deliver)
+    logger.info(f"🔍 API Key webhook test by {current_user.username} (key {key_id}): {result}")
+    return result
 
 
 @router.get("/admin/apikeys")
-def list_all_api_keys(
-    current_user: User = Depends(require_permission(Permission.APIKEY_LIST_ALL)),
+async def list_all_api_keys(
+    current_user: User = Depends(require_role(UserRole.ADMIN)),
     auth_db: AuthDB = Depends(get_auth_db),
 ):
     """
@@ -602,13 +711,13 @@ if OIDC_AVAILABLE:
                 },
             )
 
-            # 生成 JWT Token
+            # 生成 JWT Token（携带当前令牌代次）
             access_token = create_access_token(
                 user_id=user.user_id,
                 username=user.username,
                 role=user.role,
-                epoch=user.token_epoch,
                 expires_delta=timedelta(minutes=JWT_EXPIRE_MINUTES),
+                epoch=auth_db.get_token_epoch(user.user_id),
             )
 
             logger.info(f"✅ SSO user logged in: {user.username} (provider: oidc)")
@@ -633,6 +742,9 @@ async def get_system_config():
     config = SystemConfig()
     configs = config.get_all_configs()
 
+    # 邀请码只暴露"是否需要"，绝不回传真实值；掩码供管理员页面回显
+    invite_code_set = bool((configs.get("registration_invite_code") or "").strip())
+
     # 转换布尔值配置项
     return {
         "success": True,
@@ -641,7 +753,8 @@ async def get_system_config():
             "system_logo": configs.get("system_logo", ""),
             "show_github_star": configs.get("show_github_star", "true") == "true",
             "allow_registration": configs.get("allow_registration", "true") == "true",
-            "registration_invite_required": bool((configs.get("registration_invite_code") or "").strip()),
+            "registration_invite_required": invite_code_set,
+            "registration_invite_code": "********" if invite_code_set else "",
         },
     }
 
@@ -649,6 +762,7 @@ async def get_system_config():
 @router.post("/system/config")
 async def update_system_config(
     config_data: dict,
+    request: Request,
     current_user: User = Depends(require_permission(Permission.SYSTEM_CONFIG)),
 ):
     """
@@ -667,13 +781,61 @@ async def update_system_config(
     config = SystemConfig()
 
     # 允许的配置键
-    allowed_keys = {"system_name", "system_logo", "show_github_star", "allow_registration"}
+    allowed_keys = {
+        "system_name",
+        "system_logo",
+        "show_github_star",
+        "allow_registration",
+        "registration_invite_code",
+        # 图片描述（多模态大模型）配置
+        "image_caption_enabled",
+        "image_caption_api_base",
+        "image_caption_api_key",
+        "image_caption_model",
+        "image_caption_prompt",
+        "image_caption_max_images",
+        "image_caption_concurrency",
+        "image_caption_timeout",
+        # Webhook 投递策略（回调地址与密钥按 API Key 维度配置，见 Key 级端点）
+        "webhook_timeout",
+        "webhook_max_attempts",
+        # 任务超时自动重试上限
+        "task_max_retries",
+    }
     update_data = {}
+
+    if "task_max_retries" in config_data:
+        from .system_config import TASK_MAX_RETRIES_LIMIT
+
+        raw_retries = config_data["task_max_retries"]
+        # bool 是 int 的子类，true/false 不能被当成 1/0 放行
+        if isinstance(raw_retries, bool) or not isinstance(raw_retries, (int, str)):
+            raw_retries = None
+        try:
+            retries = int(raw_retries) if raw_retries is not None else None
+        except ValueError:
+            retries = None
+        if retries is None or not 0 <= retries <= TASK_MAX_RETRIES_LIMIT:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"task_max_retries must be an integer between 0 and {TASK_MAX_RETRIES_LIMIT}",
+            )
+        config_data = {**config_data, "task_max_retries": retries}
 
     for key, value in config_data.items():
         if key in allowed_keys:
+            # 掩码占位符表示前端未修改，跳过不更新
+            if (
+                key
+                in {
+                    "image_caption_api_key",
+                    "registration_invite_code",
+                }
+                and value == "********"
+            ):
+                continue
             # 转换布尔值配置项为字符串
-            if key in {"show_github_star", "allow_registration"}:
+            if key in {"show_github_star", "allow_registration", "image_caption_enabled"}:
                 update_data[key] = "true" if value else "false"
             else:
                 update_data[key] = str(value)
@@ -688,8 +850,18 @@ async def update_system_config(
 
     logger.info(f"✅ System config updated by {current_user.username}: {list(update_data.keys())}")
 
+    # 只记改了哪些配置键名，绝不记值（含 api_key、邀请码等敏感配置）
+    record_audit(
+        "config.update",
+        user=current_user,
+        request=request,
+        resource_type="config",
+        detail={"keys": sorted(update_data.keys())},
+    )
+
     # 返回更新后的配置
     updated_configs = config.get_all_configs()
+    invite_code_set = bool((updated_configs.get("registration_invite_code") or "").strip())
     return {
         "success": True,
         "message": "Configuration updated successfully",
@@ -698,8 +870,170 @@ async def update_system_config(
             "system_logo": updated_configs.get("system_logo", ""),
             "show_github_star": updated_configs.get("show_github_star", "true") == "true",
             "allow_registration": updated_configs.get("allow_registration", "true") == "true",
+            "registration_invite_required": invite_code_set,
+            "registration_invite_code": "********" if invite_code_set else "",
         },
     }
+
+
+# ==================== 图片描述（多模态大模型）配置 (管理员) ====================
+
+# api_key 的掩码占位符：接口不返回真实密钥，前端未修改时原样发回
+IMAGE_CAPTION_KEY_MASK = "********"
+
+
+def _get_image_caption_configs() -> dict:
+    """读取图片描述相关配置（含读取端默认值兜底，兼容存量部署）"""
+    from image_caption.config import (
+        DEFAULT_API_BASE,
+        DEFAULT_CONCURRENCY,
+        DEFAULT_MAX_IMAGES,
+        DEFAULT_PROMPT,
+        DEFAULT_TIMEOUT,
+    )
+
+    config = SystemConfig()
+    raw = config.get_all_configs()
+
+    def get(key: str, default: str) -> str:
+        value = raw.get(key)
+        return value if value is not None else default
+
+    def get_int(key: str, default: int) -> int:
+        try:
+            return int(get(key, str(default)))
+        except (ValueError, TypeError):
+            return default
+
+    return {
+        "enabled": get("image_caption_enabled", "false") == "true",
+        "api_base": get("image_caption_api_base", DEFAULT_API_BASE),
+        "api_key": get("image_caption_api_key", ""),
+        "model": get("image_caption_model", ""),
+        "prompt": get("image_caption_prompt", DEFAULT_PROMPT),
+        "max_images": get_int("image_caption_max_images", DEFAULT_MAX_IMAGES),
+        "concurrency": get_int("image_caption_concurrency", DEFAULT_CONCURRENCY),
+        "timeout": get_int("image_caption_timeout", DEFAULT_TIMEOUT),
+    }
+
+
+@router.get("/system/config/image-caption")
+async def get_image_caption_config(
+    current_user: User = Depends(require_permission(Permission.SYSTEM_CONFIG)),
+):
+    """
+    获取图片描述（多模态大模型）配置 (管理员)
+
+    api_key 属敏感信息，以掩码返回；公开接口 /system/config 不包含这些配置。
+    """
+    config = _get_image_caption_configs()
+    config["api_key"] = IMAGE_CAPTION_KEY_MASK if config["api_key"] else ""
+    return {"success": True, "config": config}
+
+
+@router.post("/system/config/image-caption/test")
+async def test_image_caption_connection(
+    test_data: dict,
+    current_user: User = Depends(require_permission(Permission.SYSTEM_CONFIG)),
+):
+    """
+    测试多模态模型端点连通性 (管理员)
+
+    请求体可携带表单中尚未保存的配置（api_base/api_key/model/timeout），
+    api_key 为掩码占位符时回落到已保存的值。
+    """
+    import asyncio
+
+    from image_caption.captioner import ImageCaptioner
+    from image_caption.config import ImageCaptionConfig
+
+    stored = _get_image_caption_configs()
+
+    api_key = test_data.get("api_key", "")
+    if api_key == IMAGE_CAPTION_KEY_MASK:
+        api_key = stored["api_key"]
+
+    config = ImageCaptionConfig(
+        enabled=True,
+        api_base=(test_data.get("api_base") or stored["api_base"]).strip(),
+        api_key=api_key.strip(),
+        model=(test_data.get("model") or stored["model"]).strip(),
+        prompt=stored["prompt"],
+        max_images=stored["max_images"],
+        concurrency=stored["concurrency"],
+        timeout=int(test_data.get("timeout") or stored["timeout"]),
+    )
+    if not config.api_base or not config.model:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="API Base 和模型名不能为空",
+        )
+
+    # 同步 SDK 调用放到线程中，避免阻塞事件循环
+    success, message, latency_ms = await asyncio.to_thread(ImageCaptioner(config).test_connection)
+    logger.info(f"🔍 Image caption connection test by {current_user.username}: {success} ({message})")
+    return {"success": success, "message": message, "latency_ms": latency_ms}
+
+
+# ==================== Webhook 投递策略配置 (管理员) ====================
+
+
+@router.get("/system/config/webhook")
+async def get_webhook_config_endpoint(
+    current_user: User = Depends(require_permission(Permission.SYSTEM_CONFIG)),
+):
+    """
+    获取 Webhook 投递策略 (管理员)
+
+    回调地址与密钥按 API Key 维度配置（见 /apikeys/{key_id}/webhook），
+    这里只返回全局投递策略（超时与最大重试次数）。
+    """
+    from webhook.config import get_webhook_config
+
+    return {"success": True, "config": get_webhook_config()}
+
+
+# ==================== 任务处理策略配置 (管理员) ====================
+
+
+@router.get("/system/config/task")
+async def get_task_config_endpoint(
+    current_user: User = Depends(require_permission(Permission.SYSTEM_CONFIG)),
+):
+    """
+    获取任务处理策略 (管理员)
+
+    max_retries：任务超时（卡在处理中）后自动重试的上限，超过即判定失败。
+    """
+    from .system_config import TASK_MAX_RETRIES_LIMIT, get_task_max_retries
+
+    return {
+        "success": True,
+        "config": {"max_retries": get_task_max_retries(), "max_retries_limit": TASK_MAX_RETRIES_LIMIT},
+    }
+
+
+@router.get("/system/webhook/deliveries")
+async def list_webhook_deliveries(
+    page: int = 1,
+    page_size: int = 20,
+    status_filter: str = Query(None, alias="status"),
+    current_user: User = Depends(require_permission(Permission.SYSTEM_CONFIG)),
+):
+    """
+    分页查询 Webhook 投递记录 (管理员)
+
+    page_size 上限 100，status_filter 可选（pending/delivered/failed/dead）。
+    """
+    import asyncio
+
+    from webhook.delivery import list_deliveries
+
+    if status_filter and status_filter not in {"pending", "delivered", "failed", "dead"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid status filter")
+
+    items, total = await asyncio.to_thread(list_deliveries, page, page_size, status_filter or None)
+    return {"success": True, "data": {"items": items, "total": total, "page": page, "page_size": page_size}}
 
 
 @router.post("/system/logo/upload")

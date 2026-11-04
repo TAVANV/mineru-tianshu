@@ -1,8 +1,7 @@
 {
   "mcpServers": {
     "mineru-tianshu": {
-      "url": "http://localhost:8002/sse",
-      "headers": {"X-API-Key": "REPLACE_WITH_MCP_ACCESS_KEY"},
+      "url": "http://localhost:8001/sse",
       "transport": "sse",
       "description": "MinerU Tianshu - 文档解析服务"
     }

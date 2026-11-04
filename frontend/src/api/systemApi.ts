@@ -6,6 +6,13 @@ import type {
   SystemConfigResponse,
   SystemConfigUpdateRequest,
   EnginesResponse,
+  ImageCaptionConfigResponse,
+  ImageCaptionTestResult,
+  WebhookConfigResponse,
+  TaskConfigResponse,
+  WebhookDeliveriesResponse,
+  AuditLogQuery,
+  AuditLogsResponse,
 } from './types'
 import apiClient from './client'
 
@@ -36,6 +43,28 @@ export async function updateSystemConfig(
 }
 
 /**
+ * 获取图片描述（多模态大模型）配置（管理员）
+ */
+export async function getImageCaptionConfig(): Promise<ImageCaptionConfigResponse> {
+  const response = await apiClient.get('/api/v1/auth/system/config/image-caption')
+  return response.data
+}
+
+/**
+ * 测试图片描述模型连接（管理员）
+ * api_key 未修改时传掩码值，后端回落到已存值
+ */
+export async function testImageCaptionConnection(data: {
+  api_base?: string
+  api_key?: string
+  model?: string
+  timeout?: number
+}): Promise<ImageCaptionTestResult> {
+  const response = await apiClient.post('/api/v1/auth/system/config/image-caption/test', data)
+  return response.data
+}
+
+/**
  * 上传系统 Logo（管理员）
  */
 export async function uploadSystemLogo(
@@ -49,5 +78,39 @@ export async function uploadSystemLogo(
       'Content-Type': 'multipart/form-data',
     },
   })
+  return response.data
+}
+
+/**
+ * 查询审计日志（仅管理员）
+ */
+export async function getAuditLogs(params: AuditLogQuery = {}): Promise<AuditLogsResponse> {
+  const response = await apiClient.get('/api/v1/admin/audit-logs', { params })
+  return response.data
+}
+
+/**
+ * 获取任务处理策略（管理员）
+ */
+export async function getTaskConfig(): Promise<TaskConfigResponse> {
+  const response = await apiClient.get('/api/v1/auth/system/config/task')
+  return response.data
+}
+
+/**
+ * 获取 Webhook 投递策略（管理员）
+ */
+export async function getWebhookConfig(): Promise<WebhookConfigResponse> {
+  const response = await apiClient.get('/api/v1/auth/system/config/webhook')
+  return response.data
+}
+
+/**
+ * 查询 Webhook 投递记录（管理员）
+ */
+export async function getWebhookDeliveries(
+  params: { page?: number; page_size?: number; status?: string } = {}
+): Promise<WebhookDeliveriesResponse> {
+  const response = await apiClient.get('/api/v1/auth/system/webhook/deliveries', { params })
   return response.data
 }

@@ -5,7 +5,7 @@ MinerU Tianshu - Authentication Dependencies
 FastAPI 依赖项,用于保护路由和验证用户权限
 """
 
-from fastapi import Request, Depends, HTTPException, status, Security
+from fastapi import Depends, HTTPException, status, Security, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, APIKeyHeader
 from typing import Optional
 
@@ -59,7 +59,7 @@ def _authenticate_jwt(token: str, auth_db: AuthDB) -> Optional[User]:
     return user
 
 
-def get_current_user_from_token(
+async def get_current_user_from_token(
     credentials: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme),
     auth_db: AuthDB = Depends(get_auth_db),
 ) -> Optional[User]:
@@ -79,7 +79,7 @@ def get_current_user_from_token(
     return _authenticate_jwt(credentials.credentials, auth_db)
 
 
-def get_current_user_from_apikey(
+async def get_current_user_from_apikey(
     api_key: Optional[str] = Security(api_key_header),
     auth_db: AuthDB = Depends(get_auth_db),
 ) -> Optional[User]:
@@ -131,7 +131,7 @@ async def get_current_user(
     return user
 
 
-async def get_current_active_user(request: Request, current_user: User = Depends(get_current_user)) -> User:
+async def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
     """
     获取当前激活的用户
 
@@ -146,7 +146,6 @@ async def get_current_active_user(request: Request, current_user: User = Depends
     """
     if not current_user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Inactive user")
-    request.state.audit_user = current_user
     return current_user
 
 
@@ -248,12 +247,12 @@ async def get_optional_user(
     return user_from_token or user_from_apikey
 
 
-def get_current_user_flexible(
+async def get_current_user_flexible(
     request: Request,
     auth_db: AuthDB = Depends(get_auth_db),
 ) -> User:
     """
-    文件认证：依次选择 Bearer 头、预览查询 JWT、X-API-Key；所选凭据无效时拒绝
+    灵活认证（供文件端点使用）：优先 Authorization 头，失败后尝试 ?token= 查询参数
 
     浏览器内嵌预览（<img>/<iframe>）无法携带请求头，因此文件端点允许
     通过查询参数传递 JWT。两种方式都会做验签 + 吊销 + 令牌代次 + 激活状态校验。
@@ -269,7 +268,7 @@ def get_current_user_flexible(
     if auth_header.startswith("Bearer "):
         token = auth_header[len("Bearer ") :]
     if not token:
-        token = request.scope.get("state", {}).get("file_token") or request.query_params.get("token")
+        token = request.query_params.get("token")
     api_key = request.headers.get("X-API-Key")
     if not token and not api_key:
         raise HTTPException(

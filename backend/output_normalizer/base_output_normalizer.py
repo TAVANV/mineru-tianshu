@@ -3,8 +3,9 @@
 """
 
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Callable, Dict, Any
 from loguru import logger
+import re
 import json
 import os
 
@@ -26,17 +27,18 @@ class BaseOutputNormalizer:
         self._rustfs_client = None
 
     def normalize(
-        self, output_dir: Path, use_rustfs: Optional[bool] = None, enable_caption: bool = True
+        self,
+        output_dir: Path,
+        image_processor: Callable[[Path, Dict[str, Any]], None] = None,
+        use_rustfs: bool | None = None,
     ) -> Dict[str, Any]:
         """
         规范化输出目录（模板方法）
 
         Args:
             output_dir: 输出目录（引擎的原始输出目录）
-            use_rustfs: 任务级 RustFS 开关。
-                        None  → 由 RUSTFS_ENABLED 环境变量决定（向后兼容）
-                        True  → 强制上传到 RustFS
-                        False → 不上传，保留本地图片路径
+            image_processor: 可选的图片处理回调，在本地文件规范化之后、RustFS 上传之前调用，
+                此时图片引用仍是 images/<原始文件名>，可按文件名匹配（用于图片描述写回等场景）
 
         Returns:
             规范化后的文件信息
@@ -58,15 +60,13 @@ class BaseOutputNormalizer:
         result.setdefault("rustfs_enabled", False)
         result.setdefault("images_uploaded", False)
 
-        if enable_caption:
+        # 1.5 可选图片处理钩子（如多模态大模型图片描述写回）
+        # 必须在 RustFS 上传前执行：上传后图片被重命名为短随机名，无法按文件名匹配
+        if image_processor and result["image_dir"] and result["image_count"] > 0:
             try:
-                from image_caption import ImageCaptionConfig, process_output_dir
-
-                config = ImageCaptionConfig.load()
-                if config:
-                    result["image_caption"] = process_output_dir(output_dir, config)
+                image_processor(output_dir, result)
             except Exception as e:
-                logger.warning(f"Image caption skipped: {type(e).__name__}")
+                logger.warning(f"⚠️  Image processor failed (continuing): {e}")
 
         # 2. 自动上传图片到 RustFS 并替换 URL（基础功能，始终启用）
         if result["image_dir"] and result["image_count"] > 0:
@@ -100,55 +100,42 @@ class BaseOutputNormalizer:
         """
         raise NotImplementedError
 
-    def _process_rustfs_upload(self, result: Dict[str, Any], use_rustfs: Optional[bool] = None):
-        """处理 RustFS 上传和 URL 替换
-
-        Args:
-            result: 规范化结果字典
-            use_rustfs: 任务级 RustFS 开关。
-                        None  → 读取 RUSTFS_ENABLED 环境变量（向后兼容）
-                        True/False → 按任务强制开启/关闭
-        """
-
-        # 检查是否启用 RustFS：任务级开关优先，未指定时回退到环境变量
-        if use_rustfs is None:
-            rustfs_enabled = os.getenv("RUSTFS_ENABLED", "true").lower() in ("true", "1", "yes")
-        else:
-            rustfs_enabled = use_rustfs
-
-        if not rustfs_enabled:
-            logger.info("ℹ️  RustFS upload disabled for this task, using local file service")
+    def _process_rustfs_upload(self, result: Dict[str, Any], use_rustfs: bool | None = None):
+        """任务显式选择优先；启用上传时保持上游的失败即报错策略。"""
+        image_count = result.get("image_count", 0)
+        enabled = (
+            use_rustfs
+            if use_rustfs is not None
+            else os.getenv("RUSTFS_ENABLED", "true").lower() in ("true", "1", "yes")
+        )
+        if not enabled:
             result["rustfs_enabled"] = False
             result["images_uploaded"] = False
             return
 
+        logger.info(f"📤 Uploading {image_count} images to RustFS...")
         try:
-            logger.info(f"📤 Uploading {result['image_count']} images to RustFS...")
             url_mapping = self._upload_images_to_rustfs(result["image_dir"])
-
-            if url_mapping:
-                # 替换 Markdown 中的图片路径
-                if result["markdown_file"]:
-                    self._replace_markdown_urls(result["markdown_file"], url_mapping)
-
-                # 替换 JSON 中的图片路径
-                if result["json_file"]:
-                    self._replace_json_urls(result["json_file"], url_mapping)
-
-                result["rustfs_enabled"] = True
-                result["images_uploaded"] = True
-                logger.info(f"✅ Images uploaded to RustFS: {len(url_mapping)}/{result['image_count']}")
-            else:
-                logger.warning("⚠️  No images uploaded (url_mapping empty)")
-                result["rustfs_enabled"] = False
-                result["images_uploaded"] = False
         except Exception as e:
-            logger.error(f"❌ Failed to upload images to RustFS: {e}")
-            logger.error(f"   Error details: {type(e).__name__}: {str(e)}")
-            result["rustfs_enabled"] = False
-            result["images_uploaded"] = False
-            # RustFS 上传失败不应中断主流程，继续使用本地路径
-            logger.warning("⚠️  Continuing with local image paths (RustFS upload failed)")
+            raise RuntimeError(
+                f"图片上传到 RustFS 失败（{type(e).__name__}: {e}）。"
+                "请检查 RustFS 容器是否运行、RUSTFS_ENDPOINT / RUSTFS_ACCESS_KEY / "
+                "RUSTFS_SECRET_KEY / RUSTFS_PUBLIC_URL 是否配置正确。"
+            ) from e
+
+        if not url_mapping:
+            raise RuntimeError(
+                f"图片上传到 RustFS 未返回任何地址（应上传 {image_count} 张）。请检查 RustFS 服务状态与存储桶权限。"
+            )
+
+        if result["markdown_file"]:
+            self._replace_markdown_urls(result["markdown_file"], url_mapping)
+        if result["json_file"]:
+            self._replace_json_urls(result["json_file"], url_mapping)
+
+        result["rustfs_enabled"] = True
+        result["images_uploaded"] = True
+        logger.info(f"✅ Images uploaded to RustFS: {len(url_mapping)}/{image_count}")
 
     def _upload_images_to_rustfs(self, image_dir: Path) -> Dict[str, str]:
         """
@@ -181,18 +168,112 @@ class BaseOutputNormalizer:
             raise
 
     def _replace_markdown_urls(self, md_file: Path, url_mapping: Dict[str, str]):
-        from utils.image_references import replace_image_references
+        """
+        替换 Markdown 中的图片路径为 RustFS URL
 
-        content = md_file.read_text(encoding="utf-8")
-        updated = replace_image_references(content, url_mapping, markdown_to_html=True)
-        if updated != content:
-            md_file.write_text(updated, encoding="utf-8")
+        Args:
+            md_file: Markdown 文件
+            url_mapping: {本地文件名: RustFS URL} 映射
+        """
+        try:
+            content = md_file.read_text(encoding="utf-8")
+            original_content = content
+            replaced_count = 0
+
+            logger.debug(f"🔍 Replacing URLs in {md_file.name}")
+            logger.debug(f"   URL mapping: {url_mapping}")
+
+            # 替换所有图片引用（统一转换为 HTML 格式，更通用）
+            for filename, url in url_mapping.items():
+                # 方式1: Markdown 格式 -> HTML 格式
+                # ![alt](images/xxx.jpg) -> <img src="https://..." alt="alt">
+                pattern1 = rf"!\[(.*?)\]\({self.STANDARD_IMAGE_DIR}/{re.escape(filename)}\)"
+                matches1 = re.findall(pattern1, content)
+                if matches1:
+                    logger.debug(f"   Found Markdown pattern: {pattern1}")
+                    logger.debug(f"   Matches: {matches1}")
+
+                # 转换为 HTML 格式（更通用，前端渲染友好）
+                def markdown_to_html(match):
+                    alt_text = match.group(1) or filename
+                    return f'<img src="{url}" alt="{alt_text}">'
+
+                new_content = re.sub(pattern1, markdown_to_html, content)
+                if new_content != content:
+                    replaced_count += 1
+                    logger.debug(f"   ✅ Replaced Markdown -> HTML: {filename} -> {url}")
+                content = new_content
+
+                # 方式2: HTML 格式 -> 更新 URL
+                # <img src="images/xxx.jpg"> -> <img src="https://...">
+                pattern2 = rf'<img([^>]*?)src=["\']({self.STANDARD_IMAGE_DIR}/{re.escape(filename)})["\']([^>]*?)>'
+                matches2 = re.findall(pattern2, content)
+                if matches2:
+                    logger.debug(f"   Found HTML pattern: {pattern2}")
+                    logger.debug(f"   Matches: {matches2}")
+
+                new_content = re.sub(pattern2, rf'<img\1src="{url}"\3>', content)
+                if new_content != content:
+                    replaced_count += 1
+                    logger.debug(f"   ✅ Replaced HTML: {filename} -> {url}")
+                content = new_content
+
+            if content != original_content:
+                md_file.write_text(content, encoding="utf-8")
+                logger.info(f"✅ Replaced {replaced_count} image URLs in {md_file.name}")
+            else:
+                logger.warning(f"⚠️  No replacements made in {md_file.name}")
+                logger.debug(f"   Content preview (first 500 chars):\n{original_content[:500]}")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to replace URLs in Markdown: {e}")
+            raise
 
     def _replace_json_urls(self, json_file: Path, url_mapping: Dict[str, str]):
-        from utils.image_references import replace_json_image_references
+        """
+        替换 JSON 中的图片路径为 RustFS URL
 
-        data = json.loads(json_file.read_text(encoding="utf-8"))
-        json_file.write_text(
-            json.dumps(replace_json_image_references(data, url_mapping), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        Args:
+            json_file: JSON 文件
+            url_mapping: {本地文件名: RustFS URL} 映射
+        """
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            replaced_count = 0
+            logger.debug(f"🔍 Replacing URLs in {json_file.name}")
+
+            # 递归替换 JSON 中的所有图片路径
+            def replace_paths(obj, path=""):
+                nonlocal replaced_count
+                if isinstance(obj, dict):
+                    for key, value in obj.items():
+                        if isinstance(value, str):
+                            # 检查是否是图片路径
+                            for filename, url in url_mapping.items():
+                                if filename in value and self.STANDARD_IMAGE_DIR in value:
+                                    old_value = obj[key]
+                                    obj[key] = url
+                                    replaced_count += 1
+                                    logger.debug(f"   ✅ Replaced JSON[{path}.{key}]: {old_value} -> {url}")
+                                    break
+                        else:
+                            replace_paths(value, f"{path}.{key}")
+                elif isinstance(obj, list):
+                    for i, item in enumerate(obj):
+                        replace_paths(item, f"{path}[{i}]")
+
+            replace_paths(data)
+
+            with open(json_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            if replaced_count > 0:
+                logger.info(f"✅ Replaced {replaced_count} image URLs in {json_file.name}")
+            else:
+                logger.warning(f"⚠️  No replacements made in {json_file.name}")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to replace URLs in JSON: {e}")
+            raise

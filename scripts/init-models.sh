@@ -1,14 +1,16 @@
 #!/bin/bash
-# Tianshu - offline model validation script
+# Tianshu - 模型初始化脚本（统一版本，自动适配 GPU/CPU）
+# 在容器首次启动时从外部卷复制模型到容器内
 
 set -e
 
+# 颜色输出
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-RED='\033[0;31m'
-NC='\033[0m'
+NC='\033[0m' # No Color
 
+# 日志函数
 log_info() {
     echo -e "${BLUE}[INIT]${NC} $1"
 }
@@ -21,81 +23,112 @@ log_warning() {
     echo -e "${YELLOW}[INIT]${NC} $1"
 }
 
-log_error() {
-    echo -e "${RED}[INIT]${NC} $1"
-}
+# ============================================================================
+# 主函数
+# ============================================================================
+main() {
+    log_info "Checking model initialization..."
 
-require_path() {
-    local path="$1"
-    local description="$2"
-
-    if [ ! -e "$path" ]; then
-        log_error "Missing required model asset: $description"
-        log_error "Expected path: $path"
-        return 1
+    # 检测设备模式
+    DEVICE_MODE=${DEVICE_MODE:-auto}
+    if [ "$DEVICE_MODE" = "auto" ]; then
+        if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null 2>&1; then
+            log_info "Detected: GPU mode (auto-detection)"
+        else
+            log_info "Detected: CPU mode (auto-detection)"
+        fi
+    else
+        log_info "Device mode: $DEVICE_MODE (manual configuration)"
     fi
 
-    log_success "Found: $description"
-    return 0
-}
-
-optional_path() {
-    local path="$1"
-    local description="$2"
-
-    if [ ! -e "$path" ]; then
-        log_warning "Optional model asset missing: $description ($path)"
+    # 检查初始化标记文件（使用运行用户可写的路径）
+    INIT_MARKER="${HOME:-/root}/.cache/.models_initialized"
+    if [ -f "$INIT_MARKER" ]; then
+        log_info "Models already initialized, skipping copy"
         return 0
     fi
 
-    log_success "Found optional: $description"
-}
-
-main() {
-    log_info "Validating offline model layout..."
-
-    local failed=0
-
-    require_path "/app/models/mineru.json" "MinerU config" || failed=1
-    require_path "/app/models/PDF-Extract-Kit-1.0/models" "MinerU pipeline models" || failed=1
-    require_path "/app/models/PDF-Extract-Kit-1.0/models/Layout/PP-DocLayoutV2/model.safetensors" "MinerU layout checkpoint" || failed=1
-    require_path "/app/models/PDF-Extract-Kit-1.0/models/MFR/unimernet_hf_small_2503/model.safetensors" "MinerU MFR checkpoint" || failed=1
-    require_path "/app/models/PDF-Extract-Kit-1.0/models/OCR/paddleocr_torch/ch_PP-OCRv6_small_det_infer.safetensors" "MinerU OCR detection checkpoint" || failed=1
-    require_path "/app/models/PDF-Extract-Kit-1.0/models/OCR/paddleocr_torch/ch_PP-OCRv6_small_rec_infer.safetensors" "MinerU OCR recognition checkpoint" || failed=1
-    require_path "/app/models/PDF-Extract-Kit-1.0/models/OCR/paddleocr_torch/ch_PP-OCRv6_medium_rec_infer.safetensors" "MinerU OCR medium/seal checkpoint" || failed=1
-    require_path "/app/models/PDF-Extract-Kit-1.0/models/TabRec/SlanetPlus/slanet-plus.onnx" "MinerU table model" || failed=1
-    require_path "/app/models/PDF-Extract-Kit-1.0/models/TabRec/UnetStructure/unet.onnx" "MinerU table structure" || failed=1
-    require_path "/app/models/PDF-Extract-Kit-1.0/models/TabCls/paddle_table_cls/PP-LCNet_x1_0_table_cls.onnx" "MinerU table classifier" || failed=1
-    if [ "${TIANSHU_DEPLOY_MODE:-full}" = "pipeline" ]; then
-        [ "$failed" -eq 0 ] || exit 1
-        log_success "Pipeline-only model validation passed"
-        return
-    fi
-    local vlm_path
-    vlm_path=$(python -c 'from model_layout import active_vlm_path; print(active_vlm_path())')
-    require_path "$vlm_path" "MinerU VLM model" || failed=1
-    require_path "${PADDLEX_HOME:-/root/.paddlex}/official_models/PaddleOCR-VL-1.5-0.9B" "PaddleOCR-VL 1.5 model" || failed=1
-    require_path "${PADDLEX_HOME:-/root/.paddlex}/official_models/PP-DocLayoutV3" "PaddleOCR-VL layout model" || failed=1
-    require_path "/app/models/SenseVoiceSmall" "SenseVoiceSmall audio model" || failed=1
-    require_path "/app/models/speech_fsmn_vad_zh-cn-16k-common-pytorch" "FSMN VAD audio model" || failed=1
-
-    optional_path "${PADDLEX_HOME:-/root/.paddlex}/official_models/PP-LCNet_x1_0_doc_ori" "Paddle document orientation classifier"
-    optional_path "${PADDLEX_HOME:-/root/.paddlex}/official_models/UVDoc" "Paddle document unwarping model"
-    optional_path "${PADDLEX_HOME:-/root/.paddlex}/fonts/simfang.ttf" "PaddleX visualization font"
-    optional_path "/app/models/Paraformer" "Paraformer speaker diarization model"
-    optional_path "/app/models/punc_ct-transformer_zh-cn-common-vocab272727-pytorch" "CT punctuation model"
-    optional_path "/app/models/speech_campplus_sv_zh-cn_16k-common" "CAM++ speaker model"
-    optional_path "/app/models/YOLO11/best.pt" "YOLO watermark model"
-    optional_path "/app/models/big-lama.pt" "LaMa inpainting model"
-    optional_path "${ULTRALYTICS_CONFIG_DIR:-/app/data/Ultralytics}/Arial.ttf" "Ultralytics Arial.ttf"
-    optional_path "${ULTRALYTICS_CONFIG_DIR:-/app/data/Ultralytics}/settings.json" "Ultralytics settings"
-
-    if [ "$failed" -ne 0 ]; then
-        log_error "Offline model validation failed. Please rebuild or re-extract models-offline.tar.gz."
-        exit 1
+    # 检查外部模型目录是否存在
+    if [ ! -d "/models-external" ]; then
+        log_warning "External models directory not found at /models-external"
+        log_warning "Models will be downloaded on first use"
+        return 0
     fi
 
-    log_success "Offline model validation passed"
+    log_info "Copying models from external volume..."
+    log_info "This is a one-time operation and may take 5-10 minutes"
+    echo ""
+
+    # 创建必要的目录（使用运行用户的主目录，避免 tianshu 用户无法写入 /root）
+    mkdir -p "${HOME:-/root}/.cache/huggingface/hub"
+    mkdir -p "${HOME:-/root}/.cache/watermark_models"
+    mkdir -p /app/models/sensevoice
+    mkdir -p /app/models/paraformer
+
+    # 复制 MinerU 配置文件（离线部署的关键文件）
+    if [ -f "/models-external/mineru.json" ]; then
+        log_info "Copying MinerU config (mineru.json)..."
+        cp /models-external/mineru.json /app/models/mineru.json 2>/dev/null || true
+        log_success "mineru.json copied"
+    fi
+
+    # 复制 MinerU Pipeline 模型
+    if [ -d "/models-external/PDF-Extract-Kit-1.0" ]; then
+        log_info "Copying MinerU Pipeline model..."
+        cp -r /models-external/PDF-Extract-Kit-1.0 /app/models/ 2>/dev/null || true
+        log_success "MinerU Pipeline model copied"
+    fi
+
+    # 复制 MinerU VLM 模型
+    if [ -d "/models-external/MinerU2.5-Pro-2605-1.2B" ]; then
+        log_info "Copying MinerU VLM model..."
+        cp -r /models-external/MinerU2.5-Pro-2605-1.2B /app/models/ 2>/dev/null || true
+        log_success "MinerU VLM model copied"
+    fi
+
+    # 复制 HuggingFace 模型（旧版布局兼容）
+    if [ -d "/models-external/huggingface/hub" ]; then
+        log_info "Copying HuggingFace models (MinerU)..."
+        cp -r /models-external/huggingface/hub/* "${HOME:-/root}/.cache/huggingface/hub/" 2>/dev/null || true
+        log_success "HuggingFace models copied"
+    fi
+
+    # 复制 SenseVoice 模型（兼容新版 SenseVoiceSmall 目录名）
+    if [ -d "/models-external/SenseVoiceSmall" ]; then
+        log_info "Copying SenseVoice models..."
+        cp -r /models-external/SenseVoiceSmall/* /app/models/sensevoice/ 2>/dev/null || true
+        log_success "SenseVoice models copied"
+    elif [ -d "/models-external/sensevoice" ]; then
+        log_info "Copying SenseVoice models..."
+        cp -r /models-external/sensevoice/* /app/models/sensevoice/ 2>/dev/null || true
+        log_success "SenseVoice models copied"
+    fi
+
+    # 复制 Paraformer 模型（兼容新版 Paraformer 目录名）
+    if [ -d "/models-external/Paraformer" ]; then
+        log_info "Copying Paraformer models..."
+        cp -r /models-external/Paraformer/* /app/models/paraformer/ 2>/dev/null || true
+        log_success "Paraformer models copied"
+    elif [ -d "/models-external/paraformer" ]; then
+        log_info "Copying Paraformer models..."
+        cp -r /models-external/paraformer/* /app/models/paraformer/ 2>/dev/null || true
+        log_success "Paraformer models copied"
+    fi
+
+    # 复制水印去除模型
+    if [ -d "/models-external/watermark_models" ]; then
+        log_info "Copying watermark removal models..."
+        cp -r /models-external/watermark_models/* "${HOME:-/root}/.cache/watermark_models/" 2>/dev/null || true
+        log_success "Watermark removal models copied"
+    fi
+
+    # 创建初始化标记文件
+    date -Iseconds > "$INIT_MARKER"
+
+    echo ""
+    log_success "✅ Models initialized successfully"
+    log_info "All models are now ready for use"
 }
 
-main "$@"
+# 执行主函数
+main

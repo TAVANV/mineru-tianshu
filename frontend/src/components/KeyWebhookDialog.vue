@@ -1,6 +1,5 @@
 <template>
   <div
-    role="dialog" aria-modal="true" :aria-label="$t('apiKey.webhookTitle')"
     class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50"
     @click.self="$emit('close')"
   >
@@ -37,7 +36,7 @@
           <label class="block text-sm font-medium text-gray-700 mb-1">{{ $t('webhook.secret') }}</label>
           <input
             v-model="form.secret"
-            type="password"
+            type="text"
             :placeholder="secretPlaceholder('secret')"
             class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
           />
@@ -61,7 +60,7 @@
           <label class="block text-sm font-medium text-gray-700 mb-1">{{ $t('webhook.authToken') }}</label>
           <input
             v-model="form.auth_token"
-            type="password"
+            type="text"
             :placeholder="secretPlaceholder('auth_token')"
             class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent"
           />

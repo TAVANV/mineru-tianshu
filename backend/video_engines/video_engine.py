@@ -241,7 +241,7 @@ class VideoProcessingEngine:
         use_itn: bool = True,
         keep_audio: bool = False,
         enable_keyframe_ocr: bool = False,
-        ocr_backend: str = "paddleocr-vl",
+        ocr_backend: str = "mineru",
         keep_keyframes: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
@@ -255,7 +255,7 @@ class VideoProcessingEngine:
             use_itn: 是否使用逆文本归一化
             keep_audio: 是否保留提取的音频文件
             enable_keyframe_ocr: 是否启用关键帧OCR（默认False，仅音频转写）
-            ocr_backend: OCR引擎（paddleocr-vl）
+            ocr_backend: OCR引擎（mineru）
             keep_keyframes: 是否保留关键帧图像
             **kwargs: 其他参数
 
@@ -321,15 +321,9 @@ class VideoProcessingEngine:
             if result.get("json_data"):
                 json_data = result["json_data"]
                 json_data["type"] = "video"
-                # SenseVoice 产出的 json_data 不含 "source" 键，直接下标赋值会 KeyError。
-                # 这里确保 source 为 dict 后再写入（已有则保留原内容）。
-                if not isinstance(json_data.get("source"), dict):
-                    json_data["source"] = {}
-                source = json_data["source"]
-                source.setdefault("filename", video_path.name)
-                source["file_type"] = "video"
-                source["video_format"] = video_path.suffix[1:]
-                source["original_filename"] = video_path.name
+                json_data["source"]["file_type"] = "video"
+                json_data["source"]["video_format"] = video_path.suffix[1:]
+                json_data["source"]["original_filename"] = video_path.name
 
                 # 添加关键帧OCR结果
                 if keyframe_result and keyframe_result.get("success"):

@@ -36,12 +36,12 @@ export interface LoginResponse {
 
 // 注册请求
 export interface RegisterRequest {
-  invite_code?: string
   username: string
   email: string
   password: string
   full_name?: string
   role?: UserRole
+  invite_code?: string
 }
 
 // 修改密码请求
@@ -54,7 +54,6 @@ export interface PasswordChangeRequest {
 export interface APIKeyCreate {
   name: string
   expires_days?: number
-  scopes?: string[]
 }
 
 // API Key 响应
@@ -69,8 +68,6 @@ export interface APIKeyResponse {
 
 // API Key 信息 (列表项)
 export interface APIKeyInfo {
-  webhook_enabled?: boolean | number
-  webhook_url?: string
   key_id: string
   name: string
   prefix: string
@@ -78,6 +75,8 @@ export interface APIKeyInfo {
   created_at: string
   expires_at?: string
   last_used?: string
+  webhook_enabled?: boolean | number
+  webhook_url?: string
 }
 
 // API Key 列表响应
@@ -85,6 +84,35 @@ export interface APIKeyListResponse {
   success: boolean
   count: number
   api_keys: APIKeyInfo[]
+}
+
+// Key 级 Webhook 回调配置（敏感字段接口只回显掩码，发回掩码表示不修改）
+export interface APIKeyWebhookConfig {
+  enabled: boolean
+  url: string
+  secret: string
+  auth_type: 'none' | 'bearer' | 'basic' | 'api_key'
+  auth_token: string
+  auth_username: string
+  auth_password: string
+  auth_header_name: string
+  auth_header_value: string
+}
+
+export interface APIKeyWebhookResponse {
+  success: boolean
+  webhook: APIKeyWebhookConfig
+}
+
+// 管理员视角的全量 API Key 列表项（附归属用户）
+export interface AdminAPIKeyInfo extends APIKeyInfo {
+  username: string
+}
+
+export interface AdminAPIKeyListResponse {
+  success: boolean
+  count: number
+  api_keys: AdminAPIKeyInfo[]
 }
 
 // ==================== 任务相关类型 ====================
@@ -100,8 +128,6 @@ export type Backend =
   | 'hybrid-auto-engine'// MinerU 混合高精度 (本地)
   | 'vlm-http-client'   // [新增] MinerU VLM Client (远程)
   | 'hybrid-http-client'// [新增] MinerU Hybrid Client (远程)
-  | 'paddleocr-vl'      // PaddleOCR-VL v1.5 (0.9B) - 本地推理
-  | 'paddleocr-vl-vllm' // PaddleOCR-VL v1.5 (0.9B) - vLLM 加速
   | 'sensevoice'
   | 'video'
   | 'fasta'             // FASTA 生物序列格式
@@ -134,7 +160,6 @@ export type ParseMethod = 'auto' | 'txt' | 'ocr'
 
 // 任务配置选项 (对应数据库存储的 JSON 结构)
 export interface TaskOptions {
-  webhook_url?: string
   lang: Language
   method: ParseMethod
   formula_enable: boolean
@@ -161,31 +186,10 @@ export interface TaskOptions {
   force_ocr?: boolean
   draw_layout?: boolean
   draw_span?: boolean
-
-  // PaddleOCR 专属参数
-  useDocOrientationClassify?: boolean
-  useDocUnwarping?: boolean
-  useLayoutDetection?: boolean
-  useChartRecognition?: boolean
-  useSealRecognition?: boolean
-  useOcrForImageBlock?: boolean
-  mergeTables?: boolean
-  relevelTitles?: boolean
-  layoutShapeMode?: string
-  promptLabel?: string
-  repetitionPenalty?: number
-  temperature?: number
-  topP?: number
-  minPixels?: number
-  maxPixels?: number
-  layoutNms?: boolean
-  restructurePages?: boolean
-  markdownIgnoreLabels?: string[]
 }
 
 // 任务提交请求 (前端 Form 表单数据)
 export interface SubmitTaskRequest {
-  webhook_url?: string
   file: File
   backend?: Backend
   lang?: Language
@@ -200,6 +204,10 @@ export interface SubmitTaskRequest {
 
   // 远程服务地址 (Client 模式必填)
   server_url?: string
+
+  // 加密文档打开密码（PDF / Office / ZIP，可选）
+  use_rustfs?: boolean | null
+  password?: string
 
   // MinerU 详细调试参数
   draw_layout_bbox?: boolean // 是否绘制布局边框
@@ -230,32 +238,6 @@ export interface SubmitTaskRequest {
   enable_speaker_diarization?: boolean
 
   // Office 转换参数
-  convert_office_to_pdf?: boolean
-  office_parser?: 'compatible' | 'mineru'
-
-  // 任务级 RustFS 对象存储开关
-  // undefined=跟随 RUSTFS_ENABLED 环境变量(向后兼容); true=强制上传图片到对象存储; false=保留图片在本地
-  use_rustfs?: boolean
-
-  // PaddleOCR 专属参数
-  useDocOrientationClassify?: boolean
-  useDocUnwarping?: boolean
-  useLayoutDetection?: boolean
-  useChartRecognition?: boolean
-  useSealRecognition?: boolean
-  useOcrForImageBlock?: boolean
-  mergeTables?: boolean
-  relevelTitles?: boolean
-  layoutShapeMode?: string
-  promptLabel?: string
-  repetitionPenalty?: number
-  temperature?: number
-  topP?: number
-  minPixels?: number
-  maxPixels?: number
-  layoutNms?: boolean
-  restructurePages?: boolean
-  markdownIgnoreLabels?: string // ✅ 修改为 string，对应表单中的逗号分隔字符串
 }
 
 // 任务信息
@@ -276,12 +258,27 @@ export interface Task {
   is_parent?: boolean
   child_count?: number
   child_completed?: number
-  subtasks?: { task_id: string; file_name?: string; status: TaskStatus; error_message?: string }[]
+  parent_task_id?: string | null
+  // 列表接口为父任务附带的子任务状态统计（total 为子任务总数，其余键为各状态数量）
+  children_stats?: TaskChildrenStats
   subtask_progress?: {
     total: number
     completed: number
     percentage: number
   }
+  // 子任务列表（父任务详情接口返回；chunk_info 为 PDF 分片页码范围或 zip 解包条目信息）
+  subtasks?: Array<{
+    task_id: string
+    status: TaskStatus
+    chunk_info?: {
+      start_page?: number
+      end_page?: number
+      page_count?: number
+      index?: number
+      entry_name?: string
+    } | null
+    error_message?: string | null
+  }>
   data?: {
     markdown_file: string
     content: string
@@ -334,6 +331,37 @@ export interface TaskQueryParams {
   status?: string
   backend?: string
   search?: string
+  // 默认只返回顶层任务，子任务在父任务下展开查看
+  include_children?: boolean
+}
+
+export type TaskChildrenStats = { total: number } & Partial<Record<TaskStatus, number>>
+
+// 父任务的子任务（PDF 分片或 zip 解包条目）
+export interface ChildTask {
+  task_id: string
+  file_name: string
+  status: TaskStatus
+  chunk_info?: {
+    start_page?: number
+    end_page?: number
+    page_count?: number
+    index?: number
+    entry_name?: string
+  } | null
+  error_message: string | null
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+  retry_count: number | null
+  result_path: string | null
+}
+
+export interface TaskChildrenResponse {
+  success: boolean
+  task_id: string
+  count: number
+  children: ChildTask[]
 }
 
 // 任务列表响应
@@ -365,19 +393,13 @@ export interface EngineItem {
 }
 
 export interface EngineSystemInfo {
-  python: string
   platform: string
-  cuda: string
-  gpu: string
-  gpu_memory_gb: number | null
-  packages: Record<string, string>
 }
 
 export interface EnginesResponse {
   success: boolean
   engines: {
     document: EngineItem[]
-    ocr: EngineItem[]
     audio: EngineItem[]
     video: EngineItem[]
     format: EngineItem[]
@@ -391,11 +413,12 @@ export interface EnginesResponse {
 
 // 系统配置
 export interface SystemConfig {
-  registration_invite_required?: boolean
   system_name: string
   system_logo: string
   show_github_star: boolean
   allow_registration: boolean
+  registration_invite_required?: boolean
+  registration_invite_code?: string
 }
 
 // 系统配置响应
@@ -410,35 +433,148 @@ export interface SystemConfigUpdateRequest {
   system_logo?: string
   show_github_star?: boolean
   allow_registration?: boolean
+  registration_invite_code?: string
+  image_caption_enabled?: boolean
+  image_caption_api_base?: string
+  image_caption_api_key?: string
+  image_caption_model?: string
+  image_caption_prompt?: string
+  image_caption_max_images?: number
+  image_caption_concurrency?: number
+  image_caption_timeout?: number
+  webhook_enabled?: boolean
+  webhook_url?: string
+  webhook_secret?: string
+  webhook_events?: string
+  webhook_timeout?: number
+  webhook_max_attempts?: number
+  task_max_retries?: number
+  webhook_auth_type?: string
+  webhook_auth_token?: string
+  webhook_auth_username?: string
+  webhook_auth_password?: string
+  webhook_auth_header_name?: string
+  webhook_auth_header_value?: string
 }
 
-export interface APIKeyWebhookConfig {
-  enabled: boolean
+// Webhook 鉴权方式
+export type WebhookAuthType = 'none' | 'bearer' | 'basic' | 'api_key'
+
+// Webhook 投递策略（回调地址与密钥按 API Key 维度配置）
+export interface WebhookConfig {
+  timeout: number
+  max_attempts: number
+}
+
+// 任务处理策略
+export interface TaskConfig {
+  max_retries: number
+}
+
+// 任务处理策略响应（max_retries_limit 为后端允许的上限）
+export interface TaskConfigResponse {
+  success: boolean
+  config: TaskConfig & { max_retries_limit: number }
+}
+
+// Webhook 投递策略响应
+export interface WebhookConfigResponse {
+  success: boolean
+  config: WebhookConfig
+}
+
+// Webhook 测试投递结果
+export interface WebhookTestResult {
+  success: boolean
+  status_code?: number
+  error?: string
+}
+
+// Webhook 投递记录
+export interface WebhookDeliveryItem {
+  delivery_id: string
+  task_id: string | null
+  event: string
   url: string
-  secret: string
-  auth_type: 'none' | 'bearer' | 'basic' | 'api_key'
-  auth_token: string
-  auth_username: string
-  auth_password: string
-  auth_header_name: string
-  auth_header_value: string
+  status: string
+  attempts: number
+  last_error: string | null
+  created_at: string
+  delivered_at: string | null
+  source: string
 }
 
-export interface APIKeyWebhookResponse {
+// Webhook 投递记录分页响应
+export interface WebhookDeliveriesResponse {
   success: boolean
-  webhook: APIKeyWebhookConfig
+  data: {
+    items: WebhookDeliveryItem[]
+    total: number
+    page: number
+    page_size: number
+  }
 }
 
-// 管理员视角的全量 API Key 列表项（附归属用户）
-export interface AdminAPIKeyInfo extends APIKeyInfo {
-  username: string
+// 图片描述（多模态大模型）配置
+export interface ImageCaptionConfig {
+  enabled: boolean
+  api_base: string
+  api_key: string
+  model: string
+  prompt: string
+  max_images: number
+  concurrency: number
+  timeout: number
 }
 
-export interface AdminAPIKeyListResponse {
+// 图片描述配置响应
+export interface ImageCaptionConfigResponse {
   success: boolean
-  count: number
-  api_keys: AdminAPIKeyInfo[]
+  config: ImageCaptionConfig
 }
 
+// 图片描述连接测试结果
+export interface ImageCaptionTestResult {
+  success: boolean
+  message: string
+  latency_ms: number
+}
 
-export interface WebhookTestResult { success: boolean; status_code?: number; error?: string }
+// ==================== 审计日志类型 ====================
+
+// 审计日志条目
+export interface AuditLogItem {
+  id: number
+  created_at: string
+  user_id: string | null
+  username: string | null
+  action: string
+  resource_type: string | null
+  resource_id: string | null
+  detail: string | null
+  ip: string | null
+  user_agent: string | null
+  result: string
+}
+
+// 审计日志查询参数
+export interface AuditLogQuery {
+  user_id?: string
+  action?: string
+  result?: string
+  start?: string
+  end?: string
+  page?: number
+  page_size?: number
+}
+
+// 审计日志分页响应
+export interface AuditLogsResponse {
+  success: boolean
+  data: {
+    items: AuditLogItem[]
+    total: number
+    page: number
+    page_size: number
+  }
+}

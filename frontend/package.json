@@ -22,15 +22,15 @@
     "@vitejs/plugin-vue": "^6.0.1",
     "axios": "^1.12.2",
     "dayjs": "^1.11.10",
-    "dompurify": "^3.4.15",
     "highlight.js": "^11.11.1",
     "katex": "^0.16.25",
     "lucide-vue-next": "^0.546.0",
     "marked": "^16.4.1",
-    "pdfjs-dist": "3.11.174",
+    "pdfjs-dist": "^4.2.67",
     "pinia": "^3.0.3",
     "vue": "^3.5.22",
     "vue-i18n": "^10.0.4",
-    "vue-router": "^4.6.3"
+    "vue-router": "^4.6.3",
+    "dompurify": "^3.4.15"
   }
 }

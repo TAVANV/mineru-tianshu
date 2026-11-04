@@ -9,6 +9,7 @@ import type {
   TaskListResponse,
   ApiResponse,
   TaskQueryParams,
+  TaskChildrenResponse,
 } from './types'
 
 // =================================================================
@@ -20,7 +21,6 @@ import type {
  */
 export async function submitTask(request: SubmitTaskRequest): Promise<SubmitTaskResponse> {
   const formData = new FormData()
-  if (request.webhook_url) formData.append('webhook_url', request.webhook_url)
   formData.append('file', request.file)
 
   // 基础参数
@@ -39,16 +39,10 @@ export async function submitTask(request: SubmitTaskRequest): Promise<SubmitTask
   // 远程服务
   if (request.server_url) formData.append('server_url', request.server_url)
 
-  // Office 转换
-  if (request.office_parser) formData.append('office_parser', request.office_parser)
-  if (request.convert_office_to_pdf !== undefined) {
-    formData.append('convert_office_to_pdf', String(request.convert_office_to_pdf))
-  }
+  if (request.use_rustfs != null) formData.append('use_rustfs', String(request.use_rustfs))
 
-  // 任务级 RustFS 开关 (三态: 不传=跟随环境变量; true=强制上传; false=保留本地)
-  if (request.use_rustfs !== undefined) {
-    formData.append('use_rustfs', String(request.use_rustfs))
-  }
+  // 加密文档密码
+  if (request.password) formData.append('password', request.password)
 
   // MinerU 调试/输出选项
   if (request.draw_layout_bbox !== undefined) formData.append('draw_layout_bbox', String(request.draw_layout_bbox))
@@ -110,19 +104,10 @@ export async function getTaskStatus(
 }
 
 /**
- * 取消任务
+ * 取消任务 (仅 pending/processing/paused 状态有效，区别于彻底删除)
  */
 export async function cancelTask(taskId: string): Promise<ApiResponse> {
   const response = await apiClient.post<ApiResponse>(`/api/v1/tasks/${taskId}/cancel`)
-  return response.data
-}
-
-/**
- * 彻底删除任务（物理删除上传源文件、输出目录及数据库记录）
- * 对应后端 DELETE /api/v1/tasks/{task_id}
- */
-export async function deleteTask(taskId: string): Promise<ApiResponse> {
-  const response = await apiClient.delete<ApiResponse>(`/api/v1/tasks/${taskId}`)
   return response.data
 }
 
@@ -141,10 +126,21 @@ export async function listTasks(params: TaskQueryParams): Promise<TaskListRespon
 // =================================================================
 
 /**
- * 重试失败的任务
+ * 获取父任务的子任务列表（按分片页码 / 解包序号排序）
  */
-export async function retryTask(taskId: string): Promise<ApiResponse> {
-  const response = await apiClient.post<ApiResponse>(`/api/v1/tasks/${taskId}/retry`)
+export async function getTaskChildren(taskId: string): Promise<TaskChildrenResponse> {
+  const response = await apiClient.get<TaskChildrenResponse>(`/api/v1/tasks/${taskId}/children`)
+  return response.data
+}
+
+/**
+ * 重试失败的任务（父任务会重跑其失败 / 已取消的子任务）
+ * password：可选，修正加密文档的打开密码后重试（留空表示沿用原密码）
+ */
+export async function retryTask(taskId: string, password?: string): Promise<ApiResponse> {
+  const formData = new FormData()
+  if (password) formData.append('password', password)
+  const response = await apiClient.post<ApiResponse>(`/api/v1/tasks/${taskId}/retry`, formData)
   return response.data
 }
 

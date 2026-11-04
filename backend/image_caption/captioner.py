@@ -35,7 +35,6 @@ class ImageCaptioner:
             base_url=config.api_base,
             api_key=config.api_key or "none",
             timeout=config.timeout,
-            max_retries=0,
         )
 
     def caption_image(self, image_path: Path) -> str:
@@ -47,8 +46,6 @@ class ImageCaptioner:
         """
         image_path = Path(image_path)
         mime = MIME_TYPES.get(image_path.suffix.lower(), "image/jpeg")
-        if image_path.stat().st_size > 20 * 1024 * 1024:
-            raise ValueError("Image exceeds 20 MiB caption limit")
         b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
 
         response = self.client.chat.completions.create(
@@ -91,7 +88,7 @@ class ImageCaptioner:
                     if caption:
                         results[path.name] = caption
                 except Exception as e:
-                    logger.warning(f"⚠️ Failed to caption image {path.name}: {type(e).__name__}")
+                    logger.warning(f"⚠️ Failed to caption image {path.name}: {e}")
 
         logger.info(f"✅ Captioned {len(results)}/{len(image_paths)} images")
         return results

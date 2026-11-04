@@ -55,9 +55,15 @@ check_environment() {
             exit 1
         fi
 
-        if [ "$JWT_SECRET_KEY" = "CHANGE_THIS_TO_A_SECURE_RANDOM_STRING_IN_PRODUCTION" ]; then
-            log_warning "JWT_SECRET_KEY is using default value, must be changed for production!"
-        fi
+        # 已知占位符一律拒绝启动（fail-closed），防止弱密钥上线
+        JWT_PLACEHOLDERS="your-secret-key-change-in-production dev-secret-key-change-in-production cpu-dev-secret-key-change-in-production temp-secret-key CHANGE_THIS_TO_A_SECURE_RANDOM_STRING_IN_PRODUCTION"
+        for placeholder in $JWT_PLACEHOLDERS; do
+            if [ "$JWT_SECRET_KEY" = "$placeholder" ]; then
+                log_error "JWT_SECRET_KEY is a known placeholder: $placeholder"
+                log_error "Generate a random one: openssl rand -hex 32 (or run setup.sh)"
+                exit 1
+            fi
+        done
     fi
 }
 
@@ -67,10 +73,30 @@ check_environment() {
 initialize_directories() {
     log_info "Initializing directory structure..."
 
-    mkdir -p /app/models
+    # /app/models 允许只读挂载（离线部署直接把 models-offline 挂成 :ro），
+    # 因此建目录失败不视为错误
+    mkdir -p /app/models 2> /dev/null || true
     mkdir -p /app/data/uploads
     mkdir -p /app/data/output
+    mkdir -p /app/data/db
     mkdir -p /app/logs
+
+    # 真正需要写入的目录：不可写直接退出，避免任务跑到一半才失败
+    local dir
+    for dir in /app/data/uploads /app/data/output /app/data/db /app/logs; do
+        if [ ! -w "$dir" ]; then
+            log_error "Directory $dir is not writable by the container user (UID $(id -u))."
+            log_error "Fix on host: 让部署目录属主与 TIANSHU_UID/TIANSHU_GID 一致，"
+            log_error "             或执行 chmod -R a+rwX <host dir>（参考 setup.sh create_directories）"
+            exit 1
+        fi
+    done
+
+    # /app/models 只读即可：mineru.json 与模型权重都只被读取。
+    # 只有需要在容器内下载模型时才必须可写，这里降级为提示。
+    if [ ! -w /app/models ]; then
+        log_info "/app/models is read-only (expected for offline deployments; models are only read)"
+    fi
 
     log_success "Directory structure initialized"
 }
@@ -84,51 +110,16 @@ setup_mineru_config() {
     log_info "Setting up MinerU configuration (mineru.json)..."
 
     # 该文件由 download_models.py 生成到共享卷 /app/models 中
+    # 目标路径随容器运行用户变化（非 root 时为 /home/tianshu）
     CONFIG_SRC="/app/models/mineru.json"
     CONFIG_FILENAME="${MINERU_TOOLS_CONFIG_JSON:-mineru.json}"
-    CONFIG_DEST="${TIANSHU_RUNTIME_HOME:-$HOME}/${CONFIG_FILENAME}"
+    CONFIG_DEST="${HOME:-/root}/${CONFIG_FILENAME}"
 
     if [ -f "$CONFIG_SRC" ]; then
         cp "$CONFIG_SRC" "${CONFIG_DEST}"
-        python - "${CONFIG_DEST}" <<'PYCONFIG'
-import json, sys, os
-from pathlib import Path
-path = Path(sys.argv[1])
-config = json.loads(path.read_text())
-if config.get("models-dir", {}).get("pipeline") == "/app/models/PDF-Extract-Kit-1.0/models":
-    config["models-dir"]["pipeline"] = "/app/models/PDF-Extract-Kit-1.0"
-config.setdefault("model-source", "local")
-if os.getenv("MODEL_DOWNLOAD_SOURCE") == "local":
-    config["model-source"] = "local"
-config["config_version"] = "1.3.2"
-path.write_text(json.dumps(config, ensure_ascii=False, indent=4))
-PYCONFIG
         log_success "mineru.json distributed to ${CONFIG_DEST}"
     else
-        if [ "${MODEL_DOWNLOAD_SOURCE:-auto}" = "local" ]; then
-            log_error "$CONFIG_SRC not found. Offline mode requires a local MinerU config."
-            exit 1
-        fi
         log_warning "$CONFIG_SRC not found. MinerU might use default internal settings."
-    fi
-}
-
-# ============================================================================
-# Ultralytics config initialization
-# ============================================================================
-setup_ultralytics_config() {
-    log_info "Setting up Ultralytics configuration..."
-
-    CONFIG_SRC="/app/models/ultralytics_cfg"
-    CONFIG_DEST="${ULTRALYTICS_CONFIG_DIR:-/app/data/Ultralytics}"
-
-    mkdir -p "$CONFIG_DEST"
-
-    if [ -d "$CONFIG_SRC" ]; then
-        cp -n "$CONFIG_SRC"/* "$CONFIG_DEST"/ 2> /dev/null || true
-        log_success "Ultralytics config prepared at ${CONFIG_DEST}"
-    else
-        log_warning "$CONFIG_SRC not found. Ultralytics may create default settings."
     fi
 }
 
@@ -136,16 +127,22 @@ setup_ultralytics_config() {
 # Model initialization
 # ============================================================================
 initialize_models() {
-    log_info "Validating offline models..."
+    log_info "Initializing models..."
 
-    INIT_SCRIPT="/usr/local/bin/init-models.sh"
+    # 检查是否有外部模型卷挂载
+    if [ -d "/models-external" ]; then
+        # 调用统一的模型初始化脚本
+        INIT_SCRIPT="/usr/local/bin/init-models.sh"
 
-    if [ -f "$INIT_SCRIPT" ]; then
-        log_info "Running model validation script: $INIT_SCRIPT"
-        bash "$INIT_SCRIPT"
+        if [ -f "$INIT_SCRIPT" ]; then
+            log_info "Running model initialization script: $INIT_SCRIPT"
+            bash "$INIT_SCRIPT" || log_warning "Model initialization script failed, continuing..."
+        else
+            log_warning "Model initialization script not found: $INIT_SCRIPT"
+        fi
     else
-        log_error "Model validation script not found: $INIT_SCRIPT"
-        exit 1
+        log_warning "External models directory (/models-external) not found"
+        log_warning "Models will be downloaded on first use"
     fi
 }
 
@@ -156,52 +153,17 @@ check_models() {
     log_info "Checking model files..."
 
     MODEL_PATH=${MODEL_PATH:-/app/models}
-    local failed=0
-    local offline_mode=0
-
-    if [ "${MODEL_DOWNLOAD_SOURCE:-auto}" = "local" ]; then
-        offline_mode=1
-    fi
 
     if [ ! -d "$MODEL_PATH" ]; then
-        if [ "$offline_mode" -eq 1 ]; then
-            log_error "Model directory does not exist: $MODEL_PATH"
-            exit 1
-        fi
-        log_warning "Model directory does not exist: $MODEL_PATH"
-        return 0
+        log_warning "Model directory does not exist, will create $MODEL_PATH"
+        mkdir -p "$MODEL_PATH"
     fi
 
-    if [ -d "$MODEL_PATH/PDF-Extract-Kit-1.0/models" ]; then
-        log_success "MinerU pipeline model found"
+    # Check key models
+    if [ -d "$MODEL_PATH/sensevoice" ]; then
+        log_success "SenseVoice model found"
     else
-        log_warning "MinerU pipeline model not found at $MODEL_PATH/PDF-Extract-Kit-1.0/models"
-        failed=1
-    fi
-
-    if [ "${TIANSHU_DEPLOY_MODE:-full}" = "pipeline" ]; then
-        if [ "$offline_mode" -eq 1 ] && [ "$failed" -ne 0 ]; then exit 1; fi
-        return 0
-    fi
-    local vlm_path
-    vlm_path=$(python -c 'from model_layout import active_vlm_path; print(active_vlm_path())')
-    if [ -d "$vlm_path" ]; then
-        log_success "MinerU VLM model found"
-    else
-        log_warning "MinerU VLM model not found at $vlm_path"
-        failed=1
-    fi
-
-    if [ -d "${PADDLEX_HOME:-/root/.paddlex}/official_models/PaddleOCR-VL-1.5-0.9B" ]; then
-        log_success "PaddleOCR-VL model found"
-    else
-        log_warning "PaddleOCR-VL model not found at ${PADDLEX_HOME:-/root/.paddlex}/official_models/PaddleOCR-VL-1.5-0.9B"
-        failed=1
-    fi
-
-    if [ "$failed" -ne 0 ] && [ "$offline_mode" -eq 1 ]; then
-        log_error "Required offline models are missing"
-        exit 1
+        log_warning "SenseVoice model not found, audio processing features will be limited"
     fi
 }
 
@@ -257,11 +219,6 @@ check_gpu() {
         log_info "$line"
     done
 
-    # Check PaddlePaddle
-    python -c "import paddle; print('Paddle CUDA:', paddle.device.is_compiled_with_cuda())" 2>&1 | while read line; do
-        log_info "$line"
-    done
-
     # Check device information
     if python -c "import torch; print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU')" 2>&1 | grep -q "No GPU"; then
         log_warning "No available GPU device detected"
@@ -286,16 +243,15 @@ main() {
     check_environment "$SERVICE_TYPE"
     initialize_directories
 
-    # ✅ 在初始化目录后，执行配置分发
-    setup_mineru_config
-    setup_ultralytics_config
-
     initialize_database
 
-    # Validate offline models before checking
-    if [ "${MODEL_DOWNLOAD_SOURCE:-auto}" = "local" ] && [ "$SERVICE_TYPE" != "mcp" ]; then
+    # Initialize models before checking (for worker only)
+    if [ "$SERVICE_TYPE" = "worker" ]; then
         initialize_models
     fi
+
+    # 模型初始化完成后再分发 mineru.json（离线/外部模型卷此时已复制到 /app/models）
+    setup_mineru_config
 
     check_models
 

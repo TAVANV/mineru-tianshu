@@ -1,4 +1,38 @@
-> 定制分支：MinerU 3.4.5、新模型增量准备及兼容补齐说明见 [第四批升级指南](docs/phase4-compatible-upstream-completion.md)。本次代码集成不执行模型下载。
+> 本分支已合并上游 v2.2.1（`46af54c`）。仅保留外置模型兼容、任务级 RustFS 开关、图片交接接口，以及必要的数据迁移和依赖/预览安全修正。部署本仓库请使用 `bash setup.sh`（源码构建），或叠加 `docker-compose.build.yml`；下面的上游 GHCR 镜像不包含本地兼容接口。
+
+## 从旧定制版本升级
+
+- PaddleOCR、自定义 Office 解析、任务调度、MCP 和 Webhook 统一采用上游。旧的 `paddleocr-vl` / `paddleocr-vl-vllm` 客户端应改为上游支持的 MinerU 后端；`office_parser`、`MCP_API_KEY_MAP` 和旧可选功能配置接口不再生效。
+- 升级前让旧 Worker 完成任务并停止所有旧服务，备份 SQLite 数据库及输出目录；不要让新旧 Worker 同时操作数据库。旧的多层 ZIP/PDF 任务先在旧版本处理完。现有账户、API Key、任务及输出保留。
+- 旧 `webhook_deliveries` 表自动归档为 `webhook_deliveries_legacy_20260915`，原记录保留，旧待投递通知不自动重发。新通知统一使用上游 Key/任务级配置和签名协议，不再使用旧全局回调、内网白名单或取消通知。升级前核对待投递记录并适配接收方；回滚时恢复升级前数据库备份。
+- 使用新版 `.env.example` 核对部署配置。旧的独立部署脚本和 `deploy/docker/` 编排不再维护，统一使用上游 `setup.sh`、`docker-compose.yml` 及叠加文件。
+
+### 保留的兼容契约
+
+`POST /api/v1/tasks/submit` 仍接受可选表单字段 `use_rustfs`：不传时跟随 `RUSTFS_ENABLED`；`true` 强制上传；`false` 保留本地图片。启用上传时，上传失败仍按上游策略使任务失败。前端高级设置提供相同选项，PDF/ZIP 子任务继承该选择，本地图片在合并时去重命名并搬到父任务目录。
+
+`GET /api/v1/tasks/{task_id}/images` 返回 `{success, task_id, status, images, total}`；每项图片包含 `filename`、`download_url`、`size`。调用方须有任务读取权限；图片下载支持 `X-API-Key` 和 JWT。任务未完成或产物已清理时返回空列表。下游可继续下载并接管图片。
+
+### 复用已有外置模型
+
+标准新部署使用上游 `backend/download_models.py`。已有外置目录使用保留的 `backend/offline_models.py`，它保留旧 VLM 选择及目录，并提供增量下载和校验；`backend/prepare_offline_models.py` 也保留，但不再默认下载 PaddleOCR。不要对旧目录运行上游默认下载器来切换模型。
+
+```bash
+# 在联网准备机补齐 Pipeline 权重；不会自动切换已有 VLM。
+python backend/offline_models.py --output /data/modelfiles --models mineru_pipeline --strict
+# 如需 Pro VLM，显式下载并切换；原 VLM 权重不删除。
+python backend/offline_models.py --output /data/modelfiles --models mineru_vlm_pro --vlm-model mineru_vlm_pro --strict
+# 只读验证 mineru.json 与所选权重；不下载、不修改配置。
+python backend/check_external_models.py /data/modelfiles
+
+# .env 中设置 OFFLINE_MODELS_PATH=/data/modelfiles，仍使用原 data/uploads、data/output、data/db。
+docker compose -f docker-compose.yml -f docker-compose.build.yml -f docker-compose.external-models.yml build
+docker compose -f docker-compose.yml -f docker-compose.build.yml -f docker-compose.external-models.yml up -d
+```
+
+外置目录挂到 `/app/models`，`mineru.json` 使用容器路径；模型权重只读，下载缓存与 Ultralytics 配置子目录可写。本地 vLLM 额外叠加上游 `docker-compose.vllm.yml`，模型选择跟随已有 `mineru.json`。启动前只校验权重，不自动下载或复制整份模型。真实 GPU 推理及旧模型与新版引擎的兼容性仍需在部署环境验收。
+
+---
 
 <div align="center">
 
@@ -48,6 +82,49 @@
 
 ## 📝 最新更新
 
+### 2026-10-16 🚀 v2.2.1：发布预构建 Docker 镜像
+
+- ✅ **预构建镜像**：GPU 后端、CPU 后端、前端镜像随版本发布到 GHCR（`ghcr.io/magicyuan876/tianshu-backend` / `tianshu-backend-cpu` / `tianshu-frontend`），部署时直接拉取，无需本机构建
+- ✅ **compose 默认拉取发布镜像**：`docker-compose.yml` 按 `.env` 中的 `TIANSHU_IMAGE_REGISTRY` / `TIANSHU_VERSION` 拉取镜像；源码构建与本地代码挂载拆到 `docker-compose.build.yml`，`setup.sh` 默认叠加该文件，行为不变
+- ✅ **GPU 镜像瘦身**：基础镜像由 `cudnn-devel` 改为 `cudnn-runtime`，压缩后基础层从 4.32GB 降到 2.0GB
+- ✅ **第三方镜像固定版本**：vLLM 固定为 `v0.31.0`、RustFS 固定为 `1.0.1`，可通过 `VLLM_VERSION` / `RUSTFS_VERSION` 覆盖
+- 🐛 **修复**：worker 缺少 `JWT_SECRET_KEY` 导致任务完成后 Webhook 通知入队失败
+
+### 2026-10-12 🚀 v2.2.0：加密文档解析支持
+
+- ✅ **加密 PDF**：支持密码保护的 PDF；空密码 / 仅所有者密码的文档自动移除限制，无需手动输入
+- ✅ **加密 Office**：支持加密的 DOCX / XLSX / PPTX 及旧版 DOC / XLS / PPT（msoffcrypto-tool 解密后走正常解析流水线）
+- ✅ **加密 ZIP**：支持 ZipCrypto 与 AES 加密的压缩包，解密后自动解包为父子任务批量解析
+- ✅ **全链路 password 参数**：提交任务时可选填文档打开密码——API 表单、前端提交页高级选项、MCP `parse_document` 工具、Dify 插件均已支持
+- ✅ **密码错误可补救**：解密失败任务给出友好中文报错，可在任务详情页重试时填写正确密码直接重跑，无需重新提交
+- 🔒 **密码安全**：密码仅存于任务 options（接口返回一律掩码）、不落任何日志；解密明文副本隔离存放，任务完成自动清理
+
+### 2026-09-13 🚀 v2.1.0：Webhook 任务通知、审计日志与界面体系升级
+
+- ✅ **Webhook 任务终态通知**：任务完成/失败时向对接方推送带 HMAC 签名的回调（仅任务元数据 + 结果查询地址，不含解析内容）；调度器周期投递，失败指数退避重试直至死信，全程 SSRF 防护，投递记录可查询
+- ✅ **按 API Key 维度配置回调**：每个对接系统在「API Token 管理」中自助绑定回调地址、签名密钥与出站鉴权（Bearer/Basic/自定义头），支持测试投递；管理员可在系统设置统一查看与管理全部对接方；临时场景可在提交任务时按任务指定 `webhook_url`
+- ✅ **审计日志**：登录、配置变更、API Key 与任务高危操作全量留痕（含 IP/UA），系统设置页可视化筛选查询，按保留期自动清理
+- ✅ **界面体系升级**：设置中心重构为导航式布局，全局页面自适应流式宽度，顶栏分区协调不遮挡；英文界面全量翻译，中英文完整双语
+
+### 2026-09-12 🚀 v2.0.0 稳定版：多模态图片描述、ZIP/EPUB 支持与系统完善
+
+- ✅ **图片描述（多模态大模型）**：解析结果中的图片可自动调用多模态大模型生成内容描述，写回 Markdown 图片 alt 与 JSON 的 img_caption；管理员在系统配置页完成启用与模型配置（OpenAI 兼容接口），支持连接测试与并发控制
+- ✅ **ZIP 压缩包解析**：上传 zip 自动解包为父子任务批量解析（条目数/解压总量限制，防 Zip Slip），结果按条目合并；新增 EPUB 格式支持（MarkItDown）
+- ✅ **邀请码注册**：管理员可在配置页开启注册邀请码，公开注册接口按需校验
+- ✅ **任务取消**：支持取消 pending/processing/paused 状态的任务（PR #83）
+- ✅ **MinerU 3.4.5 升级**：Office 原生解析（DOCX/XLSX/PPTX）、macOS MPS 原生运行支持；引擎聚焦 MinerU，移除 PaddleOCR 引擎
+- ✅ **部署统一**：单一交互式 `setup.sh` 入口（GPU/纯 pipeline/CPU/原生/离线），新增 pipeline-only 编排与离线部署方案
+- ⚡ **性能与稳定性**：SQLite 启用 WAL 模式消除读写互斥；API 端点去阻塞化；Redis 队列与 SQLite 定期对账；子任务单事务批量创建；vLLM 容器按需冷启动
+- 🔒 **安全加固**：认证与密钥强度强制校验、文件服务鉴权与下载防护、对象存储凭据与网络收紧、依赖版本升级等系统性完善（升级前请按文档重新生成 `.env`）
+- 🔧 **修复**：图片 EXIF 方向非法导致解析失败、模型缓存随容器重建丢失、图片源文件预览失败等问题
+
+### 2026-09-11 🚀 MinerU 3.4.5 升级
+
+- ✅ **MinerU 3.4.5 升级**：`mineru[all]>=3.4.5`，同步 `mineru-vl-utils>=1.0.5,<2`、`pypdf>=5.6.0`
+- ✅ **VLM 模型更新**：`MinerU2.5-2509-1.2B` → `MinerU2.5-Pro-2605-1.2B`（模型下载脚本、`mineru.json`、vLLM 服务同步）
+- ✅ **兼容确认**：`do_parse` API、`vlm/hybrid` 后端名（旧别名 `*-auto-engine` 仍受支持）、pipeline 模型目录结构（PP-DocLayoutV2 等）均保持不变
+- ✅ **macOS 原生支持**：Apple Silicon 自动启用 MPS 加速（`--accelerator mps`），VLM 后端自动走 MLX；音视频辅助引擎在 mac 上回退 CPU
+
 ### 2026-04-12 🔧 MinerU 3.0.9 升级 & Office 格式增强
 
 - ✅ **MinerU 3.0.9 升级**
@@ -96,16 +173,13 @@
 ### 2025-10-30 🐳 Docker 部署 + 企业级认证系统
 
 - ✅ **Docker 容器化部署支持**
-  - **一键部署**：`make setup` 或运行部署脚本即可完成全栈部署
+  - **一键部署**：根目录交互式脚本 `setup.sh`（或 `make setup`）即可完成全栈部署
   - **多阶段构建**：优化镜像体积，分离依赖层和应用层
   - **GPU 支持**：NVIDIA CUDA 12.6 + Container Toolkit 集成
   - **服务编排**：前端、后端、Worker、MCP 完整编排（docker-compose）
-  - **开发友好**：支持热重载、远程调试（debugpy）、实时日志
+  - **开发友好**：源码挂载进容器，改完 `make reload` 即生效；`make smoke` 一键验证解析链路
   - **生产就绪**：健康检查、数据持久化、零停机部署、资源限制
-  - **跨平台脚本**：
-    - Linux/Mac: `scripts/docker-setup.sh` 或 `Makefile`
-    - Windows: `scripts/docker-setup.bat`
-  - **完整文档**：`scripts/DOCKER_QUICK_START.txt`、`scripts/docker-commands.sh`
+  - **多种部署模式**：GPU 标准、纯 pipeline、Mac CPU 本地开发、原生部署、离线部署
   - 详见：Docker 配置文件（`docker-compose.yml`、`backend/Dockerfile`、`frontend/Dockerfile`）
 
 - ✅ **企业级用户认证与授权系统**
@@ -188,7 +262,6 @@
 - 支持 109+ 语言自动识别，无需手动指定语言
 - 文档方向分类、文本图像矫正、版面区域检测等增强功能
 - 原生 PDF 多页文档支持，模型自动下载管理
-- 详细文档：[backend/paddleocr_vl/README.md](backend/paddleocr_vl/README.md)
 
 ---
 
@@ -196,7 +269,7 @@
 
 MinerU Tianshu（天枢）是一个**企业级 AI 数据预处理平台**，将非结构化数据转换为 AI 可用的结构化格式：
 
-- **📄 文档**: PDF、Word、Excel、PPT → Markdown/JSON（MinerU、PaddleOCR-VL 109+ 语言、水印去除🧪）
+- **📄 文档**: PDF、Word、Excel、PPT → Markdown/JSON（MinerU、水印去除🧪）
 - **🎬 视频**: MP4、AVI、MKV → 语音转写 + 关键帧 OCR🧪（FFmpeg + SenseVoice）
 - **🎙️ 音频**: MP3、WAV、M4A → 文字转写 + 说话人识别（SenseVoice 多语言）
 - **🖼️ 图片**: JPG、PNG → 文字提取 + 结构化（多 OCR 引擎 + 水印去除🧪）
@@ -235,14 +308,17 @@ MinerU Tianshu（天枢）是一个**企业级 AI 数据预处理平台**，将�
 
 - ✅ **用户认证**: JWT 认证、角色权限、API Key 管理
 - ✅ **任务管理**: 拖拽上传、批量处理、实时追踪、Markdown/JSON 预览
+- ✅ **加密文档解析**: 加密 PDF（空密码/仅所有者密码自动移除）、加密 Office、加密 ZIP；提交时可选填密码，密码错误可在重试时补填
 - ✅ **队列管理**: 系统监控、超时重置、文件清理
+- ✅ **Webhook 通知**: 按 API Key 绑定回调，任务终态签名推送、失败重试
+- ✅ **审计日志**: 敏感操作留痕、可视化查询、自动清理
 - ✅ **MCP 协议**: AI 助手（Claude Desktop）无缝集成
 - ✅ **Docker 部署**: 一键部署、GPU 支持、完整容器化
 
 ### 支持的文件格式
 
-- 📄 **文档**: PDF、Word、Excel、PPT（MinerU、PaddleOCR-VL、MarkItDown）
-- 🖼️ **图片**: JPG、PNG、BMP、TIFF（MinerU、PaddleOCR-VL）
+- 📄 **文档**: PDF、Word、Excel、PPT（MinerU、MarkItDown；支持加密文档，提交时填密码即可）
+- 🖼️ **图片**: JPG、PNG、BMP、TIFF（MinerU）
 - 🎙️ **音频**: MP3、WAV、M4A、FLAC（SenseVoice 多语言、说话人识别、情感识别）
 - 🎬 **视频**: MP4、AVI、MKV、MOV、WebM（音频转写 + 关键帧 OCR🧪）
 - 🧬 **生物格式**: FASTA、GenBank（序列统计、碱基分析、GC 含量）
@@ -267,9 +343,8 @@ mineru-server/
 │   ├── remove_watermark/  # 水印去除（YOLO11x + LaMa）
 │   └── requirements.txt
 │
-├── scripts/               # 部署脚本
-│   ├── docker-setup.sh    # Linux/Mac 部署
-│   └── docker-setup.bat   # Windows 部署
+├── setup.sh               # 一键部署脚本（交互式引导 + 非交互参数）
+├── scripts/               # 辅助脚本（docker-entrypoint.sh、init-models.sh）
 │
 ├── docker-compose.yml     # Docker 编排配置
 └── Makefile               # 快捷命令
@@ -282,18 +357,50 @@ mineru-server/
 **前置要求**：Docker 20.10+、Docker Compose 2.0+、NVIDIA Container Toolkit（GPU 可选）
 
 ```bash
-# 一键部署
-make setup
+# 一键部署（交互式引导）
+bash setup.sh
 
-# 或使用脚本
-./scripts/docker-setup.sh    # Linux/Mac
-scripts\docker-setup.bat     # Windows
+# 跳过提问直接部署（非交互，适合 CI/熟手）
+bash setup.sh --mode pipeline --yes
 
-# 常用命令
+# 预览将要执行的配置（不构建、不启动）
+bash setup.sh --mode gpu --dry-run
+```
+
+> Windows 用户请使用 Git Bash 或 WSL 运行 `setup.sh`。
+
+`setup.sh` 支持六种部署模式：
+
+| 模式 | 说明 |
+|---|---|
+| `gpu` | GPU 标准部署（docker-compose.yml，默认） |
+| `pipeline` | 纯 pipeline 部署（只下载 PDF-Extract-Kit 模型，更轻量） |
+| `cpu` | Mac CPU 本地开发（docker-compose.cpu.yml + .env.cpu） |
+| `native` | 本机原生部署（不用 Docker，Apple Silicon 自动 MPS 加速，VLM 走 MLX） |
+| `offline-build` / `offline-deploy` | 离线部署：联网机构建离线包 / 生产机离线部署 |
+
+交互过程会询问网络环境（国内镜像加速 / 海外官方源直连）、GPU 数量（自动检测）、Worker 并发数、模型源（HuggingFace/ModelScope）、Redis、RustFS 公网地址和端口，并自动完成 JWT 密钥生成、`MINERU_VIRTUAL_VRAM_SIZE`/`WORKER_MEMORY_LIMIT` 计算、目录创建和健康检查。
+
+> 网络环境也可用参数指定：`--network cn`（国内镜像加速，默认）或 `--network global`（海外/代理，官方源直连）。该选择同时作用于 Docker 镜像构建（apt/pip/npm 源）与原生部署的 pip 安装。
+
+常用命令：
+
+```bash
 make start    # 启动服务
 make stop     # 停止服务
 make logs     # 查看日志
 ```
+
+**使用预构建镜像（免构建）**：不运行 `setup.sh` 时，可直接拉取发布镜像部署。
+
+```bash
+cp .env.example .env   # 填写 JWT_SECRET_KEY、TIANSHU_ADMIN_PASSWORD、RUSTFS_*、RUSTFS_PUBLIC_URL 等必填项
+mkdir -p models/huggingface_cache models/modelscope_cache data/uploads data/output data/db          logs/backend logs/worker logs/mcp logs/scheduler
+docker compose -f docker-compose.yml -f docker-compose.pipeline.yml up -d   # 纯 pipeline
+docker compose -f docker-compose.yml -f docker-compose.vllm.yml up -d       # GPU 全引擎（含本机 vLLM）
+```
+
+> 镜像版本由 `.env` 中的 `TIANSHU_VERSION` 指定；GHCR 拉取较慢时，可把 `TIANSHU_IMAGE_REGISTRY` 改为同步后的镜像仓库地址。
 
 **服务访问**：
 - 前端：http://localhost:80
@@ -345,14 +452,13 @@ npm run dev                  # http://localhost:3000
 - **pipeline**: MinerU 标准流程，通用文档解析
 - **vlm-transformers/vlm-vllm-engine**: MinerU VLM 模式
 <!-- - **deepseek-ocr**: DeepSeek OCR，高精度需求 -->
-- **paddleocr-vl**: 109+ 语言，自动方向矫正
 
 ## 🎯 核心特性
 
 - **Worker 主动拉取**: 0.5秒响应，无需调度器触发
 - **GPU 负载均衡**: LitServe 自动调度，避免显存冲突，多 GPU 隔离
 - **并发安全**: 原子操作防止任务重复，支持多 Worker 并发
-- **多解析引擎**: MinerU、PaddleOCR-VL、MarkItDown、格式引擎
+- **多解析引擎**: MinerU、MarkItDown、格式引擎
 - **自动清理**: 定期清理旧文件，保留数据库记录
 - **现代化 UI**: TailwindCSS 美观界面，响应式设计，实时更新
 
@@ -415,66 +521,41 @@ python start_all.py --enable-mcp  # MCP Server 端口 8002（默认）
 
 ## 🚢 生产部署
 
-### 离线部署（推荐）
+### 离线部署
 
-Tianshu 支持**完全离线部署**，提供两种部署模式：
-
-#### 方式 1：统一版（GPU 自动降级 CPU）
-
-适用于 Linux 服务器（有 GPU 则加速，无 GPU 自动降级 CPU）：
+Tianshu 支持**完全离线部署**，分为联网机构建、生产机部署两个阶段：
 
 ```bash
-# 1. 在联网环境构建镜像（Linux/Mac 均可）
-./scripts/build-offline.sh
+# 1. 在联网环境构建离线包（Linux/Mac 均可，产物在 docker-images/）
+bash setup.sh --mode offline-build
 
 # 2. 传输到生产服务器
 rsync -avz docker-images/ user@prod-server:/opt/tianshu/
 
-# 3. 在生产服务器部署（自动检测 GPU/CPU）
+# 3. 在生产服务器部署
 cd /opt/tianshu
-./deploy-offline.sh
-```
-
-#### 方式 2：CPU 专用版（Mac/无 GPU 环境）
-
-适用于 Mac（Apple Silicon/Intel）和无 GPU 的 Linux 环境：
-
-```bash
-# 1. 在联网环境构建镜像
-./scripts/build-offline.sh
-
-# 2. 传输构建产物（可选：直接在目标机器构建可跳过此步）
-rsync -avz docker-images/ user@target:/opt/tianshu/
-
-# 3. 在目标机器部署（强制 CPU 模式）
-cd /opt/tianshu
-./deploy-offline-cpu.sh
+bash setup.sh --mode offline-deploy
 ```
 
 **特点**：
-- ✅ **统一镜像**：自动检测 GPU，有则加速，无则 CPU 降级
 - ✅ **跨平台构建**：支持在 Mac（Apple Silicon/Intel）构建 Linux amd64 镜像
 - ✅ **完全离线**：所有模型（~15GB）和依赖预先打包
 - ✅ **一键部署**：自动配置环境变量、JWT 密钥、RustFS 对象存储
-- ✅ **Office 文档支持**：自动转换 .doc/.docx/.pptx 等格式为 PDF 后处理
+- ✅ **Office 文档支持**：MinerU 原生解析 .docx/.xlsx/.pptx，旧版 .doc/.xls/.ppt 经 LibreOffice 转换后解析
 
 **关键修复**：
-- 🔧 Worker uploads 目录读写权限（支持 Office 转 PDF）
+- 🔧 Worker uploads 目录读写权限
 - 🔧 albumentations/albucore 版本锁定（解决 MinerU 公式识别依赖）
 - 🔧 RustFS 镜像平台指定（确保 amd64 架构一致性）
 
-📖 **详细说明**：[DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)
-
 ### 在线 Docker 部署
 
-推荐使用 Docker Compose 一键部署：
-
 ```bash
-# 一键部署
-docker compose up -d
+# 交互式引导部署（推荐）
+bash setup.sh
 
-# 或使用 Make 命令
-make setup
+# 或直接启动（需已配置 .env）
+docker compose up -d
 ```
 
 ### 手动部署
@@ -495,11 +576,30 @@ server {
 
 **后端部署**：`cd backend && python start_all.py --api-port 8000 --worker-port 9000`
 
+### 附录：常用 Docker 命令速查
+
+```bash
+# 构建与启动
+docker compose build --parallel        # 并行构建全部镜像
+docker compose up -d                   # 后台启动全部服务
+docker compose down                    # 停止并移除容器
+
+# 状态与日志
+docker compose ps                      # 查看服务状态
+docker compose logs -f                 # 跟踪全部日志
+docker compose logs -f backend         # 跟踪单服务日志
+
+# 进入容器与调试
+docker compose exec backend bash       # 进入后端容器
+docker compose exec worker nvidia-smi  # 检查容器内 GPU
+docker stats                           # 查看容器资源占用
+```
+
 ## 📚 技术栈
 
 **前端**：Vue 3、TypeScript、Vite、TailwindCSS、Pinia、Vue Router
 
-**后端**：FastAPI、LitServe、MinerU、PaddleOCR、SenseVoice、SQLite、Loguru
+**后端**：FastAPI、LitServe、MinerU、SenseVoice、SQLite、Loguru
 
 ## 🔧 故障排查
 
@@ -529,7 +629,6 @@ server {
 **核心引擎**
 
 - [MinerU](https://github.com/opendatalab/MinerU) - PDF/图片文档解析
-- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) - 多语言 OCR 引擎
 - [SenseVoice](https://github.com/FunAudioLLM/SenseVoice) - 语音识别与说话人识别
 - [FunASR](https://github.com/modelscope/FunASR) - 语音识别框架
 - [MarkItDown](https://github.com/microsoft/markitdown) - 文档转换工具

@@ -1,0 +1,54 @@
+# 叠加于上游编排和本仓库源码构建配置，复用已有 /data/modelfiles。
+# docker compose -f docker-compose.yml -f docker-compose.build.yml -f docker-compose.external-models.yml up -d
+x-external-environment: &external-environment
+  MODEL_PATH: /app/models
+  MINERU_MODEL_SOURCE: local
+  MODEL_DOWNLOAD_SOURCE: local
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  MODELSCOPE_OFFLINE: "1"
+  MODELSCOPE_CACHE: /app/models/modelscope_cache
+  HF_HOME: /app/models/huggingface_cache
+  WATERMARK_MODEL_DIR: /app/models/watermark_models
+  LAMA_MODEL: /app/models/watermark_models/big-lama.pt
+  YOLO_CONFIG_DIR: /app/models/ultralytics_cfg
+
+x-external-volumes: &external-volumes
+  - ${OFFLINE_MODELS_PATH:-/data/modelfiles}:/app/models:ro
+  - ${OFFLINE_MODELS_PATH:-/data/modelfiles}/modelscope_cache:/app/models/modelscope_cache:rw
+  - ${OFFLINE_MODELS_PATH:-/data/modelfiles}/huggingface_cache:/app/models/huggingface_cache:rw
+  - ${OFFLINE_MODELS_PATH:-/data/modelfiles}/ultralytics_cfg:/app/models/ultralytics_cfg:rw
+
+services:
+  init-models:
+    image: tianshu-backend:latest
+    entrypoint: ["python", "check_external_models.py", "/app/models"]
+    environment: *external-environment
+    volumes: *external-volumes
+  backend:
+    environment: *external-environment
+    volumes: *external-volumes
+  worker:
+    environment: *external-environment
+    volumes: *external-volumes
+  scheduler:
+    environment: *external-environment
+    volumes: *external-volumes
+  mcp-server:
+    environment: *external-environment
+    volumes: *external-volumes
+  vllm-mineru:
+    entrypoint: ["python3", "/opt/vllm-model-entrypoint.py"]
+    volumes:
+      - ${OFFLINE_MODELS_PATH:-/data/modelfiles}:/models:ro
+      - ./scripts/vllm-model-entrypoint.py:/opt/vllm-model-entrypoint.py:ro
+    environment:
+      MINERU_VLM_MODEL_DIR: ${MINERU_VLM_MODEL_DIR:-}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    command: >
+      --served-model-name MinerU-1.2B
+      --trust-remote-code --host 0.0.0.0 --port 30024
+      --gpu-memory-utilization 0.6 --max-model-len 8192
+      --max-num-batched-tokens 8192 --enforce-eager
+      --limit-mm-per-prompt '{"image": 1}'

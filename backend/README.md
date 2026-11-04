@@ -72,12 +72,14 @@ POST /api/v1/tasks/submit
 
 参数:
   - file: 文件 (必需)
-  - backend: pipeline | vlm-transformers | vllm-engine | paddleocr-vl (默认: pipeline)
+  - backend: pipeline | vlm-transformers | vllm-engine (默认: pipeline)
   - lang: ch | en | korean | japan (默认: ch)
   - method: auto | txt | ocr (默认: auto)
   - formula_enable: boolean (默认: true)
   - table_enable: boolean (默认: true)
   - priority: 0-100 (默认: 0)
+  - password: 加密文档打开密码（可选，仅加密 PDF / Office / ZIP 需要；
+    解密失败任务报错，可通过重试补填正确密码；密码不出现在任何查询接口响应中）
 
 返回:
   {
@@ -127,6 +129,23 @@ DELETE /api/v1/tasks/{task_id}
   {
     "success": true,
     "message": "Task cancelled successfully"
+  }
+```
+
+#### 重试失败任务
+
+```
+POST /api/v1/tasks/{task_id}/retry
+
+参数:
+  - password: 可选表单参数，仅对 failed 状态任务生效。加密文档因密码错误失败时，
+    传入正确密码会覆盖任务 options 中的原密码后重新入队；留空表示沿用原密码。
+
+返回:
+  {
+    "success": true,
+    "message": "Task submitted for retry",
+    "retried_subtasks": 0
   }
 ```
 
@@ -259,7 +278,6 @@ export MINERU_VIRTUAL_VRAM_SIZE=6
 | 引擎 | 名称 | 特点 | 适用场景 |
 |------|------|------|----------|
 | `pipeline` | MinerU Pipeline | 完整文档解析，支持表格、公式 | 通用文档处理 |
-| `paddleocr-vl` | PaddleOCR-VL | 多语言 OCR，自动方向矫正 | 多语言文档 |
 | `sensevoice` | SenseVoice | 音频转文字，说话人识别 | 音频处理 |
 | `video` | Video Engine | 视频处理，关键帧 OCR | 视频分析 |
 | `fasta` | FASTA Engine | 生物序列格式解析 | 生物信息学 |
@@ -279,9 +297,8 @@ export MINERU_VIRTUAL_VRAM_SIZE=6
 
 ### 多解析器支持
 
-- **MinerU**: 完整文档解析，支持表格、公式等 (GPU 加速)
-- **PaddleOCR-VL**: 高精度视觉语言模型 OCR (可选)
-- **MarkItDown**: 处理 Office、HTML、文本等 (快速处理)
+- **MinerU**: 完整文档解析，支持 PDF、图片、DOCX/XLSX/PPTX 及旧版 Office 转换 (GPU 加速)
+- **MarkItDown**: 处理 HTML、文本、CSV 等轻量格式 (快速处理)
 
 ### 自动清理
 

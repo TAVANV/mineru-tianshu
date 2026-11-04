@@ -4,14 +4,14 @@
 使用 YOLO11x 检测水印位置，LaMa 模型修复图像
 """
 
-import os
 import cv2
 import numpy as np
-import torch
 from PIL import Image
 from pathlib import Path
 from typing import List, Tuple, Optional, Union
 from loguru import logger
+
+from utils import copy_file
 
 try:
     from ultralytics import YOLO
@@ -20,64 +20,12 @@ try:
 except ImportError:
     ULTRALYTICS_AVAILABLE = False
 
-LAMA_AVAILABLE = True
+try:
+    from simple_lama_inpainting import SimpleLama
 
-
-class LocalLamaInpainter:
-    """Minimal LaMa TorchScript runner for offline deployments."""
-
-    def __init__(self, model_path: str, device: str):
-        if not Path(model_path).exists():
-            raise FileNotFoundError(f"lama torchscript model not found: {model_path}")
-
-        self.device = torch.device(device if torch.cuda.is_available() or not device.startswith("cuda") else "cpu")
-        self.model = torch.jit.load(model_path, map_location=self.device)
-        self.model.eval()
-        self.model.to(self.device)
-
-    @staticmethod
-    def _ceil_modulo(value: int, modulo: int) -> int:
-        if value % modulo == 0:
-            return value
-        return (value // modulo + 1) * modulo
-
-    @classmethod
-    def _prepare_image(cls, image: Image.Image) -> tuple[torch.Tensor, tuple[int, int]]:
-        image_array = np.array(image.convert("RGB")).astype(np.float32) / 255.0
-        height, width = image_array.shape[:2]
-        image_array = np.transpose(image_array, (2, 0, 1))
-        image_array = cls._pad_to_modulo(image_array)
-        tensor = torch.from_numpy(image_array).unsqueeze(0)
-        return tensor, (height, width)
-
-    @classmethod
-    def _prepare_mask(cls, mask: Image.Image) -> torch.Tensor:
-        mask_array = np.array(mask.convert("L")).astype(np.float32) / 255.0
-        mask_array = mask_array[np.newaxis, ...]
-        mask_array = cls._pad_to_modulo(mask_array)
-        tensor = torch.from_numpy((mask_array > 0).astype(np.float32)).unsqueeze(0)
-        return tensor
-
-    @classmethod
-    def _pad_to_modulo(cls, array: np.ndarray, modulo: int = 8) -> np.ndarray:
-        _, height, width = array.shape
-        out_height = cls._ceil_modulo(height, modulo)
-        out_width = cls._ceil_modulo(width, modulo)
-        return np.pad(array, ((0, 0), (0, out_height - height), (0, out_width - width)), mode="symmetric")
-
-    def __call__(self, image: Image.Image, mask: Image.Image) -> Image.Image:
-        image_tensor, (height, width) = self._prepare_image(image)
-        mask_tensor = self._prepare_mask(mask)
-        image_tensor = image_tensor.to(self.device)
-        mask_tensor = mask_tensor.to(self.device)
-
-        with torch.inference_mode():
-            inpainted = self.model(image_tensor, mask_tensor)
-
-        result = inpainted[0].permute(1, 2, 0).detach().cpu().numpy()
-        result = result[:height, :width]
-        result = np.clip(result * 255, 0, 255).astype(np.uint8)
-        return Image.fromarray(result)
+    LAMA_AVAILABLE = True
+except ImportError:
+    LAMA_AVAILABLE = False
 
 
 class WatermarkRemover:
@@ -94,8 +42,6 @@ class WatermarkRemover:
 
     # 默认使用 HuggingFace 上的 YOLO11x 水印检测模型
     DEFAULT_MODEL_ID = "corzent/yolo11x_watermark_detection"
-    DEFAULT_LOCAL_MODEL = "/app/models/YOLO11/best.pt"
-    DEFAULT_LAMA_MODEL = "/app/models/big-lama.pt"
 
     def __init__(self, model_path: Optional[str] = None, device: str = "cuda", use_lama: bool = True):
         """
@@ -112,11 +58,7 @@ class WatermarkRemover:
         if not ULTRALYTICS_AVAILABLE:
             raise ImportError("ultralytics not installed. Install: pip install ultralytics")
 
-        default_local_model = Path(self.DEFAULT_LOCAL_MODEL)
-        self._model_path_provided = model_path is not None
-        self.model_path = model_path or (
-            str(default_local_model) if default_local_model.exists() else self.DEFAULT_MODEL_ID
-        )
+        self.model_path = model_path or self.DEFAULT_MODEL_ID
         self.device = device
         self.use_lama = use_lama and LAMA_AVAILABLE
 
@@ -135,9 +77,9 @@ class WatermarkRemover:
         except ImportError:
             raise ImportError("huggingface_hub not installed. Install: pip install huggingface-hub")
 
-        # 模型目录：优先环境变量 WATERMARK_MODEL_DIR（容器/离线部署指定），默认 ~/.cache/watermark_models。
-        # 代码认死文件名 yolo11x_watermark.pt，离线时把模型放到该目录下并命名为此即可，不会再联网。
-        cache_dir = Path(os.environ.get("WATERMARK_MODEL_DIR") or (Path.home() / ".cache" / "watermark_models"))
+        import os
+
+        cache_dir = Path(os.getenv("WATERMARK_MODEL_DIR", str(Path.home() / ".cache" / "watermark_models")))
         cache_dir.mkdir(parents=True, exist_ok=True)
 
         model_file = cache_dir / "yolo11x_watermark.pt"
@@ -162,18 +104,6 @@ class WatermarkRemover:
             logger.error(f"❌ Failed to download model: {e}")
             raise
 
-    def _resolve_local_model_file(self) -> Optional[str]:
-        """Return the mounted offline YOLO checkpoint if it exists."""
-        local_model = Path(self.DEFAULT_LOCAL_MODEL)
-        if local_model.exists():
-            return str(local_model)
-
-        cache_model = Path.home() / ".cache" / "watermark_models" / "yolo11x_watermark.pt"
-        if cache_model.exists():
-            return str(cache_model)
-
-        return None
-
     def _load_yolo(self):
         """加载 YOLO 模型"""
         if self.yolo is not None:
@@ -182,19 +112,11 @@ class WatermarkRemover:
         logger.info("📥 Loading YOLO model...")
 
         # 判断是本地文件还是 HuggingFace ID
-        local_model = self._resolve_local_model_file()
         model_path = Path(self.model_path)
-        if local_model and not self._model_path_provided:
-            model_file = local_model
-        elif model_path.exists():
+        if model_path.exists():
             # 本地文件
             model_file = str(model_path)
         elif "/" in self.model_path:
-            if os.getenv("MODEL_DOWNLOAD_SOURCE", "auto").lower() == "local":
-                raise FileNotFoundError(
-                    "Offline mode requires a local YOLO watermark model at "
-                    f"{self.DEFAULT_LOCAL_MODEL} or ~/.cache/watermark_models/yolo11x_watermark.pt"
-                )
             # HuggingFace ID
             model_file = self._download_model_from_hf()
         else:
@@ -212,8 +134,7 @@ class WatermarkRemover:
         logger.info("📥 Loading LaMa...")
 
         try:
-            model_path = os.getenv("LAMA_MODEL") or self.DEFAULT_LAMA_MODEL
-            self.lama = LocalLamaInpainter(model_path, self.device)
+            self.lama = SimpleLama()
             logger.info("✅ LaMa loaded")
         except Exception as e:
             logger.warning(f"Failed to load LaMa: {e}")
@@ -251,27 +172,21 @@ class WatermarkRemover:
             if save_detection_viz and boxes:
                 import cv2
 
-                # 读取图像（用 imdecode 兼容中文/非 ASCII 路径，cv2.imread 对中文路径返回 None 会崩溃）
-                img = cv2.imdecode(np.fromfile(str(image_path), dtype=np.uint8), cv2.IMREAD_COLOR)
-                if img is None:
-                    logger.warning(f"⚠️ 无法读取图像用于检测可视化（跳过，不影响去水印主流程）: {image_path}")
-                else:
-                    img_viz = img.copy()
+                # 读取图像
+                img = cv2.imread(str(image_path))
+                img_viz = img.copy()
 
-                    # 绘制检测框
-                    for x1, y1, x2, y2, conf in boxes:
-                        # 绘制矩形框（绿色）
-                        cv2.rectangle(img_viz, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        # 添加置信度标签
-                        label = f"Watermark {conf:.2f}"
-                        cv2.putText(img_viz, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                # 绘制检测框
+                for x1, y1, x2, y2, conf in boxes:
+                    # 绘制矩形框（绿色）
+                    cv2.rectangle(img_viz, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    # 添加置信度标签
+                    label = f"Watermark {conf:.2f}"
+                    cv2.putText(img_viz, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-                    # 保存（imencode + tofile 兼容中文路径）
-                    ext = Path(save_detection_viz).suffix or ".jpg"
-                    ok, buf = cv2.imencode(ext, img_viz)
-                    if ok:
-                        buf.tofile(str(save_detection_viz))
-                        logger.info(f"🔍 Detection visualization saved: {save_detection_viz}")
+                # 保存
+                cv2.imwrite(str(save_detection_viz), img_viz)
+                logger.info(f"🔍 Detection visualization saved: {save_detection_viz}")
 
         return boxes
 
@@ -369,9 +284,7 @@ class WatermarkRemover:
         if not boxes:
             logger.info("  No watermark detected, copying original")
             # 复制而不是移动
-            import shutil
-
-            shutil.copy2(image_path, output_path)
+            copy_file(image_path, output_path)
             return output_path
 
         logger.info(f"  Detected {len(boxes)} watermark(s)")

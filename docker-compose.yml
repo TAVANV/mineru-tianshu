@@ -1,5 +1,8 @@
 # Tianshu (天枢) - Production Docker Compose
 # 终极优化版：单任务串行 + 低显存占用 + 权限修复 + 任务调度 + VLLM互斥
+#
+# 默认拉取发布镜像（TIANSHU_IMAGE_REGISTRY / TIANSHU_VERSION 见 .env）。
+# 从源码构建并挂载本地代码：叠加 docker-compose.build.yml
 
 name: tianshu
 
@@ -14,14 +17,22 @@ services:
     profiles:
       - redis
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      # 仅绑定宿主机回环：Redis 只对容器网络与宿主机本机暴露
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     environment:
       - TZ=Asia/Shanghai
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD required}
+    # noeviction 而非 allkeys-lru：这是任务队列，不是缓存。LRU 会在内存吃紧时静默
+    # 驱逐队列本身，任务虽不会丢（SQLite 兜底）但会集体绕开 Redis 退化成锁竞争。
+    # noeviction 下则是 enqueue 明确报错，能被日志和对账发现。
+    # CONFIG 命令禁用，防止运行时把策略改回去。
+    command: redis-server --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required} --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction --rename-command CONFIG ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "$$REDIS_PASSWORD", "ping"]
     networks:
       - tianshu-network
 
@@ -29,12 +40,12 @@ services:
   # RustFS (对象存储)
   # ============================================================================
   rustfs:
-    image: rustfs/rustfs:latest
+    image: rustfs/rustfs:${RUSTFS_VERSION:-1.0.1}
     container_name: tianshu-rustfs
     restart: unless-stopped
     ports:
-      - "${RUSTFS_PORT:-9000}:9000"
-      - "${RUSTFS_CONSOLE_PORT:-9001}:9001"
+      # 仅绑定宿主机回环：浏览器经前端 nginx 的 /s3/ 路径反代访问图片
+      - "127.0.0.1:${RUSTFS_PORT:-9000}:9000"
     volumes:
       - rustfs-data:/data
       - rustfs-logs:/logs
@@ -42,8 +53,8 @@ services:
       - /etc/timezone:/etc/timezone:ro
     environment:
       - TZ=Asia/Shanghai
-      - RUSTFS_ROOT_USER=${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      - RUSTFS_ROOT_PASSWORD=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_ROOT_USER=${RUSTFS_ACCESS_KEY:?RUSTFS_ACCESS_KEY required}
+      - RUSTFS_ROOT_PASSWORD=${RUSTFS_SECRET_KEY:?RUSTFS_SECRET_KEY required}
     networks:
       - tianshu-network
 
@@ -51,21 +62,21 @@ services:
   # Model Initializer (模型预下载与配置生成)
   # ============================================================================
   init-models:
-    image: tianshu-backend:latest
+    image: ${TIANSHU_IMAGE_REGISTRY:-ghcr.io/magicyuan876}/tianshu-backend:${TIANSHU_VERSION:-2.2.1}
     container_name: tianshu-init-models
+    user: "${TIANSHU_UID:-0}:${TIANSHU_GID:-0}"
     entrypoint: ["python", "download_models.py", "--output", "/app/models"]
     volumes:
       - ./models:/app/models:rw
-      - ./models/paddlex_cache:/root/.paddlex:rw
-      - ./models/paddleocr_cache:/root/.paddleocr:rw
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     environment:
       - TZ=Asia/Shanghai
-      - HF_HOME=/app/models/huggingface_cache
-      - MODELSCOPE_CACHE=/app/models/modelscope_cache
       - MODEL_DOWNLOAD_SOURCE=${MODEL_DOWNLOAD_SOURCE:-auto}
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+      # 模型缓存显式指向宿主机挂载目录（与运行用户/HOME 无关），容器重建后无需重新下载
+      - HF_HOME=/app/models/huggingface_cache
+      - MODELSCOPE_CACHE=/app/models/modelscope_cache
     networks:
       - tianshu-network
 
@@ -73,26 +84,16 @@ services:
   # Backend API (主服务)
   # ============================================================================
   backend:
-    build:
-      context: .
-      dockerfile: backend/Dockerfile
-      args:
-        PIP_MIRROR: ${PIP_MIRROR:-https://mirrors.aliyun.com/pypi/simple/}
-        PIP_TIMEOUT: ${PIP_TIMEOUT:-600}
-        PIP_RETRIES: ${PIP_RETRIES:-10}
-    image: tianshu-backend:latest
+    image: ${TIANSHU_IMAGE_REGISTRY:-ghcr.io/magicyuan876}/tianshu-backend:${TIANSHU_VERSION:-2.2.1}
     container_name: tianshu-backend
-    user: root
+    user: "${TIANSHU_UID:-0}:${TIANSHU_GID:-0}"
     restart: unless-stopped
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
-      - ./backend:/app/backend:rw
       - ./models:/app/models:rw
-      - ./models/paddlex_cache:/root/.paddlex:rw
-      - ./models/paddleocr_cache:/root/.paddleocr:rw
-      - ./input:/app/data/uploads:rw
-      - ./output:/app/data/output:rw
+      - ./data/uploads:/app/data/uploads:rw
+      - ./data/output:/app/data/output:rw
       - ./logs/backend:/app/logs:rw
       - ./data/db:/app/data/db:rw
       - /etc/localtime:/etc/localtime:ro
@@ -102,27 +103,35 @@ services:
       - HOST=0.0.0.0
       - API_PORT=8000
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
-      - UPLOAD_VALIDATE_CONTENT=${UPLOAD_VALIDATE_CONTENT:-false}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - JWT_EXPIRE_MINUTES=${JWT_EXPIRE_MINUTES:-60}
+      # 首次部署必须设置管理员初始密码（见 .env），否则 API 服务拒绝启动
+      - TIANSHU_ADMIN_USERNAME=${TIANSHU_ADMIN_USERNAME:-admin}
+      - TIANSHU_ADMIN_PASSWORD=${TIANSHU_ADMIN_PASSWORD}
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
-      - WORKER_URL=${WORKER_URL:-http://worker:8001}
+      - WORKER_URL=${WORKER_URL:-http://tianshu-worker:8001}
       - MODEL_PATH=/app/models
-      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - OUTPUT_PATH=/app/data/output
       - UPLOAD_PATH=/app/data/uploads
       - DATABASE_PATH=${DATABASE_PATH:-/app/data/db/mineru_tianshu.db}
       - RUSTFS_ENABLED=${RUSTFS_ENABLED:-true}
-      - RUSTFS_ENDPOINT=${RUSTFS_ENDPOINT:-rustfs:9000}
-      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_ENDPOINT=${RUSTFS_ENDPOINT:-tianshu-rustfs:9000}
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY}
       - RUSTFS_BUCKET=${RUSTFS_BUCKET:-ts-img}
-      - RUSTFS_PUBLIC_URL=${RUSTFS_PUBLIC_URL}
-      - HF_HOME=/app/models/huggingface_cache
-      - MODELSCOPE_CACHE=/app/models/modelscope_cache
+      # 默认经前端 nginx /s3/ 反代访问（80 端口）；无 nginx 的本地开发可改 http://127.0.0.1:9000
+      - RUSTFS_PUBLIC_URL=${RUSTFS_PUBLIC_URL:-http://localhost/s3}
+      - REDIS_QUEUE_ENABLED=${REDIS_QUEUE_ENABLED:-false}
+      - REDIS_HOST=${REDIS_HOST:-tianshu-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
       - MODEL_DOWNLOAD_SOURCE=${MODEL_DOWNLOAD_SOURCE:-auto}
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+      # 模型缓存显式指向宿主机挂载目录（与运行用户/HOME 无关），容器重建后无需重新下载
+      - HF_HOME=/app/models/huggingface_cache
+      - MODELSCOPE_CACHE=/app/models/modelscope_cache
+      # 模型来源：local = 只使用 /app/models 下已挂载的权重，不做联网探测
+      - MINERU_MODEL_SOURCE=${MINERU_MODEL_SOURCE:-local}
     deploy:
       resources:
         reservations:
@@ -142,95 +151,44 @@ services:
   # Task Scheduler (任务调度与清理)
   # ============================================================================
   scheduler:
-    image: tianshu-backend:latest
+    image: ${TIANSHU_IMAGE_REGISTRY:-ghcr.io/magicyuan876}/tianshu-backend:${TIANSHU_VERSION:-2.2.1}
     container_name: tianshu-scheduler
-    user: root
+    user: "${TIANSHU_UID:-0}:${TIANSHU_GID:-0}"
     restart: unless-stopped
     command: ["python", "task_scheduler.py", "--interval", "60", "--stale-task-timeout", "60"]
     volumes:
       - ./data/db:/app/data/db:rw
-      - ./output:/app/data/output:rw
-      - ./input:/app/data/uploads:rw
+      - ./data/output:/app/data/output:rw
+      - ./data/uploads:/app/data/uploads:rw
       - ./logs/scheduler:/app/logs:rw
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     environment:
       - TZ=Asia/Shanghai
       - DATABASE_PATH=/app/data/db/mineru_tianshu.db
-      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
-      - UPLOAD_VALIDATE_CONTENT=${UPLOAD_VALIDATE_CONTENT:-false}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - TIANSHU_ADMIN_USERNAME=${TIANSHU_ADMIN_USERNAME:-admin}
+      - TIANSHU_ADMIN_PASSWORD=${TIANSHU_ADMIN_PASSWORD}
     depends_on:
       - backend
     networks:
       - tianshu-network
 
   # ============================================================================
-  # vLLM Service - PaddleOCR (默认启动)
-  # ============================================================================
-  vllm-paddleocr:
-    image: vllm/vllm-openai:nightly
-    container_name: tianshu-vllm-paddleocr
-    restart: unless-stopped
-    ports:
-      - "30023:30023"
-    volumes:
-      - ./models:/models:ro
-      - ./models/paddlex_cache:/root/.paddlex:ro
-      - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
-    environment:
-      - TZ=Asia/Shanghai
-      - CUDA_VISIBLE_DEVICES=${VLLM_PADDLE_DEVICE:-0}
-      - TOKENIZERS_PARALLELISM=false
-      - GLOG_minloglevel=2
-      - VLLM_LOGGING_LEVEL=ERROR
-      - PYTHONWARNINGS=ignore
-    # ⬇️ [优化] 显存降至 0.6，防止卡顿；限制单次处理 1 张图
-    command: >
-      --model /root/.paddlex/official_models/PaddleOCR-VL-1.5-0.9B
-      --served-model-name PaddleOCR-VL-1.5-0.9B
-      --trust-remote-code
-      --host 0.0.0.0
-      --port 30023
-      --gpu-memory-utilization 0.6
-      --max-model-len 8192
-      --max-num-batched-tokens 8192
-      --enforce-eager
-      --limit-mm-per-prompt '{"image": 1}'
-    shm_size: 32gb
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    networks:
-      - tianshu-network
-    depends_on:
-      init-models:
-        condition: service_completed_successfully
-
-  # ============================================================================
   # vLLM Service - MinerU (手动触发，互斥控制)
   # ============================================================================
   vllm-mineru:
-    image: vllm/vllm-openai:nightly
+    image: vllm/vllm-openai:${VLLM_VERSION:-v0.31.0}
     container_name: tianshu-vllm-mineru
-    entrypoint: ["python", "/opt/tianshu-vllm-entrypoint.py"]
     restart: no
     profiles: ["manual"]
     ports:
-      - "30024:30024"
+      - "127.0.0.1:30024:30024"
     volumes:
       - ./models:/models:ro
-      - ./scripts/vllm-model-entrypoint.py:/opt/tianshu-vllm-entrypoint.py:ro
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     environment:
-      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - TZ=Asia/Shanghai
       - CUDA_VISIBLE_DEVICES=${VLLM_MINERU_DEVICE:-0}
       - GLOG_minloglevel=2
@@ -238,6 +196,7 @@ services:
       - PYTHONWARNINGS=ignore
     # ⬇️ [优化] 显存降至 0.6，防止卡顿；限制单次处理 1 张图
     command: >
+      --model /models/MinerU2.5-Pro-2605-1.2B
       --served-model-name MinerU-1.2B
       --trust-remote-code
       --host 0.0.0.0
@@ -265,28 +224,19 @@ services:
   # Worker (任务执行者)
   # ============================================================================
   worker:
-    image: tianshu-backend:latest
+    image: ${TIANSHU_IMAGE_REGISTRY:-ghcr.io/magicyuan876}/tianshu-backend:${TIANSHU_VERSION:-2.2.1}
     container_name: tianshu-worker
-    user: root
+    user: "${TIANSHU_UID:-0}:${TIANSHU_GID:-0}"
     restart: unless-stopped
-    command: [
-      "worker",
-      "python",
-      "litserve_worker.py",
-      "--paddleocr-vl-vllm-engine-enabled",
-      "--paddleocr-vl-vllm-api-list", "['http://vllm-paddleocr:30023/v1']",
-      "--mineru-vllm-api-list", "['http://vllm-mineru:30024/v1']"
-    ]
+    # vLLM 相关参数与 /var/run/docker.sock 挂载已移到 docker-compose.vllm.yml，
+    # 仅在真正使用本机 vLLM 时叠加 —— 避免解析不可信文档的容器常驻持有宿主机 Docker 权限
+    command: ["worker", "python", "litserve_worker.py"]
     ports:
-      - "${WORKER_PORT:-8001}:8001"
+      - "127.0.0.1:${WORKER_PORT:-8001}:8001"
     volumes:
-      - ./backend:/app/backend:rw
-      - /var/run/docker.sock:/var/run/docker.sock
       - ./models:/app/models:rw
-      - ./models/paddlex_cache:/root/.paddlex:rw
-      - ./models/paddleocr_cache:/root/.paddleocr:rw
-      - ./input:/app/data/uploads:rw
-      - ./output:/app/data/output:rw
+      - ./data/uploads:/app/data/uploads:rw
+      - ./data/output:/app/data/output:rw
       - ./logs/worker:/app/logs:rw
       - ./data/db:/app/data/db:rw
       - /etc/localtime:/etc/localtime:ro
@@ -296,35 +246,40 @@ services:
       - HOST=0.0.0.0
       - WORKER_PORT=8001
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      # ⬇️ [核心优化] 强制单任务串行
+      # ⬇️ 并发控制唯一入口（默认单任务串行）；>1 时必须同步下调 MINERU_VIRTUAL_VRAM_SIZE，否则 CUDA OOM
       - MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-1}
+      # 每进程 CPU 线程数，留空 = 自动按「可用核数 ÷ worker 进程总数」均分
+      - WORKER_CPU_THREADS=${WORKER_CPU_THREADS:-}
+      - MINERU_VIRTUAL_VRAM_SIZE=${MINERU_VIRTUAL_VRAM_SIZE:-8}
       - WORKER_GPUS=1
       - MAX_BATCH_SIZE=1
       - MODEL_PATH=/app/models
-      - MINERU_VLM_MODEL_DIR=${MINERU_VLM_MODEL_DIR:-}
       - OUTPUT_PATH=/app/data/output
       - UPLOAD_PATH=/app/data/uploads
       - DATABASE_PATH=${DATABASE_PATH:-/app/data/db/mineru_tianshu.db}
       - TIMEOUT=${WORKER_TIMEOUT:-300}
-      - HF_HOME=/app/models/huggingface_cache
-      - MODELSCOPE_CACHE=/app/models/modelscope_cache
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - MODEL_DOWNLOAD_SOURCE=${MODEL_DOWNLOAD_SOURCE:-auto}
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
       - HF_TOKEN=${HF_TOKEN:-}
+      # 模型缓存显式指向宿主机挂载目录（与运行用户/HOME 无关），容器重建后无需重新下载
+      - HF_HOME=/app/models/huggingface_cache
+      - MODELSCOPE_CACHE=/app/models/modelscope_cache
+      # 模型来源：local = 只使用 /app/models 下已挂载的权重，不做联网探测
+      - MINERU_MODEL_SOURCE=${MINERU_MODEL_SOURCE:-local}
       - PDF_SPLIT_ENABLED=${PDF_SPLIT_ENABLED:-true}
-      - PDF_SPLIT_THRESHOLD_PAGES=${PDF_SPLIT_THRESHOLD_PAGES:-500}
-      - PDF_SPLIT_CHUNK_SIZE=${PDF_SPLIT_CHUNK_SIZE:-500}
+      - PDF_SPLIT_THRESHOLD_PAGES=${PDF_SPLIT_THRESHOLD_PAGES:-40}
+      - PDF_SPLIT_CHUNK_SIZE=${PDF_SPLIT_CHUNK_SIZE:-20}
       - RUSTFS_ENABLED=${RUSTFS_ENABLED:-true}
-      - RUSTFS_ENDPOINT=${RUSTFS_ENDPOINT:-rustfs:9000}
-      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_ENDPOINT=${RUSTFS_ENDPOINT:-tianshu-rustfs:9000}
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY}
       - RUSTFS_BUCKET=${RUSTFS_BUCKET:-ts-img}
-      - RUSTFS_PUBLIC_URL=${RUSTFS_PUBLIC_URL}
+      - RUSTFS_PUBLIC_URL=${RUSTFS_PUBLIC_URL:-http://localhost/s3}
       - REDIS_QUEUE_ENABLED=${REDIS_QUEUE_ENABLED:-false}
-      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_HOST=${REDIS_HOST:-tianshu-redis}
       - REDIS_PORT=${REDIS_PORT:-6379}
-      - PADDLE_HOME=/root/.paddleocr
-      - PADDLEX_HOME=/root/.paddlex
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
     mem_limit: ${WORKER_MEMORY_LIMIT:-16G}
     memswap_limit: ${WORKER_MEMORY_LIMIT:-16G}
     mem_reservation: ${WORKER_MEMORY_RESERVATION:-8G}
@@ -352,12 +307,14 @@ services:
   # MCP Server
   # ============================================================================
   mcp-server:
-    image: tianshu-backend:latest
+    image: ${TIANSHU_IMAGE_REGISTRY:-ghcr.io/magicyuan876}/tianshu-backend:${TIANSHU_VERSION:-2.2.1}
     container_name: tianshu-mcp
+    user: "${TIANSHU_UID:-0}:${TIANSHU_GID:-0}"
     restart: unless-stopped
     command: ["mcp", "python", "mcp_server.py"]
     ports:
-      - "${MCP_PORT:-8002}:8002"
+      # 仅绑定宿主机回环：MCP 供本机 Claude Desktop 等客户端使用
+      - "127.0.0.1:${MCP_PORT:-8002}:8002"
     volumes:
       - ./mcp_config.example.json:/app/backend/mcp_config.json:ro
       - ./logs/mcp:/app/logs:rw
@@ -365,16 +322,15 @@ services:
       - /etc/timezone:/etc/timezone:ro
     environment:
       - TZ=Asia/Shanghai
-      - HOST=0.0.0.0
+      - MCP_HOST=0.0.0.0
       - MCP_PORT=8002
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - API_BASE_URL=${API_URL:-http://backend:8000}
-      - MCP_HOST=0.0.0.0
+      - API_BASE_URL=${API_BASE_URL:-http://tianshu-backend:8000}
+      # MCP 访问密钥（逗号分隔）与 MCP 调后端 API 的服务凭据
       - MCP_API_KEYS=${MCP_API_KEYS:-}
-      - MCP_API_KEY_MAP=${MCP_API_KEY_MAP:-}
       - TIANSHU_API_KEY=${TIANSHU_API_KEY:-}
-      - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS:-localhost:*,127.0.0.1:*}
-      - MCP_ALLOWED_ORIGINS=${MCP_ALLOWED_ORIGINS:-}
+      - TIANSHU_ADMIN_USERNAME=${TIANSHU_ADMIN_USERNAME:-admin}
+      - TIANSHU_ADMIN_PASSWORD=${TIANSHU_ADMIN_PASSWORD}
     networks:
       - tianshu-network
     depends_on:
@@ -384,10 +340,7 @@ services:
   # Frontend
   # ============================================================================
   frontend:
-    build:
-      context: .
-      dockerfile: frontend/Dockerfile
-    image: tianshu-frontend:latest
+    image: ${TIANSHU_IMAGE_REGISTRY:-ghcr.io/magicyuan876}/tianshu-frontend:${TIANSHU_VERSION:-2.2.1}
     container_name: tianshu-frontend
     restart: unless-stopped
     ports:
@@ -398,10 +351,16 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8000}
+      # nginx 上游按容器名寻址（服务名别名可能丢失，容器名始终登记在内置 DNS 中）
+      - NGINX_BACKEND_UPSTREAM=tianshu-backend:8000
+      - NGINX_RUSTFS_UPSTREAM=tianshu-rustfs:9000
     networks:
       - tianshu-network
     depends_on:
+      # nginx 会在启动时解析 /s3/ 的上游，rustfs 未就绪会拖慢首次启动；
+      # 真正的健壮性由 nginx 配置里的 resolver + 变量 proxy_pass 保证
       - backend
+      - rustfs
 
 networks:
   tianshu-network:
@@ -409,8 +368,9 @@ networks:
     ipam:
       driver: default
       config:
-        - subnet: 172.28.0.0/16
-          gateway: 172.28.0.1
+        # 网段可配置：默认值被占用时 setup.sh 会自动挑一个空闲 /16 写入 .env
+        - subnet: ${TIANSHU_SUBNET:-172.28.0.0/16}
+          gateway: ${TIANSHU_GATEWAY:-172.28.0.1}
 
 volumes:
   redis-data:

@@ -14,10 +14,8 @@ MinerU Tianshu - MCP Server
 """
 
 import asyncio
-from contextvars import ContextVar
 import base64
 import hmac
-import hashlib
 import ipaddress
 import json
 import os
@@ -33,8 +31,6 @@ import aiohttp
 import uvicorn
 from loguru import logger
 from mcp.server import Server
-from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
-from mcp.server.auth.provider import AccessToken
 from mcp.server.sse import SseServerTransport
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import TextContent, Tool
@@ -42,7 +38,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from utils.file_utils import FilenameValidationError, ensure_within_directory, sanitize_filename
+from utils import FilenameValidationError, ensure_within_directory, sanitize_filename
 
 # 文件大小限制（从环境变量读取，0 表示不限制）
 MAX_FILE_SIZE_BYTES = int(os.getenv("MAX_FILE_SIZE", "0"))  # 0 = 不限制
@@ -61,24 +57,9 @@ TIANSHU_API_KEY = os.getenv("TIANSHU_API_KEY", "")
 MCP_API_KEYS = [key.strip() for key in os.getenv("MCP_API_KEYS", "").split(",") if key.strip()]
 
 
-MCP_API_KEY_MAP = json.loads(os.getenv("MCP_API_KEY_MAP") or "{}")
-if not isinstance(MCP_API_KEY_MAP, dict) or not all(
-    isinstance(k, str) and k and isinstance(v, str) and v for k, v in MCP_API_KEY_MAP.items()
-):
-    raise ValueError("MCP_API_KEY_MAP must map access keys to backend service keys")
-_service_key = ContextVar("mcp_service_key", default=None)
-
-
-def _mcp_identity(key: str):
-    # Supply the SDK principal so SSE session ownership is enforced on /messages.
-    # Never retain the raw access credential in the principal object.
-    return AuthenticatedUser(AccessToken(token="", client_id=hashlib.sha256(key.encode()).hexdigest(), scopes=[]))
-
-
 def _api_headers() -> dict:
     """访问后端 API 时携带的服务凭据请求头"""
-    key = _service_key.get() or TIANSHU_API_KEY
-    return {"X-API-Key": key} if key else {}
+    return {"X-API-Key": TIANSHU_API_KEY} if TIANSHU_API_KEY else {}
 
 
 def _error_response(message: str) -> list[TextContent]:
@@ -89,7 +70,8 @@ def _error_response(message: str) -> list[TextContent]:
 def _validate_download_url(url: str) -> None:
     """下载目标校验（SSRF 防护）：仅允许 http/https，且解析出的所有 IP 必须为公网地址
 
-    建连时 PublicResolver 再校验实际地址，禁止重定向，避免 DNS 重绑定绕过。
+    注意：校验通过后 aiohttp 建连时会再次进行 DNS 解析，仍存在 DNS 重绑定的
+    残余风险，已通过"一次性解析校验 + allow_redirects=False"尽量收敛。
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -105,8 +87,7 @@ def _validate_download_url(url: str) -> None:
     for info in addr_infos:
         ip = ipaddress.ip_address(info[4][0])
         if (
-            not ip.is_global
-            or ip.is_loopback
+            ip.is_loopback
             or ip.is_private
             or ip.is_link_local
             or ip.is_reserved
@@ -130,10 +111,7 @@ class MCPAuthMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not any(
-            scope.get("path", "").rstrip("/") == p or scope.get("path", "").startswith(p + "/")
-            for p in self.PROTECTED_PATHS
-        ):
+        if scope["type"] != "http" or scope.get("path", "") not in self.PROTECTED_PATHS:
             await self.app(scope, receive, send)
             return
 
@@ -144,15 +122,8 @@ class MCPAuthMiddleware:
             if authorization.lower().startswith("bearer "):
                 provided = authorization[len("bearer ") :].strip()
 
-        if provided and any(
-            hmac.compare_digest(provided.encode(), key.encode()) for key in [*MCP_API_KEYS, *MCP_API_KEY_MAP]
-        ):
-            scope["user"] = _mcp_identity(provided)
-            token = _service_key.set(MCP_API_KEY_MAP.get(provided) or TIANSHU_API_KEY)
-            try:
-                await self.app(scope, receive, send)
-            finally:
-                _service_key.reset(token)
+        if provided and any(hmac.compare_digest(provided, key) for key in MCP_API_KEYS):
+            await self.app(scope, receive, send)
             return
 
         logger.warning(f"🔒 Unauthorized MCP access from {scope.get('client')}")
@@ -185,6 +156,7 @@ async def list_tools() -> list[Tool]:
 - 公式识别和表格识别
 - 支持中英文、日文、韩文等多语言
 - 支持任务优先级设置
+- 支持加密文档：提供 password 参数即可解析加密的 PDF / Office / ZIP
 - 异步处理，可选择等待完成或稍后查询
             """.strip(),
             inputSchema={
@@ -202,7 +174,6 @@ async def list_tools() -> list[Tool]:
                     "backend": {
                         "type": "string",
                         "enum": [
-                            "paddleocr-vl-vllm",
                             "auto",
                             "pipeline",
                             "vlm-auto-engine",
@@ -239,6 +210,10 @@ async def list_tools() -> list[Tool]:
                         "default": 0,
                         "minimum": 0,
                         "maximum": 100,
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "加密文档打开密码（加密 PDF / Office / ZIP 时提供，可选）",
                     },
                     "wait_for_completion": {
                         "type": "boolean",
@@ -340,30 +315,6 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         return _error_response("Tool execution failed")
 
 
-class PublicResolver(aiohttp.abc.AbstractResolver):
-    async def resolve(self, host, port=0, family=socket.AF_INET):
-        infos = await asyncio.get_running_loop().getaddrinfo(host, port, family=family, type=socket.SOCK_STREAM)
-        if not infos or any(
-            not ipaddress.ip_address(info[4][0]).is_global or ipaddress.ip_address(info[4][0]).is_multicast
-            for info in infos
-        ):
-            raise ValueError("Download host must resolve to public addresses")
-        return [
-            {
-                "hostname": host,
-                "host": info[4][0],
-                "port": port,
-                "family": info[0],
-                "proto": info[2],
-                "flags": socket.AI_NUMERICHOST,
-            }
-            for info in infos
-        ]
-
-    async def close(self):
-        pass
-
-
 async def parse_document(args: dict) -> list[TextContent]:
     """解析文档 - 支持 Base64 和 URL 两种输入方式"""
     async with aiohttp.ClientSession() as session:
@@ -379,9 +330,7 @@ async def parse_document(args: dict) -> list[TextContent]:
                 try:
                     # Security: Safe use of base64 for file transmission via MCP protocol
                     # This is legitimate business logic, not code obfuscation
-                    if len(args["file_base64"]) > ((MAX_FILE_SIZE_BYTES or MAX_DOWNLOAD_SIZE_BYTES) + 2) // 3 * 4:
-                        return _error_response("File too large")
-                    file_content = base64.b64decode(args["file_base64"], validate=True)
+                    file_content = base64.b64decode(args["file_base64"])
                 except Exception as e:
                     logger.warning(f"Invalid base64 payload: {e}")
                     return _error_response("Invalid base64 encoding")
@@ -427,21 +376,14 @@ async def parse_document(args: dict) -> list[TextContent]:
 
                 # SSRF 防护：先校验 scheme 与解析 IP，失败时仅返回固定文案
                 try:
-                    await asyncio.to_thread(_validate_download_url, url)
+                    _validate_download_url(url)
                 except ValueError as e:
                     logger.warning(f"🔒 Rejected download URL {url}: {e}")
                     return _error_response("Failed to download file")
 
                 try:
                     # 禁止跟随重定向，防止重定向绕过目标校验
-                    async with (
-                        aiohttp.ClientSession(
-                            connector=aiohttp.TCPConnector(resolver=PublicResolver(), use_dns_cache=False)
-                        ) as download_session,
-                        download_session.get(
-                            url, timeout=aiohttp.ClientTimeout(total=60), allow_redirects=False
-                        ) as resp,
-                    ):
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=60), allow_redirects=False) as resp:
                         if resp.status != 200:
                             logger.warning(f"Download failed: HTTP {resp.status}")
                             return _error_response("Failed to download file")
@@ -521,6 +463,8 @@ async def parse_document(args: dict) -> list[TextContent]:
             form_data.add_field("formula_enable", str(args.get("formula_enable", True)).lower())
             form_data.add_field("table_enable", str(args.get("table_enable", True)).lower())
             form_data.add_field("priority", str(args.get("priority", 0)))
+            if args.get("password"):
+                form_data.add_field("password", str(args["password"]))
 
             logger.info(f"📤 Submitting task for: {file_name}")
 
@@ -828,15 +772,25 @@ def _calculate_processing_time(task: dict) -> str:
     return "N/A"
 
 
-def create_app(host="127.0.0.1"):
+async def main():
+    """启动 MCP Server (SSE 模式)"""
+    logger.info("=" * 60)
+    logger.info("🚀 Starting MinerU Tianshu MCP Server")
+    logger.info("=" * 60)
+    logger.info(f"📡 API Base URL: {API_BASE_URL}")
+
+    # 从环境变量读取配置（默认仅监听回环地址，避免未认证暴露到公网）
+    host = os.getenv("MCP_HOST", "127.0.0.1")
+    port = int(os.getenv("MCP_PORT", "8002"))
+
+    if not MCP_API_KEYS:
+        logger.warning("⚠️ MCP_API_KEYS 未配置：/sse 与 /messages 将对所有请求返回 401")
+
     # 创建 SSE Transport，启用 DNS 重绑定 / Host / Origin 防护
     security_settings = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=[
-            h.strip() for h in os.getenv("MCP_ALLOWED_HOSTS", "localhost:*,127.0.0.1:*,[::1]:*").split(",") if h.strip()
-        ],
-        allowed_origins=[o.strip() for o in os.getenv("MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()]
-        or [
+        allowed_hosts=[f"{host}:*", "localhost:*", "127.0.0.1:*", "[::1]:*"],
+        allowed_origins=[
             f"http://{host}:*",
             f"https://{host}:*",
             "http://localhost:*",
@@ -849,14 +803,14 @@ def create_app(host="127.0.0.1"):
     )
     sse = SseServerTransport("/messages", security_settings=security_settings)
 
-    class SSEEndpoint:
-        async def __call__(self, scope, receive, send):
-            async with sse.connect_sse(scope, receive, send) as streams:
-                await app.run(streams[0], streams[1], app.create_initialization_options())
+    # SSE 处理函数
+    async def handle_sse(request):
+        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+            await app.run(streams[0], streams[1], app.create_initialization_options())
 
-    class MessagesEndpoint:
-        async def __call__(self, scope, receive, send):
-            await sse.handle_post_message(scope, receive, send)
+    # POST 消息处理函数
+    async def handle_messages(request):
+        await sse.handle_post_message(request.scope, request.receive, request._send)
 
     # 健康检查端点（公开，不返回版本号、工具列表、端点结构等可被用于信息收集的内容）
     async def health_check(request):
@@ -865,30 +819,13 @@ def create_app(host="127.0.0.1"):
     # 创建 Starlette 应用，受保护端点外挂鉴权中间件
     starlette_app = Starlette(
         routes=[
-            Route("/sse", endpoint=SSEEndpoint()),
-            Route("/messages", endpoint=MessagesEndpoint(), methods=["POST"]),
+            Route("/sse", endpoint=handle_sse),
+            Route("/messages", endpoint=handle_messages, methods=["POST"]),
             Route("/health", endpoint=health_check, methods=["GET"]),
             Route("/", endpoint=health_check, methods=["GET"]),  # 根路径也返回健康检查
         ]
     )
-    return MCPAuthMiddleware(starlette_app)
-
-
-async def main():
-    """启动 MCP Server (SSE 模式)"""
-    logger.info("=" * 60)
-    logger.info("🚀 Starting MinerU Tianshu MCP Server")
-    logger.info("=" * 60)
-    logger.info(f"📡 API Base URL: {API_BASE_URL}")
-
-    # 从环境变量读取配置（默认仅监听回环地址，避免未认证暴露到公网）
-    host = os.getenv("MCP_HOST", "127.0.0.1")
-    port = int(os.getenv("MCP_PORT", "8002"))
-
-    if not MCP_API_KEYS and not MCP_API_KEY_MAP:
-        logger.warning("⚠️ MCP_API_KEYS 未配置：/sse 与 /messages 将对所有请求返回 401")
-
-    starlette_app = create_app(host)
+    starlette_app = MCPAuthMiddleware(starlette_app)
 
     logger.info(f"🌐 MCP Server listening on http://{host}:{port}")
     logger.info(f"📡 SSE endpoint: http://{host}:{port}/sse")

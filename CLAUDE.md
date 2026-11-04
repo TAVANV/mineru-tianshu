@@ -2,170 +2,175 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Overview
+## Project
 
-Tianshu (天枢) is an enterprise-grade AI data preprocessing platform that converts unstructured data (documents, images, audio, video) into AI-ready structured formats (Markdown/JSON). Built with Vue 3 frontend + FastAPI backend + LitServe GPU load balancing.
+MinerU Tianshu (天枢) — an AI data preprocessing platform that turns PDFs, Office docs, images, audio,
+video and bioinformatics files into Markdown + structured JSON. Vue 3 frontend, FastAPI API server,
+LitServe GPU worker pool, SQLite task queue, optional Redis queue / MCP server / RustFS object storage.
 
-## Common Commands
+Code comments, logs and docs are predominantly Simplified Chinese — match that when editing existing files.
 
-### Docker Deployment (Recommended)
+## Commands
+
+### Docker (primary deployment path)
+
 ```bash
-make setup          # Full deployment: config + build + start
-make start          # Start all services
-make stop           # Stop all services
-make logs           # View all logs
-make status         # Check service status
-make build          # Build Docker images
-make dev            # Start development environment (docker-compose.dev.yml)
+make setup           # first-time: runs setup.sh (interactive deployment wizard)
+make build | start | stop | restart | status | logs
+make logs-worker     # per-service logs (also logs-backend, logs-frontend)
+make shell-worker    # exec into a container
+make test-gpu        # verify torch CUDA inside the worker
+make validate        # docker compose config
+make dev             # docker-compose.dev.yml (hot reload + debugpy)
 ```
 
-### Local Development
+`make` reads `REDIS_QUEUE_ENABLED` from the root `.env` and adds `--profile redis` when true.
+`setup.sh` (repo root) is the single deployment entry: `bash setup.sh` (interactive), or
+`bash setup.sh --mode <gpu|pipeline|cpu|offline-build|offline-deploy|dev> [--gpus N] [--concurrency N] [--yes] [--dry-run]`.
+Offline/air-gapped: `--mode offline-build` on a connected machine (bundle in `docker-images/`), then
+`--mode offline-deploy` on the target. Mac CPU local dev: `--mode cpu`.
 
-**Backend:**
+### Local backend
+
 ```bash
 cd backend
-pip install -r requirements.txt
-python start_all.py                    # Start all services
-python start_all.py --enable-mcp       # With MCP protocol
-python start_all.py --workers-per-device 2 --devices 0,1  # Custom GPU config
+cp .env.example .env          # REQUIRED — start_all.py exits if backend/.env is missing
+python start_all.py                       # API 8000 + worker 8001
+python start_all.py --enable-mcp --mcp-port 8002
+python start_all.py --workers-per-device 2 --devices 0,1 --accelerator cuda
 ```
 
-**Frontend:**
+All backend processes must run with `backend/` as CWD (imports are top-level: `from utils import ...`,
+`from auth import ...`). Individual services: `python api_server.py`, `python litserve_worker.py`,
+`python task_scheduler.py --enable-scheduler`, `python mcp_server.py`.
+
+### Frontend
+
 ```bash
-cd frontend
-npm install
-npm run dev         # Development server at localhost:3000
-npm run build       # tsc type-check + Vite build (output in dist/)
-npm run preview     # Preview the production build locally
+cd frontend && npm install
+npm run dev      # :3000, proxies /api -> localhost:8000 (vite.config.ts)
+npm run build    # tsc && vite build -> dist/
 ```
 
-### Linting & Tests
-- **Python**: Ruff is configured at the repo root in `pyproject.toml` (target py312, line-length 120, rules `E`+`F`, ignores `E402`/`E501`). Run `ruff check .` / `ruff format .`. Ruff is a dev/pre-commit tool, not in `requirements.txt`.
-- **Frontend**: type-checking happens via `tsc` inside `npm run build` (strict mode). No ESLint/Prettier configured.
-- **Tests**: there is currently **no test framework** in either backend (no pytest/conftest) or frontend (no Vitest/Jest). Do not assume a test runner exists — verify before claiming tests pass.
+### Lint
 
-### Service Ports
-- Frontend: http://localhost:80 (Docker) or http://localhost:3000 (dev)
-- API: http://localhost:8000 (OpenAPI docs at /docs)
-- Worker: http://localhost:8001
-- MCP: http://localhost:8002
+Backend tests live in `backend/tests`: install `backend/requirements-test.txt`, then run
+`PYTHONPATH=backend python -m pytest backend/tests -q`. CI runs these tests and pre-commit
+(`.github/workflows/pylint.yml`). Frontend validation is `npm run build`:
+
+```bash
+pip install pre-commit && pre-commit install
+pre-commit run --all-files
+ruff format backend/ && ruff check --fix backend/
+```
+
+Ruff: `select = ["E","F"]`, `ignore = ["E402","E501"]`, line-length 120, target py312, double quotes.
+Hooks also run shellcheck, markdownlint, and enforce LF endings (except `.bat/.cmd/.ps1`).
 
 ## Architecture
 
-### Process Orchestration (start_all.py)
+### Process topology
 
-`backend/start_all.py` (`TianshuLauncher`) loads `.env` first (exits if missing), then spawns processes **in strict order**, each as a subprocess waited on for readiness:
-1. API Server (8000) → 2. LitServe Worker Pool (8001, ~5s wait) → 3. Task Scheduler (optional, monitoring/stale-reset only) → 4. MCP Server (optional, 8002, `--enable-mcp`).
+`start_all.py` spawns independent subprocesses; in Docker each is a separate container running the same
+`tianshu-backend` image with a role argument via `scripts/docker-entrypoint.sh` (`api` / `worker` / `mcp`):
 
-All processes must share the same `OUTPUT_PATH` and `DATABASE_PATH`. Graceful shutdown via SIGINT/SIGTERM.
+| Service | Default port | Entry |
+|---|---|---|
+| API server (FastAPI) | 8000 | `api_server.py` |
+| Worker pool (LitServe) | 8001 | `litserve_worker.py` |
+| MCP server | 8002 | `mcp_server.py` |
+| Scheduler (optional) | — | `task_scheduler.py` |
+| Frontend (nginx) | 80 | `frontend/` |
 
-### Core Task Flow
+### Pull-based task queue
 
-Submission → claim → process → result spans several files:
-1. **Submit** (`api_server.py`): `POST /api/v1/tasks/submit` → `db.create_task()` inserts row with `status='pending'`.
-2. **Claim** (`task_db.py`): each worker loop calls `get_next_task(worker_id)` — atomically `SELECT ... WHERE status='pending' ORDER BY priority DESC, created_at ASC LIMIT 1` then flips to `processing` in one transaction (retries on conflict). Uses Redis `BZPOPMIN` first when `REDIS_QUEUE_ENABLED`, else SQLite `BEGIN IMMEDIATE`.
-3. **Process** (`litserve_worker.py`): worker auto-loop (daemon thread, **enabled by default** — the scheduler is mostly monitoring) routes by backend param + file type to the right engine.
-4. **Result**: `update_task_status(..., 'completed', data=json.dumps({pdf_path, json_content, markdown}))`. Results live in the `data` column **as a JSON string** — deserialize before use. Fetch via `GET /api/v1/tasks/{task_id}`.
+The API **never calls the worker**. It writes a row to the `tasks` table and returns immediately.
+Each worker runs `_worker_loop()`, polling `TaskDB.get_next_task()` every `--poll-interval` (0.5s).
 
-### Backend Services (backend/)
+Claiming is atomic: `BEGIN IMMEDIATE` plus `UPDATE ... WHERE task_id=? AND status='pending'`, retried when
+`rowcount == 0` (another worker won the race). With `REDIS_QUEUE_ENABLED=true`, `redis_queue.py`
+(sorted-set priority queue) is tried first and SQLite is the automatic fallback — SQLite stays the source
+of truth for metadata and results either way.
 
-Three main processes work together:
+`task_db.py` owns the schema and performs **in-place migrations on startup** by `SELECT`ing a column and
+catching `sqlite3.OperationalError` to `ALTER TABLE`. Add new columns with that same pattern, never by
+editing `CREATE TABLE` alone — existing deployments would not pick it up.
 
-1. **api_server.py** - FastAPI REST API
-   - Handles file uploads, task submission, status queries
-   - JWT authentication + API key support
-   - Routes under `/api/v1/`
+`auth/auth_db.py` reuses the **same SQLite file** (`DATABASE_PATH`) as the task DB.
 
-2. **litserve_worker.py** - GPU Worker Pool
-   - Uses LitServe for GPU load balancing
-   - Workers actively poll tasks from SQLite (0.5s interval)
-   - Supports MinerU, PaddleOCR-VL, SenseVoice engines
-   - Handles document/image/audio/video processing
+### Engine routing (`litserve_worker.py::_process_task`)
 
-3. **task_db.py** - Hybrid task queue (SQLite + Redis)
-   - SQLite: Task metadata storage, history, results
-   - Redis (optional): High-performance queue for task claiming
-   - Atomic task claiming with `BEGIN IMMEDIATE` (SQLite) or `BZPOPMIN` (Redis)
-   - Task states: pending → processing → completed/failed
+Per-task pipeline: vLLM container switch → legacy Office conversion → PDF split → watermark removal →
+engine dispatch → normalize → persist.
 
-4. **redis_queue.py** - Redis queue module (optional)
-   - Priority queue using Redis Sorted Sets
-   - Enables horizontal scaling and higher throughput (10K+ QPS)
-   - Graceful fallback to SQLite when Redis unavailable
+Dispatch is keyed on the task's `backend` string:
 
-**Processing Engines** (in backend/, dispatched from `litserve_worker.py`):
-- `mineru_pipeline/engine.py` - `MinerUPipelineEngine`, singleton with GPU auto-sleep (~5min idle) + VRAM monitoring. Document backends: `pipeline`, `vlm-transformers`, `vlm-vllm-engine`, `hybrid-*`.
-- `paddleocr_vl/` - Multi-language OCR. Optional vLLM mode via `--paddleocr-vl-vllm-engine-enabled` + `--paddleocr-vl-vllm-api-list`.
-- `audio_engines/` - SenseVoice for speech recognition
-- `video_engines/` - FFmpeg + keyframe OCR
-- `format_engines/` - registry pattern (`base.py`); FASTA/GenBank engines registered in `litserve_worker.py`
-- `remove_watermark/` - YOLO11x + LaMa watermark removal
+- `sensevoice` → audio engine; `video` → video engine
+- anything containing `pipeline` / `vlm-` / `hybrid-` → MinerU (`options["parse_mode"] = backend`)
+- `.xlsx` / `.xls` → MarkItDown directly (under `auto` and every MinerU backend; `.xls` is read via xlrd, no conversion)
+- `auto` → sniffed by extension: format engines → audio → video → MinerU (PDF/images/DOCX/PPTX) → LibreOffice conversion for
+  legacy `.doc/.ppt` → MarkItDown fallback (HTML/TXT/CSV)
+- otherwise → looked up in `FormatEngineRegistry`
 
-**Engine gotchas:**
-- **GPU isolation**: each worker gets its own `CUDA_VISIBLE_DEVICES`, so a worker sees only one GPU even when several are assigned.
-- **vLLM containers** (`tianshu-vllm-paddleocr`, `tianshu-vllm-mineru`) are mutually exclusive — only one runs at a time (managed by `VLLMController`).
-- **PDF splitting**: when `PDF_SPLIT_ENABLED=true`, large PDFs (`PDF_SPLIT_THRESHOLD_PAGES`, chunk `PDF_SPLIT_CHUNK_SIZE`) become child tasks with `parent_task_id`; the parent waits for all children, then merges results.
-- **Models**: MinerU uses `MINERU_MODEL_SOURCE` (modelscope/huggingface, `HF_ENDPOINT` mirror supported); PaddleOCR auto-downloads to `~/.paddleocr/models/` (~2GB) on first use. `Dockerfile.offline` preloads from `OFFLINE_MODELS_PATH`.
+Every engine is imported behind a try/except with an `X_AVAILABLE` flag, so a missing optional dependency
+degrades that one backend instead of killing the worker. Preserve that pattern when adding engines.
 
-**MCP server** (`mcp_server.py`, port 8002, standalone): SSE transport, exposes `parse_document`, `get_task_status`, `list_tasks`, `get_queue_stats`; proxies to the API server at `API_BASE_URL`.
+`vllm-mineru` is `profiles: ["manual"]` + `restart: no`, so it never starts with `up`.
+`VLLMController.ensure_running()` **cold-starts it** over the mounted Docker socket when a task's
+backend is in `LOCAL_VLLM_BACKENDS` and the caller supplied no `server_url` of its own. A missing
+container (or unreachable Docker) means vLLM is externally managed and is left alone. Readiness is
+not its job — `mineru_pipeline/engine.py::_wait_for_server` polls `/v1/models` for that.
 
-### Frontend (frontend/src/)
+### Output contract
 
-Vue 3 + TypeScript + Composition API:
+Every engine's raw output directory goes through `output_normalizer.normalize_output(dir, handle_method)`,
+which standardizes to `result.md` / `result.json` / `images/`, then uploads images to RustFS (S3-compatible,
+`storage/rustfs_client.py`) and rewrites image paths to public URLs.
 
-- `api/` - Axios client and typed API wrappers
-- `stores/` - Pinia stores (auth, tasks, queue)
-- `views/` - Page components (Dashboard, TaskList, TaskDetail, etc.)
-- `components/` - Reusable UI components
-- `router/` - Vue Router with auth guards
+The worker then writes a JSON blob into the `tasks.data` column with keys the frontend depends on:
+`pdf_path` (left-hand PDF preview), `json_content` (right-hand layout/bbox rendering), `markdown`,
+`markdown_file`. Renaming these keys breaks `TaskDetail.vue`.
 
-**API client** (`src/api/client.ts`): Axios instance, 5min timeout. Base URL resolution: `VITE_API_BASE_URL` env → production auto-detects domain + `VITE_API_PORT` (default 8000) → dev `http://localhost:8000`. Request interceptor reads the JWT from `localStorage` (`auth_token` or `token`) and sets `Authorization: Bearer`; all routes are normalized to `/api/v1/...`. Response interceptor clears the token and redirects to `/login` on 401. Env files: `.env.development` → `http://127.0.0.1:8000`, `.env.production` → `/api` (relative, served by Nginx).
+### Parent/child tasks (large PDFs)
 
-**Dev proxy / Nginx**: Vite dev server proxies `/api` → `localhost:8000`. In Docker, the frontend Nginx (config inlined in `frontend/Dockerfile`) handles Vue Router history mode (`try_files ... /index.html`), proxies `/api/` and `/ws/` to `backend:8000` (strips `/api`), and caps uploads via `NGINX_CLIENT_MAX_BODY_SIZE` (default 0 = unlimited). The backend has matching middleware (`api_server.py`) that re-inserts the `/api/` prefix Nginx strips.
+PDFs above `PDF_SPLIT_THRESHOLD_PAGES` are split in the **worker** (not the API) into child tasks of
+`PDF_SPLIT_CHUNK_SIZE` pages: `convert_to_parent_task` → `create_child_tasks_bulk` (one transaction:
+N inserts + a single parent-counter update) → each child processed
+independently → `on_child_task_completed` returns the parent id once the last child lands →
+`_merge_parent_task_results` concatenates Markdown/JSON in page order. Failures route through
+`on_child_task_failed`.
 
-### Authentication
+### Format engine plugin system
 
-JWT-based authentication in `backend/auth/`:
-- `jwt_handler.py` - Token creation/validation
-- `dependencies.py` - FastAPI dependency injection
-- `routes.py` - Login/register endpoints
-- `sso.py` - OIDC/SAML integration (optional)
+To add a document format: subclass `FormatEngine` (`backend/format_engines/base.py`), set
+`SUPPORTED_EXTENSIONS` / `FORMAT_NAME` / `FORMAT_DESCRIPTION`, implement `parse()` returning
+`{format, markdown, json_content, metadata, summary}`, then register it in `format_engines/__init__.py`.
+It then becomes routable both as an explicit `backend` value and via `auto` detection, and appears in
+`GET /api/v1/engines`. FASTA and GenBank are the reference implementations.
 
-## Key Configuration
+### Auth
 
-Environment variables (copy `.env.example` to `.env`):
-```bash
-JWT_SECRET_KEY=...     # Required for production
-API_PORT=8000
-WORKERS_PER_DEVICE=2
-GPU_DEVICES=0
-DATABASE_PATH=/app/data/db/mineru_tianshu.db
+JWT (access + refresh) or API key, resolved by `auth/dependencies.py::get_current_user`, which tries the
+bearer token then the API key. Authorization uses the `require_permission(...)` / `require_role(...)`
+dependency factories. Tasks carry `user_id`; non-admin users only see their own. Optional OIDC/SAML SSO
+lives in `auth/sso.py` and is registered conditionally.
 
-# Redis Queue (optional - for high concurrency)
-REDIS_QUEUE_ENABLED=true   # Enable Redis queue
-REDIS_HOST=localhost       # Redis host (use 'redis' in Docker)
-REDIS_PORT=6379
+### API surface
 
-# Output & frontend / Nginx
-OUTPUT_PATH=/app/data/output      # Must match across all backend processes
-FRONTEND_PORT=80
-VITE_API_PORT=8000                # Backend port the frontend targets in production
-NGINX_CLIENT_MAX_BODY_SIZE=0      # Upload size limit (0 = unlimited)
-```
+`/api/v1/*` from `api_server.py` (task submit/get/cancel/retry/pause/resume/clear-cache, queue stats,
+admin cleanup and reset-stale, `/engines`, `/health`, file serving) plus `auth/routes.py` at
+`/api/v1/auth/*`. File-serving endpoints resolve the path then check `is_relative_to(OUTPUT_DIR)` — keep
+that guard on any new path-taking endpoint. Interactive docs at `http://localhost:8000/docs`.
 
-Dockerfile variants: `Dockerfile` (GPU, CUDA 12.1), `Dockerfile.cpu` (CPU-only), `Dockerfile.offline` (preloaded models, no download).
+## Configuration
 
-## API Endpoints
+Two separate `.env` files; do not conflate them:
 
-Main task endpoints:
-- `POST /api/v1/tasks/submit` - Submit file for processing
-- `GET /api/v1/tasks/{task_id}` - Get task status/result
-- `DELETE /api/v1/tasks/{task_id}` - Cancel task
-- `GET /api/v1/queue/stats` - Queue statistics
-- `POST /api/v1/admin/reset-stale` - Reset stuck tasks
+- **Root `.env`** (from `.env.example`) — consumed by docker-compose and the Makefile. Ports, `GPU_COUNT`,
+  `WORKER_MEMORY_LIMIT`, `JWT_SECRET_KEY`, `DATABASE_PATH`, `RUSTFS_*`, `REDIS_*`, `PDF_SPLIT_*`,
+  `VITE_API_BASE_URL`.
+- **`backend/.env`** (from `backend/.env.example`) — required by `start_all.py` for local runs.
 
-## Database
-
-SQLite database (`mineru_tianshu.db`) with tasks table. Key fields:
-- task_id, file_name, status, priority, backend, result_path, user_id
-- Concurrent access handled via short-lived connections and timeouts
+Note that `.env.example` sets `API_PORT=8080` while the code/CLI default is 8000; check which is in play
+before debugging a connection failure. Model weights land in `models/`, runtime data in
+`data/{uploads,output,db}`, logs in `logs/{backend,worker,mcp}`.

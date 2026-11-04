@@ -9,9 +9,6 @@ MinerU Tianshu - Audit Log
 import json
 import os
 import sqlite3
-import queue
-import threading
-import time
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -31,10 +28,10 @@ def _get_db_path() -> str:
 
 def _get_conn(db_path: str) -> sqlite3.Connection:
     """获取数据库连接，PRAGMA 设置与 task_db._get_conn 保持一致"""
-    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=0.1)
+    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=100")
-    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -65,74 +62,64 @@ def _extract_ip(request: Optional[Request]) -> Optional[str]:
     """提取客户端 IP，优先取 X-Forwarded-For 首段（反向代理场景）"""
     if request is None:
         return None
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
     if request.client:
         return request.client.host
     return None
 
 
-_events = queue.Queue(maxsize=2048)
-_writer_lock = threading.Lock()
-_writer = None
+def record_audit(
+    action: str,
+    user=None,
+    request: Optional[Request] = None,
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    detail: Optional[Dict[str, Any]] = None,
+    result: str = "success",
+) -> None:
+    """
+    写入一条审计日志（fire-and-forget）
 
+    整个函数体吞异常，只 logger.warning，绝不能影响业务请求。
+    detail 以 JSON 存储，调用方负责不传入密码、API Key 本体等敏感值。
 
-def _drain():
-    while True:
-        first = _events.get()
-        batch = [first]
-        time.sleep(0.05)
-        while len(batch) < 100:
-            try:
-                batch.append(_events.get_nowait())
-            except queue.Empty:
-                break
-        try:
-            # Group by database path (also makes isolated test databases safe).
-            for path in {item[0] for item in batch}:
-                conn = _get_conn(path)
-                try:
-                    _init_table(conn)
-                    conn.executemany(
-                        "INSERT INTO audit_logs (user_id, username, action, resource_type, resource_id, detail, ip, user_agent, result) VALUES (?,?,?,?,?,?,?,?,?)",
-                        [item[1] for item in batch if item[0] == path],
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
-        except Exception as e:
-            logger.warning(f"Audit batch could not be saved: {type(e).__name__}")
-        finally:
-            for _ in batch:
-                _events.task_done()
-
-
-def record_audit(action, user=None, request=None, resource_type=None, resource_id=None, detail=None, result="success"):
-    """Bounded, best-effort batching: audit failures never block business requests."""
-    global _writer
+    Args:
+        action: 动作标识，如 auth.login / task.delete
+        user: 当前用户对象（有 user_id / username 属性），未认证场景传 None
+        request: FastAPI Request，用于提取 IP 与 User-Agent
+        resource_type: 资源类型，如 task / api_key / config
+        resource_id: 资源标识，如 task_id / key_id
+        detail: 脱敏后的上下文字典
+        result: success / failure / denied
+    """
     try:
-        with _writer_lock:
-            if _writer is None or not _writer.is_alive():
-                _writer = threading.Thread(target=_drain, daemon=True, name="audit-writer")
-                _writer.start()
-        # Never accept credential values in audit details.
-        safe_detail = {k: v for k, v in (detail or {}).items() if k in {"method", "status_code", "changed_keys"}}
-        _events.put_nowait(
-            (
-                _get_db_path(),
+        conn = _get_conn(_get_db_path())
+        try:
+            _init_table(conn)
+            conn.execute(
+                """
+                INSERT INTO audit_logs (user_id, username, action, resource_type, resource_id, detail, ip, user_agent, result)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
-                    getattr(user, "user_id", None),
-                    getattr(user, "username", None),
+                    getattr(user, "user_id", None) if user is not None else None,
+                    getattr(user, "username", None) if user is not None else None,
                     action,
                     resource_type,
                     resource_id,
-                    json.dumps(safe_detail, ensure_ascii=False),
+                    json.dumps(detail, ensure_ascii=False) if detail is not None else None,
                     _extract_ip(request),
-                    request.headers.get("User-Agent", "")[:512] if request else None,
+                    request.headers.get("User-Agent") if request is not None else None,
                     result,
                 ),
             )
-        )
-    except Exception:
-        logger.warning("Audit event dropped; request continues")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to record audit log (action={action}): {e}")
 
 
 def query_audit_logs(

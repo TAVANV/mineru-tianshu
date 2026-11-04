@@ -183,14 +183,14 @@ def dl_extras():
 # ------------------------------------------------------------------------------
 def gen_mineru_json():
     step("Generate mineru.json (container paths)")
-    from download_models import generate_mineru_json
+    from offline_models import generate_mineru_json
 
     generate_mineru_json(ROOT, ACTIVE_VLM)
     print(f"   -> {ROOT / 'mineru.json'}")
 
 
 def dl_mineru_pro():
-    from download_models import main as prepare
+    from offline_models import main as prepare
 
     if prepare(str(ROOT), selected_models="mineru_vlm_pro", strict=True, vlm_model=ACTIVE_VLM):
         raise RuntimeError("New VLM preparation failed; existing model selection is unchanged")
@@ -202,7 +202,6 @@ def dl_mineru_pro():
 TASKS = [
     ("MinerU", dl_mineru),
     ("Audio", dl_audio),
-    ("PaddleOCR-VL", dl_paddleocr_vl),
     ("YOLO", dl_yolo),
     ("Fonts/LaMa", dl_extras),
     ("mineru.json", gen_mineru_json),

@@ -4,11 +4,9 @@
 """
 
 import json
-import html
 import re
 from pathlib import Path
 from typing import Dict
-from urllib.parse import unquote, urlsplit
 
 from loguru import logger
 
@@ -43,11 +41,7 @@ def process_output_dir(output_dir: Path, config: ImageCaptionConfig) -> Dict[str
         if not images:
             return stats
 
-        captioner = ImageCaptioner(config)
-        try:
-            captions = captioner.caption_batch(images)
-        finally:
-            captioner.client.close()
+        captions = ImageCaptioner(config).caption_batch(images)
         stats["captioned"] = len(captions)
         stats["failed"] = stats["total"] - len(captions)
         if not captions:
@@ -74,27 +68,13 @@ def _write_back_markdown(md_file: Path, captions: Dict[str, str]):
     for filename, desc in captions.items():
         # Markdown 形态：![旧alt](images/xxx.jpg)，保留原路径只替换 alt
         md_pattern = r"!\[[^\]]*\]\(((?:images/)?" + re.escape(filename) + r")\)"
-        content = re.sub(
-            md_pattern,
-            lambda m, d=desc: "![" + d.replace("[", "\\[").replace("]", "\\]") + "](" + m.group(1) + ")",
-            content,
+        content = re.sub(md_pattern, lambda m, d=desc: f"![{d}]({m.group(1)})", content)
+
+        # HTML 形态：<img ... src="images/xxx.jpg" ... alt="旧值" ...>
+        html_pattern = (
+            r'(<img\b[^>]*?\bsrc=["\'][^"\']*' + re.escape(filename) + r'["\'][^>]*?\balt=["\'])[^"\']*(["\'])'
         )
-
-    def caption_html(match):
-        tag = match.group(0)
-        src = re.search(r"\bsrc\s*=\s*([\"'])(.*?)\1", tag, re.IGNORECASE)
-        if not src:
-            return tag
-        url = urlsplit(src.group(2))
-        if url.scheme or url.netloc:
-            return tag
-        desc = captions.get(Path(unquote(url.path)).name)
-        if not desc:
-            return tag
-        tag = re.sub(r"\s+alt\s*=\s*([\"']).*?\1", "", tag, flags=re.IGNORECASE)
-        return re.sub(r"\s*/?>$", lambda _: ' alt="' + html.escape(desc, quote=True) + '">', tag)
-
-    content = re.sub(r"<img\b[^>]*>", caption_html, content, flags=re.IGNORECASE)
+        content = re.sub(html_pattern, lambda m, d=desc: m.group(1) + d + m.group(2), content)
 
     if content != original:
         md_file.write_text(content, encoding="utf-8")
