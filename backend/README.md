@@ -437,3 +437,15 @@ MCP Server 将在 `http://localhost:8001` 启动，提供以下端点：
 ## 📄 许可证
 
 遵循 MinerU 主项目许可证
+
+### MCP 外部地址白名单
+
+`MCP_HOST` 控制监听地址。通过非回环地址或反向代理访问 `/sse`、`/messages` 时，还需配置逗号分隔的 `MCP_ALLOWED_HOSTS`（实际请求的 Host，含端口）及 `MCP_ALLOWED_ORIGINS`（浏览器客户端的 Origin），例如：
+
+```bash
+MCP_HOST=0.0.0.0
+MCP_ALLOWED_HOSTS=tianshu.example.com:8002,localhost:*,127.0.0.1:*
+MCP_ALLOWED_ORIGINS=https://tianshu.example.com,http://localhost:8080
+```
+
+未配置或为空时沿用监听地址与回环地址的默认白名单。DNS 重绑定防护始终开启，未列出的 Host 返回 421，未列出的 Origin 返回 403；访问密钥校验仍独立生效。

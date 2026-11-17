@@ -57,6 +57,30 @@ TIANSHU_API_KEY = os.getenv("TIANSHU_API_KEY", "")
 MCP_API_KEYS = [key.strip() for key in os.getenv("MCP_API_KEYS", "").split(",") if key.strip()]
 
 
+def _transport_security_settings(host: str) -> TransportSecuritySettings:
+    def configured(name, defaults):
+        values = [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
+        return values or defaults
+
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=configured("MCP_ALLOWED_HOSTS", [f"{host}:*", "localhost:*", "127.0.0.1:*", "[::1]:*"]),
+        allowed_origins=configured(
+            "MCP_ALLOWED_ORIGINS",
+            [
+                f"http://{host}:*",
+                f"https://{host}:*",
+                "http://localhost:*",
+                "https://localhost:*",
+                "http://127.0.0.1:*",
+                "https://127.0.0.1:*",
+                "http://[::1]:*",
+                "https://[::1]:*",
+            ],
+        ),
+    )
+
+
 def _api_headers() -> dict:
     """访问后端 API 时携带的服务凭据请求头"""
     return {"X-API-Key": TIANSHU_API_KEY} if TIANSHU_API_KEY else {}
@@ -787,20 +811,7 @@ async def main():
         logger.warning("⚠️ MCP_API_KEYS 未配置：/sse 与 /messages 将对所有请求返回 401")
 
     # 创建 SSE Transport，启用 DNS 重绑定 / Host / Origin 防护
-    security_settings = TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=[f"{host}:*", "localhost:*", "127.0.0.1:*", "[::1]:*"],
-        allowed_origins=[
-            f"http://{host}:*",
-            f"https://{host}:*",
-            "http://localhost:*",
-            "https://localhost:*",
-            "http://127.0.0.1:*",
-            "https://127.0.0.1:*",
-            "http://[::1]:*",
-            "https://[::1]:*",
-        ],
-    )
+    security_settings = _transport_security_settings(host)
     sse = SseServerTransport("/messages", security_settings=security_settings)
 
     # SSE 处理函数
