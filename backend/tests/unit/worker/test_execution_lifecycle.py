@@ -14,6 +14,7 @@ from pathlib import Path
 import psutil
 import pytest
 
+from tests.fixtures import minimal_pdf
 from tests.unit.worker.test_routing import load_worker_module, make_worker
 
 
@@ -147,7 +148,7 @@ def lifecycle(task_db, runtime_paths, monkeypatch, mocker):
 
     def submit(name, mode="ok", **kwargs):
         source = runtime_paths["upload_path"] / f"{name}.pdf"
-        source.write_bytes(b"%PDF-1.4")
+        source.write_bytes(minimal_pdf())
         return task_db.create_task(
             source.name,
             str(source),
@@ -295,7 +296,7 @@ def split_parent(task_db, submit, root, mode="ok", merge_block=False):
             }
         ],
     )[0]
-    (root / "uploads" / "part.pdf").write_bytes(b"%PDF-1.4")
+    (root / "uploads" / "part.pdf").write_bytes(minimal_pdf())
     return parent_id, child_id
 
 

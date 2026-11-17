@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.fixtures import minimal_pdf
+
 
 def load_worker_module(monkeypatch):
     litserve = types.ModuleType("litserve")
@@ -53,7 +55,7 @@ def test_external_vllm_url_does_not_trigger_local_container_start(monkeypatch, m
     monkeypatch.setattr(worker_module, "MINERU_PIPELINE_AVAILABLE", True)
     worker = make_worker(worker_module, mocker)
     source = tmp_path / "document.pdf"
-    source.write_bytes(b"pdf")
+    source.write_bytes(minimal_pdf())
 
     worker._process_task(
         {
@@ -78,7 +80,7 @@ def test_local_vllm_backend_starts_container_and_pdf_split_short_circuits(monkey
     monkeypatch.setattr(worker_module, "MINERU_PIPELINE_AVAILABLE", True)
     worker = make_worker(worker_module, mocker)
     source = tmp_path / "document.pdf"
-    source.write_bytes(b"pdf")
+    source.write_bytes(minimal_pdf())
 
     worker._process_task(
         {
@@ -111,7 +113,7 @@ def test_worker_failure_marks_task_failed_and_enqueues_one_failure_webhook(monke
     worker = make_worker(worker_module, mocker)
     worker._process_with_mineru.side_effect = RuntimeError("engine failure")
     source = tmp_path / "document.pdf"
-    source.write_bytes(b"pdf")
+    source.write_bytes(minimal_pdf())
 
     with pytest.raises(RuntimeError, match="engine failure"):
         worker._process_task(
