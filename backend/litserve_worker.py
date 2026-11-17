@@ -90,7 +90,8 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 # Local imports
-from task_db import TaskDB
+from task_db import TaskDB, ExecutionRevoked
+from task_execution import TaskExecutor, ExecutionCleanupError
 from output_normalizer import normalize_output
 from utils import (
     parse_list_arg,
@@ -384,7 +385,7 @@ class MinerUWorkerAPI(ls.LitAPI):
             os.environ.setdefault("HF_ENDPOINT", hf_endpoint)
 
         # CPU 线程上限：必须在下方首次导入 torch（mineru.utils.model_utils）之前设置环境变量
-        cpu_threads = configure_cpu_threads()
+        configure_cpu_threads()
 
         # 设备配置
         self.device = device
@@ -401,6 +402,41 @@ class MinerUWorkerAPI(ls.LitAPI):
             self.accelerator = "cpu"
             self.engine_device = "cpu"
 
+        # 初始化数据库
+        db_path_env = os.getenv("DATABASE_PATH")
+        if db_path_env:
+            db_path = Path(db_path_env).resolve()
+        else:
+            project_root = Path(__file__).parent.parent
+            db_path = (project_root / "data" / "db" / "mineru_tianshu.db").resolve()
+
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.task_db = TaskDB(str(db_path))
+
+        # 初始化状态
+        self.running = True
+        self.current_task_id = None
+        hostname = socket.gethostname()
+        pid = os.getpid()
+        self.worker_id = f"tianshu-{hostname}-{device}-{pid}"
+
+        self._executor_factory = "litserve_worker:create_task_executor"
+        self._executor_config = {
+            "device": str(device),
+            "accelerator": self.accelerator,
+            "engine_device": self.engine_device,
+            "output_dir": self.output_dir,
+            "db_path": self.task_db.db_path,
+            "worker_id": self.worker_id,
+            "mineru_vllm_api": self.mineru_vllm_api,
+        }
+        logger.info(f"🚀 Worker 监督进程就绪: {self.worker_id}")
+        if self.enable_worker_loop:
+            self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+            self.worker_thread.start()
+
+    def _setup_engines(self):
+        cpu_threads = configure_cpu_threads()
         # MinerU VRAM 设置
         from mineru.utils.model_utils import get_vram
 
@@ -425,33 +461,11 @@ class MinerUWorkerAPI(ls.LitAPI):
             else:
                 os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "1"
 
-        # 初始化数据库
-        db_path_env = os.getenv("DATABASE_PATH")
-        if db_path_env:
-            db_path = Path(db_path_env).resolve()
-        else:
-            project_root = Path(__file__).parent.parent
-            db_path = (project_root / "data" / "db" / "mineru_tianshu.db").resolve()
-
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.task_db = TaskDB(str(db_path))
-
-        # 初始化状态
-        self.running = True
-        self.current_task_id = None
-        hostname = socket.gethostname()
-        pid = os.getpid()
-        self.worker_id = f"tianshu-{hostname}-{device}-{pid}"
-
-        # 引擎占位符
         self.markitdown = MarkItDown() if MARKITDOWN_AVAILABLE else None
         self.mineru_pipeline_engine = None
         self.sensevoice_engine = None
         self.video_engine = None
         self.watermark_handler = None
-
-        logger.info(f"🚀 Worker Setup Complete: {self.worker_id}")
-
         if WATERMARK_REMOVAL_AVAILABLE and self.accelerator == "cuda":
             try:
                 from remove_watermark.pdf_watermark_handler import PDFWatermarkHandler
@@ -461,47 +475,60 @@ class MinerUWorkerAPI(ls.LitAPI):
             except Exception as e:
                 logger.error(f"❌ Failed to init watermark engine: {e}")
 
-        if self.enable_worker_loop:
-            self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
-            self.worker_thread.start()
-
     def _worker_loop(self):
-        logger.info(f"🔁 {self.worker_id} started task polling loop")
-        loop_count = 0
-        last_stats_log = 0
-
-        while self.running:
-            try:
-                loop_count += 1
-                task = self.task_db.get_next_task(worker_id=self.worker_id)
-
-                if task:
-                    task_id = task["task_id"]
-                    self.current_task_id = task_id
-                    logger.info(f"📥 {self.worker_id} pulled task: {task_id}")
-
-                    try:
-                        self._process_task(task)
-                        logger.info(f"✅ {self.worker_id} completed task: {task_id}")
-                    except Exception as e:
-                        logger.error(f"❌ {self.worker_id} failed task {task_id}: {e}")
-                        logger.exception(e)
-                    finally:
-                        self.current_task_id = None
-                else:
-                    if loop_count - last_stats_log >= 20:
-                        try:
-                            stats = self.task_db.get_queue_stats()
-                            if loop_count % 100 == 0:
-                                logger.info(f"💤 {self.worker_id} idle. Queue stats: {stats}")
-                        except Exception:
-                            pass
-                        last_stats_log = loop_count
+        logger.info(f"🔁 {self.worker_id} 启动任务监督循环")
+        executor = TaskExecutor(self._executor_factory, self._executor_config)
+        try:
+            while self.running:
+                task = None
+                released = False
+                try:
+                    task = self.task_db.get_next_task(worker_id=self.worker_id, with_execution_lock=True)
+                    if task is None:
+                        time.sleep(self.poll_interval)
+                        continue
+                    self.current_task_id = task["task_id"]
+                    logger.info(f"📥 {self.worker_id} 认领任务 {self.current_task_id}，执行 {task['execution_id']}")
+                    error = executor.run(task, self.task_db, lambda: self.running)
+                    released = True
+                    if not self.running and self.task_db.owns_execution(task):
+                        with self.task_db.execution_scope(task):
+                            if self.task_db.get_task(task["task_id"])["status"] == "processing":
+                                self.task_db.update_task_status(task["task_id"], "pending")
+                        self.task_db._requeue_pending(task["task_id"])
+                    if error and self.task_db.owns_execution(task):
+                        with self.task_db.execution_scope(task):
+                            changed = self.task_db.update_task_status(task["task_id"], "failed", error_message=error)
+                            if changed:
+                                if task.get("parent_task_id"):
+                                    self.task_db.on_child_task_failed(task["task_id"], error)
+                                else:
+                                    self._enqueue_webhook(task["task_id"], "task.failed")
+                        logger.error(f"❌ 任务执行失败 {task['task_id']}: {error}")
+                except ExecutionCleanupError:
+                    self.running = False
+                    logger.exception("执行树退出未确认，停止领取任务")
+                    raise
+                except ExecutionRevoked:
+                    pass
+                except Exception:
+                    logger.exception("任务监督循环异常")
+                    if task is not None and not released:
+                        # 通信或数据库异常也必须先停止执行，才能交还锁与容量。
+                        executor.close()
+                        released = True
+                        executor = TaskExecutor(self._executor_factory, self._executor_config)
                     time.sleep(self.poll_interval)
-
-            except Exception as e:
-                logger.error(f"❌ Worker loop error: {e}")
-                time.sleep(self.poll_interval)
+                finally:
+                    if task is not None and released:
+                        try:
+                            self.task_db.finish_execution(task)
+                            cleanup_decrypted(decrypted_dir(self.output_dir, task["task_id"]))
+                        finally:
+                            self.task_db.release_execution_lock(task["task_id"])
+                            self.current_task_id = None
+        finally:
+            executor.close()
 
     def _enqueue_webhook(self, task_id: str, event: str):
         """任务终态触发 webhook 通知入队；任何失败只记日志，不影响任务主流程"""
@@ -692,8 +719,10 @@ class MinerUWorkerAPI(ls.LitAPI):
             if parent_task_id:
                 parent_id_to_merge = self.task_db.on_child_task_completed(task_id)
                 if parent_id_to_merge:
-                    self._finalize_parent_task(parent_id_to_merge)
+                    self.task_db.queue_parent_merge(parent_id_to_merge)
 
+        except ExecutionRevoked:
+            raise
         except DocDecryptError as e:
             # 解密失败：文案已是友好中文，直接落库，不套 "TypeError: ..." 前缀
             error_msg = str(e)
@@ -1398,13 +1427,22 @@ class MinerUWorkerAPI(ls.LitAPI):
         elif action == "poll":
             if self.enable_worker_loop:
                 return {"status": "skipped", "message": "Auto-loop active"}
-            task = self.task_db.pull_task()
+            task = self.task_db.get_next_task(self.worker_id, with_execution_lock=True)
             if task:
+                executor = TaskExecutor(self._executor_factory, self._executor_config)
+                self.current_task_id = task["task_id"]
                 try:
-                    self._process_task(task)
-                    return {"status": "completed", "task_id": task["task_id"]}
-                except Exception as e:
-                    return {"status": "failed", "error": str(e)}
+                    error = executor.run(task, self.task_db, lambda: self.running)
+                    if error:
+                        with self.task_db.execution_scope(task):
+                            self.task_db.update_task_status(task["task_id"], "failed", error_message=error)
+                        return {"status": "failed", "error": error}
+                    return {"status": self.task_db.get_task(task["task_id"])["status"], "task_id": task["task_id"]}
+                finally:
+                    executor.close()
+                    self.task_db.finish_execution(task)
+                    self.task_db.release_execution_lock(task["task_id"])
+                    self.current_task_id = None
             return {"status": "empty"}
         return {"status": "error", "message": "Invalid action"}
 
@@ -1414,7 +1452,20 @@ class MinerUWorkerAPI(ls.LitAPI):
     def teardown(self):
         self.running = False
         if hasattr(self, "worker_thread"):
-            self.worker_thread.join(timeout=2)
+            timeout = float(os.getenv("TASK_EXECUTION_TERMINATE_GRACE", "2")) + 15
+            self.worker_thread.join(timeout=timeout)
+            if self.worker_thread.is_alive():
+                logger.error("任务执行退出未确认，监督进程将继续持有执行锁")
+
+
+def create_task_executor(config):
+    worker = MinerUWorkerAPI.__new__(MinerUWorkerAPI)
+    for key in ("device", "accelerator", "engine_device", "output_dir", "worker_id", "mineru_vllm_api"):
+        setattr(worker, key, config[key])
+    worker.vllm_controller = VLLMController()
+    worker.task_db = TaskDB(config["db_path"])
+    worker._setup_engines()
+    return worker
 
 
 def start_litserve_workers(

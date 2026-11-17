@@ -55,6 +55,10 @@ def _resolve_upload_dir() -> Path:
     return (Path(__file__).parent.parent / "input").resolve()
 
 
+class ExecutionRevoked(RuntimeError):
+    """任务已取消或执行归属已变更。"""
+
+
 class TaskDB:
     """任务数据库管理类"""
 
@@ -78,6 +82,8 @@ class TaskDB:
 
         # 确保 db_path 是绝对路径字符串
         self.db_path = str(Path(db_path).resolve())
+        self._execution = None
+        self._execution_locks = {}
 
         # WAL 依赖 POSIX 文件锁，NFS/CIFS 上会静默损坏数据库，启动时直接拦截
         assert_local_filesystem(self.db_path)
@@ -117,6 +123,15 @@ class TaskDB:
         conn = self._get_conn()
         cursor = conn.cursor()
         try:
+            if self._execution is not None:
+                # 校验和写入必须在同一事务内，避免取消/重试穿过检查后被旧执行覆盖。
+                cursor.execute("BEGIN IMMEDIATE")
+                cursor.execute(
+                    "SELECT 1 FROM tasks WHERE task_id = ? AND execution_id = ? AND worker_id = ?",
+                    self._execution,
+                )
+                if cursor.fetchone() is None:
+                    raise ExecutionRevoked("任务执行归属已失效")
             yield cursor
             conn.commit()
         except Exception as e:
@@ -124,6 +139,56 @@ class TaskDB:
             raise e
         finally:
             conn.close()  # 关闭连接
+
+    @contextmanager
+    def execution_scope(self, task):
+        previous = self._execution
+        self._execution = (task["task_id"], task["execution_id"], task["worker_id"])
+        try:
+            yield
+        finally:
+            self._execution = previous
+
+    def owns_execution(self, task):
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                "SELECT 1 FROM tasks WHERE task_id = ? AND execution_id = ? AND worker_id = ?",
+                (task["task_id"], task["execution_id"], task["worker_id"]),
+            )
+            return cursor.fetchone() is not None
+
+    def _acquire_execution_lock(self, task_id):
+        import fcntl
+        import hashlib
+
+        lock_dir = Path(self.db_path + ".execution-locks")
+        lock_dir.mkdir(exist_ok=True)
+        lock = open(lock_dir / hashlib.sha256(task_id.encode()).hexdigest(), "a+b")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            return False
+        self._execution_locks[task_id] = lock
+        return True
+
+    def execution_lock_fd(self, task_id):
+        return self._execution_locks[task_id].fileno()
+
+    def release_execution_lock(self, task_id):
+        lock = self._execution_locks.pop(task_id, None)
+        if lock is not None:
+            # 不 unlink：其他进程可能正在锁同一 inode；执行进程还持有同一文件描述符。
+            lock.close()
+
+    def finish_execution(self, task):
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                """UPDATE tasks SET execution_id = NULL, worker_id = NULL, started_at = NULL
+                   WHERE task_id = ? AND execution_id = ? AND worker_id = ?
+                   AND status = 'processing' AND is_parent = 1 AND child_count > 0""",
+                (task["task_id"], task["execution_id"], task["worker_id"]),
+            )
 
     def _init_db(self):
         """初始化数据库表"""
@@ -207,6 +272,11 @@ class TaskDB:
                 logger.info("📊 Migrating database schema: adding stale_reset_count field")
                 cursor.execute("ALTER TABLE tasks ADD COLUMN stale_reset_count INTEGER DEFAULT 0")
                 logger.info("✅ stale_reset_count field added")
+
+            try:
+                cursor.execute("SELECT execution_id FROM tasks LIMIT 1")
+            except sqlite3.OperationalError:
+                cursor.execute("ALTER TABLE tasks ADD COLUMN execution_id TEXT")
 
     def create_task(
         self,
@@ -300,19 +370,20 @@ class TaskDB:
             logger.warning(f"🔄 Re-enqueued {len(missing)} pending task(s) missing from the Redis queue")
         return len(missing)
 
-    def get_next_task(self, worker_id: str, max_retries: int = 3) -> Optional[Dict]:
+    def get_next_task(self, worker_id: str, max_retries: int = 3, with_execution_lock: bool = False) -> Optional[Dict]:
         """
         获取下一个待处理任务（原子操作，防止并发冲突）
         """
         from loguru import logger
 
         # 尝试使用 Redis 队列（如果可用）
-        task = self._get_next_task_redis(worker_id)
+        task = self._get_next_task_redis(worker_id, with_execution_lock)
         if task is not None:
             return task
 
         # Redis 不可用或出错，回退到 SQLite
         for attempt in range(max_retries):
+            locked_task_id = None
             try:
                 with self.get_cursor() as cursor:
                     # 使用事务确保原子性
@@ -320,35 +391,46 @@ class TaskDB:
 
                     # 按优先级和创建时间获取任务
                     cursor.execute("""
-                        SELECT * FROM tasks
+                        SELECT task_id FROM tasks
                         WHERE status = 'pending'
                         ORDER BY priority DESC, created_at ASC
-                        LIMIT 1
                     """)
 
-                    task = cursor.fetchone()
+                    task = next(
+                        (
+                            row
+                            for row in cursor
+                            if not with_execution_lock or self._acquire_execution_lock(row["task_id"])
+                        ),
+                        None,
+                    )
                     if task:
                         task_id = task["task_id"]
+                        locked_task_id = task_id if with_execution_lock else None
+                        execution_id = uuid.uuid4().hex if with_execution_lock else None
+                        cursor.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
+                        task = cursor.fetchone()
                         # 立即标记为 processing，并确保状态仍是 pending
                         cursor.execute(
                             """
                             UPDATE tasks
                             SET status = 'processing',
                                 started_at = CURRENT_TIMESTAMP,
-                                worker_id = ?
+                                worker_id = ?, execution_id = ?
                             WHERE task_id = ? AND status = 'pending'
                         """,
-                            (worker_id, task_id),
+                            (worker_id, execution_id, task_id),
                         )
 
                         # 检查是否更新成功（防止被其他 worker 抢走）
                         if cursor.rowcount == 0:
+                            self.release_execution_lock(task_id)
                             # 任务被其他进程抢走了，立即重试
                             if attempt == 0:  # 只在第一次尝试时记录日志
                                 logger.debug(f"Task {task_id} was grabbed by another worker, retrying...")
                             continue
 
-                        return dict(task)
+                        return dict(task, status="processing", worker_id=worker_id, execution_id=execution_id)
                     else:
                         # 队列中没有待处理任务，返回 None
                         if attempt == 0:
@@ -363,6 +445,8 @@ class TaskDB:
                         return None
 
             except Exception as e:
+                if locked_task_id is not None:
+                    self.release_execution_lock(locked_task_id)
                 logger.error(f"❌ Error in get_next_task (attempt {attempt + 1}/{max_retries}): {e}")
                 logger.exception(e)
                 if attempt == max_retries - 1:
@@ -376,7 +460,7 @@ class TaskDB:
         logger.warning(f"⚠️  Failed to get task after {max_retries} attempts")
         return None
 
-    def _get_next_task_redis(self, worker_id: str) -> Optional[Dict]:
+    def _get_next_task_redis(self, worker_id: str, with_execution_lock: bool = False) -> Optional[Dict]:
         """从 Redis 队列获取下一个任务"""
         if not REDIS_QUEUE_AVAILABLE:
             return None
@@ -385,6 +469,7 @@ class TaskDB:
         if not redis_queue:
             return None
 
+        locked_task_id = None
         try:
             # 从 Redis 获取任务 ID（阻塞式，1秒超时）
             task_id = redis_queue.dequeue(worker_id, timeout=1.0)
@@ -401,27 +486,35 @@ class TaskDB:
                     redis_queue.fail(task_id, worker_id, requeue=False)
                     return None
 
+                if with_execution_lock and not self._acquire_execution_lock(task_id):
+                    redis_queue.fail(task_id, worker_id, requeue=True)
+                    return None
+                locked_task_id = task_id if with_execution_lock else None
+                execution_id = uuid.uuid4().hex if with_execution_lock else None
                 # 更新 SQLite 中的任务状态
                 cursor.execute(
                     """
                     UPDATE tasks
                     SET status = 'processing',
                         started_at = CURRENT_TIMESTAMP,
-                        worker_id = ?
+                        worker_id = ?, execution_id = ?
                     WHERE task_id = ? AND status = 'pending'
                     """,
-                    (worker_id, task_id),
+                    (worker_id, execution_id, task_id),
                 )
 
                 if cursor.rowcount == 0:
+                    self.release_execution_lock(task_id)
                     logger.warning(f"⚠️  Task {task_id} status changed, skipping")
                     redis_queue.fail(task_id, worker_id, requeue=False)
                     return None
 
                 logger.info(f"📤 [Redis] Task {task_id} claimed by worker {worker_id}")
-                return dict(task)
+                return dict(task, status="processing", worker_id=worker_id, execution_id=execution_id)
 
         except Exception as e:
+            if locked_task_id is not None:
+                self.release_execution_lock(locked_task_id)
             logger.error(f"❌ Redis dequeue failed, falling back to SQLite: {e}")
             return None
 
@@ -497,7 +590,7 @@ class TaskDB:
             elif status == "cancelled":
                 sql = """
                     UPDATE tasks
-                    SET status = ?,
+                    SET status = ?, execution_id = NULL,
                         completed_at = CURRENT_TIMESTAMP
                     WHERE task_id = ?
                 """
@@ -508,7 +601,7 @@ class TaskDB:
                 sql = """
                     UPDATE tasks
                     SET status = ?,
-                        worker_id = NULL,
+                        worker_id = NULL, execution_id = NULL,
                         started_at = NULL
                     WHERE task_id = ?
                 """
@@ -728,6 +821,7 @@ class TaskDB:
         failed_tasks = []
 
         with self.get_cursor() as cursor:
+            cursor.execute("BEGIN IMMEDIATE")
             cursor.execute(
                 """
                 SELECT task_id, priority, file_name, backend, parent_task_id,
@@ -735,7 +829,7 @@ class TaskDB:
                 FROM tasks
                 WHERE status = 'processing'
                 AND started_at < datetime('now', '-' || ? || ' minutes')
-                AND NOT (COALESCE(is_parent, 0) = 1 AND COALESCE(child_count, 0) > 0)
+                AND NOT (COALESCE(is_parent, 0) = 1 AND COALESCE(child_count, 0) > 0 AND execution_id IS NULL)
             """,
                 (timeout_minutes,),
             )
@@ -749,7 +843,7 @@ class TaskDB:
                         """
                         UPDATE tasks
                         SET status = 'pending',
-                            worker_id = NULL,
+                            worker_id = NULL, execution_id = NULL,
                             retry_count = retry_count + 1,
                             stale_reset_count = COALESCE(stale_reset_count, 0) + 1
                         WHERE task_id = ? AND status = 'processing'
@@ -767,7 +861,7 @@ class TaskDB:
                         """
                         UPDATE tasks
                         SET status = 'failed',
-                            worker_id = NULL,
+                            worker_id = NULL, execution_id = NULL,
                             completed_at = CURRENT_TIMESTAMP,
                             error_message = ?
                         WHERE task_id = ? AND status = 'processing'
@@ -775,6 +869,13 @@ class TaskDB:
                         (error_message, row["task_id"]),
                     )
                     if cursor.rowcount > 0:
+                        if row["parent_task_id"]:
+                            cursor.execute(
+                                """UPDATE tasks SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                                       execution_id = NULL, error_message = ?
+                                   WHERE task_id = ? AND status = 'processing'""",
+                                (f"Subtask {row['task_id']} failed: {error_message}", row["parent_task_id"]),
+                            )
                         failed_tasks.append(
                             {
                                 "task_id": row["task_id"],
@@ -789,10 +890,7 @@ class TaskDB:
                 row["task_id"], row["priority"], {"file_name": row["file_name"], "backend": row["backend"]}
             )
 
-        # 子任务失败要连带父任务失败，与 worker 侧失败路径保持一致
         for task in failed_tasks:
-            if task["parent_task_id"]:
-                self.on_child_task_failed(task["task_id"], task["error_message"])
             logger.error(f"❌ Task {task['task_id']} marked as failed: {task['error_message']}")
 
         return {"reset_count": len(requeue), "failed_count": len(failed_tasks), "failed_tasks": failed_tasks}
@@ -1011,6 +1109,22 @@ class TaskDB:
                 return False
             return self._count_completed_children(cursor, parent_task_id) >= row["child_count"]
 
+    def queue_parent_merge(self, parent_task_id):
+        """合并独立认领父任务，取消父任务时不会留下仍写文件的子任务执行。"""
+        with self.get_cursor() as cursor:
+            cursor.execute(
+                """UPDATE tasks SET status = 'pending', worker_id = NULL,
+                       execution_id = NULL, started_at = NULL
+                   WHERE task_id = ? AND status = 'processing' AND child_count > 0
+                   AND child_count = (SELECT COUNT(*) FROM tasks AS children
+                       WHERE children.parent_task_id = tasks.task_id AND children.status = 'completed')""",
+                (parent_task_id,),
+            )
+            queued = cursor.rowcount > 0
+        if queued:
+            self._requeue_pending(parent_task_id)
+        return queued
+
     def on_child_task_failed(self, child_task_id: str, error_message: str):
         """子任务失败回调"""
         with self.get_cursor() as cursor:
@@ -1032,7 +1146,7 @@ class TaskDB:
             cursor.execute(
                 """
                 UPDATE tasks
-                SET status = 'failed',
+                SET status = 'failed', execution_id = NULL,
                     completed_at = CURRENT_TIMESTAMP,
                     error_message = ?
                 WHERE task_id = ?
@@ -1163,7 +1277,7 @@ class TaskDB:
                     error_message = NULL,
                     started_at = NULL,
                     completed_at = NULL,
-                    worker_id = NULL,
+                    worker_id = NULL, execution_id = NULL,
                     retry_count = retry_count + 1,
                     stale_reset_count = 0
                 WHERE task_id = ?
@@ -1201,7 +1315,7 @@ class TaskDB:
             SET status = 'processing',
                 error_message = NULL,
                 completed_at = NULL,
-                worker_id = NULL
+                worker_id = NULL, execution_id = NULL
             WHERE task_id = ? AND status IN ('failed', 'cancelled')
             """,
             (parent_task_id,),
@@ -1229,7 +1343,7 @@ class TaskDB:
                         error_message = NULL,
                         started_at = NULL,
                         completed_at = NULL,
-                        worker_id = NULL,
+                        worker_id = NULL, execution_id = NULL,
                         retry_count = retry_count + 1,
                         stale_reset_count = 0
                     WHERE task_id = ?
@@ -1247,7 +1361,7 @@ class TaskDB:
                 SET status = ?,
                     error_message = NULL,
                     completed_at = NULL,
-                    worker_id = NULL,
+                    worker_id = NULL, execution_id = NULL,
                     retry_count = retry_count + 1,
                     stale_reset_count = 0
                 WHERE task_id = ?
@@ -1287,7 +1401,7 @@ class TaskDB:
         """
         取消任务：将 pending/processing/paused 状态的任务标记为 cancelled。
         - 已取消的任务不会被打回 pending，也不会被调度器再次派发
-        - 正在处理的任务由 worker 在完成/失败时根据状态机自动跳过（completed/failed 仅对 processing 生效）
+        - 正在处理的任务使执行令牌失效，由监督进程停止执行后释放容量
         - 已拆分的父任务：未完成的子任务一并取消，排队中的不再占用处理名额
         """
         cancel_sql = """
@@ -1295,7 +1409,7 @@ class TaskDB:
             SET status = 'cancelled',
                 started_at = NULL,
                 completed_at = CURRENT_TIMESTAMP,
-                worker_id = NULL
+                worker_id = NULL, execution_id = NULL
             WHERE {target}
             AND status IN ('pending', 'processing', 'paused')
         """
