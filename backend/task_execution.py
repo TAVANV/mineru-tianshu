@@ -138,7 +138,8 @@ def _stop_tree(executor, grace):
             except ChildProcessError:
                 break
         collect()
-        if not any(_alive(p) for p in descendants.values()):
+        # 孤儿可能在 waitpid 之后才交给 subreaper；僵尸仍须下一轮 wait，不能提前确认退出。
+        if not any(p.is_running() for p in descendants.values()):
             if executor is not None:
                 executor.wait(timeout=1)
             return

@@ -28,6 +28,34 @@ def wait_for(predicate, timeout=12):
     raise AssertionError("等待执行生命周期事件超时")
 
 
+def test_stop_tree_waits_for_delayed_orphan_reaping(monkeypatch):
+    import task_execution
+    from unittest.mock import Mock
+
+    child = Mock(pid=123)
+    child.create_time.return_value = 1.0
+    child.status.return_value = psutil.STATUS_ZOMBIE
+    waits = []
+    child.is_running.side_effect = lambda: len(waits) < 2
+    parent = Mock()
+    parent.children.side_effect = lambda **_: [child] if len(waits) < 2 else []
+    monkeypatch.setattr(task_execution.psutil, "Process", lambda: parent)
+
+    def waitpid(*_):
+        waits.append(True)
+        if len(waits) == 1:
+            return 0, 0
+        if len(waits) == 2:
+            return child.pid, 0
+        raise ChildProcessError
+
+    monkeypatch.setattr(task_execution.os, "waitpid", waitpid)
+    task_execution._stop_tree(None, 0)
+    assert len(waits) >= 2
+    assert not child.is_running()
+    child.kill.assert_not_called()
+
+
 def fake_engine(self, file_path, options):
     root = Path(options["test_root"])
     name = Path(file_path).stem
