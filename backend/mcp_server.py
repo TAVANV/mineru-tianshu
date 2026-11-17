@@ -796,6 +796,37 @@ def _calculate_processing_time(task: dict) -> str:
     return "N/A"
 
 
+class _TransportEndpoint:
+    """传输层自行发送 ASGI 响应，不能再由 Route 包装成 Request/Response 处理器。"""
+
+    def __init__(self, handler):
+        self.handler = handler
+
+    async def __call__(self, scope, receive, send):
+        await self.handler(scope, receive, send)
+
+
+def create_mcp_app(host: str):
+    sse = SseServerTransport("/messages", security_settings=_transport_security_settings(host))
+
+    async def handle_sse(scope, receive, send):
+        async with sse.connect_sse(scope, receive, send) as streams:
+            await app.run(streams[0], streams[1], app.create_initialization_options())
+
+    async def health_check(request):
+        return JSONResponse({"status": "healthy"})
+
+    starlette_app = Starlette(
+        routes=[
+            Route("/sse", endpoint=_TransportEndpoint(handle_sse), methods=["GET"]),
+            Route("/messages", endpoint=_TransportEndpoint(sse.handle_post_message), methods=["POST"]),
+            Route("/health", endpoint=health_check, methods=["GET"]),
+            Route("/", endpoint=health_check, methods=["GET"]),
+        ]
+    )
+    return MCPAuthMiddleware(starlette_app)
+
+
 async def main():
     """启动 MCP Server (SSE 模式)"""
     logger.info("=" * 60)
@@ -810,33 +841,7 @@ async def main():
     if not MCP_API_KEYS:
         logger.warning("⚠️ MCP_API_KEYS 未配置：/sse 与 /messages 将对所有请求返回 401")
 
-    # 创建 SSE Transport，启用 DNS 重绑定 / Host / Origin 防护
-    security_settings = _transport_security_settings(host)
-    sse = SseServerTransport("/messages", security_settings=security_settings)
-
-    # SSE 处理函数
-    async def handle_sse(request):
-        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-            await app.run(streams[0], streams[1], app.create_initialization_options())
-
-    # POST 消息处理函数
-    async def handle_messages(request):
-        await sse.handle_post_message(request.scope, request.receive, request._send)
-
-    # 健康检查端点（公开，不返回版本号、工具列表、端点结构等可被用于信息收集的内容）
-    async def health_check(request):
-        return JSONResponse({"status": "healthy"})
-
-    # 创建 Starlette 应用，受保护端点外挂鉴权中间件
-    starlette_app = Starlette(
-        routes=[
-            Route("/sse", endpoint=handle_sse),
-            Route("/messages", endpoint=handle_messages, methods=["POST"]),
-            Route("/health", endpoint=health_check, methods=["GET"]),
-            Route("/", endpoint=health_check, methods=["GET"]),  # 根路径也返回健康检查
-        ]
-    )
-    starlette_app = MCPAuthMiddleware(starlette_app)
+    starlette_app = create_mcp_app(host)
 
     logger.info(f"🌐 MCP Server listening on http://{host}:{port}")
     logger.info(f"📡 SSE endpoint: http://{host}:{port}/sse")
