@@ -75,8 +75,9 @@ def test_onnxruntime_sessions_without_options_get_threads_and_providers(monkeypa
     ort = pytest.importorskip("onnxruntime")
     worker_module = load_worker_module(monkeypatch)
     monkeypatch.setattr(ort, "InferenceSession", ort.InferenceSession)  # 测试结束后还原
+    monkeypatch.setattr(ort, "get_available_providers", lambda: ["CPUExecutionProvider"])
 
-    # 本地为 CPU 版 onnxruntime：即使 use_cuda=True 也只能回落 CPU，不能因缺 CUDA provider 报错
+    # 显式模拟仅有 CPU provider，避免依赖测试机器安装的是 CPU 版还是 GPU 版。
     assert worker_module.configure_onnxruntime_sessions(3, use_cuda=True) == ["CPUExecutionProvider"]
     worker_module.configure_onnxruntime_sessions(3, use_cuda=True)  # 重复调用不叠加包装
     assert ort.InferenceSession.__mro__[1] is ort.InferenceSession._tianshu_original
