@@ -149,6 +149,7 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
 
       # Redis 队列配置（可选）
+      - FAIR_SCHEDULING_ENABLED=${FAIR_SCHEDULING_ENABLED:-true}
       - REDIS_QUEUE_ENABLED=${REDIS_QUEUE_ENABLED:-false}
       - REDIS_HOST=${REDIS_HOST:-redis}
       - REDIS_PORT=${REDIS_PORT:-6379}
@@ -265,6 +266,7 @@ services:
       - RUSTFS_PUBLIC_URL=${RUSTFS_PUBLIC_URL:-http://127.0.0.1:9000}
 
       # Redis 队列配置（可选）
+      - FAIR_SCHEDULING_ENABLED=${FAIR_SCHEDULING_ENABLED:-true}
       - REDIS_QUEUE_ENABLED=${REDIS_QUEUE_ENABLED:-false}
       - REDIS_HOST=${REDIS_HOST:-redis}
       - REDIS_PORT=${REDIS_PORT:-6379}

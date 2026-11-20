@@ -1,8 +1,8 @@
-> 本分支已合并上游 v2.2.1（`46af54c`）。仅保留外置模型兼容、任务级 RustFS 开关、图片交接接口，以及必要的数据迁移和依赖/预览安全修正。部署本仓库请使用 `bash setup.sh`（源码构建），或叠加 `docker-compose.build.yml`；下面的上游 GHCR 镜像不包含本地兼容接口。
+> 本分支已合并上游 v2.2.1（`46af54c`）。保留外置模型兼容、任务级 RustFS 开关、图片交接接口，以及必要的数据迁移和依赖/预览安全修正。任务队列默认启用[按用户公平调度](backend/README.md#任务调度)。部署本仓库请使用 `bash setup.sh`（源码构建），或叠加 `docker-compose.build.yml`；下面的上游 GHCR 镜像不包含本地兼容接口。
 
 ## 从旧定制版本升级
 
-- PaddleOCR、自定义 Office 解析、任务调度、MCP 和 Webhook 统一采用上游。旧的 `paddleocr-vl` / `paddleocr-vl-vllm` 客户端应改为上游支持的 MinerU 后端；`office_parser`、`MCP_API_KEY_MAP` 和旧可选功能配置接口不再生效。
+- PaddleOCR、自定义 Office 解析、MCP 和 Webhook 统一采用上游。旧的 `paddleocr-vl` / `paddleocr-vl-vllm` 客户端应改为上游支持的 MinerU 后端；`office_parser`、`MCP_API_KEY_MAP` 和旧可选功能配置接口不再生效。
 - 升级前让旧 Worker 完成任务并停止所有旧服务，备份 SQLite 数据库及输出目录；不要让新旧 Worker 同时操作数据库。旧的多层 ZIP/PDF 任务先在旧版本处理完。现有账户、API Key、任务及输出保留。
 - 旧 `webhook_deliveries` 表自动归档为 `webhook_deliveries_legacy_20260915`，原记录保留，旧待投递通知不自动重发。新通知统一使用上游 Key/任务级配置和签名协议，不再使用旧全局回调、内网白名单或取消通知。升级前核对待投递记录并适配接收方；回滚时恢复升级前数据库备份。
 - 使用新版 `.env.example` 核对部署配置。旧的独立部署脚本和 `deploy/docker/` 编排不再维护，统一使用上游 `setup.sh`、`docker-compose.yml` 及叠加文件。

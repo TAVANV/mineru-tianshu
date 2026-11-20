@@ -43,6 +43,16 @@ python litserve_worker.py --workers-per-device 2
 python task_scheduler.py --enable-scheduler
 ```
 
+### 任务调度
+
+`FAIR_SCHEDULING_ENABLED` 默认为 `true`。Worker 先领取优先级更高的任务，同优先级时优先选择当前执行任务最少的用户，占用相同则先领取创建更早的任务。没有用户 ID 的任务按同一个匿名用户统计。执行中的子任务计入所属用户的占用，等待子任务完成的父任务不计入占用。
+
+只有一个用户有任务待处理时，可以用满 Worker 名额。公平调度在 Worker 领取下一个任务时生效。正在执行的任务会继续运行，新用户要等到有空闲名额。
+
+Redis 有序集合的分数由优先级和时间决定。为使排序反映各用户的实时占用量，公平模式在同一个 SQLite 事务内统计占用并认领任务。此模式下任务直接在 SQLite 入队，Worker 清理旧的 Redis 待处理和执行中索引。队列状态以 SQLite 为准。
+
+设为 `false` 可恢复原优先级和时间顺序。若同时启用了 `REDIS_QUEUE_ENABLED`，Worker 会先从 SQLite 补入 Redis 缺失的待处理任务。切换时使用同一配置重启 API 和 Worker。原生部署修改 `backend/.env`，Compose 部署修改仓库根目录的 `.env`。
+
 ## 📁 项目结构
 
 ```

@@ -181,6 +181,7 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
 
       # Redis 队列配置（可选 - 解决 SQLite 并发瓶颈）
+      - FAIR_SCHEDULING_ENABLED=${FAIR_SCHEDULING_ENABLED:-true}
       - REDIS_QUEUE_ENABLED=${REDIS_QUEUE_ENABLED:-false}
       - REDIS_HOST=${REDIS_HOST:-tianshu-redis}
       - REDIS_PORT=${REDIS_PORT:-6379}
@@ -289,6 +290,7 @@ services:
       - RUSTFS_PUBLIC_URL=${RUSTFS_PUBLIC_URL:-http://localhost/s3}
 
       # Redis 队列配置（可选 - 解决 SQLite 并发瓶颈）
+      - FAIR_SCHEDULING_ENABLED=${FAIR_SCHEDULING_ENABLED:-true}
       - REDIS_QUEUE_ENABLED=${REDIS_QUEUE_ENABLED:-false}
       - REDIS_HOST=${REDIS_HOST:-tianshu-redis}
       - REDIS_PORT=${REDIS_PORT:-6379}

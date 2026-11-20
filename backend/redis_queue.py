@@ -122,6 +122,9 @@ class RedisTaskQueue:
         task_id: str,
         priority: int = 0,
         task_data: Optional[Dict] = None,
+        *,
+        queued_at: Optional[float] = None,
+        only_if_missing: bool = False,
     ) -> bool:
         """
         将任务加入队列
@@ -130,6 +133,8 @@ class RedisTaskQueue:
             task_id: 任务ID
             priority: 优先级（数字越大越优先）
             task_data: 任务数据（可选，用于快速访问）
+            queued_at: 补入 SQLite 积压任务时用于排序的原始时间
+            only_if_missing: 补入时保留已入队任务的分数
 
         Returns:
             bool: 是否成功入队
@@ -138,12 +143,12 @@ class RedisTaskQueue:
             # 计算分数：优先级高的先出，同优先级按时间先后
             # score = -priority * 1e10 + timestamp
             timestamp = time.time()
-            score = -priority * 1e10 + timestamp
+            score = -priority * 1e10 + (queued_at if queued_at is not None else timestamp)
 
             pipe = self.client.pipeline()
 
             # 添加到优先级队列
-            pipe.zadd(self.config.queue_key, {task_id: score})
+            pipe.zadd(self.config.queue_key, {task_id: score}, nx=only_if_missing)
 
             # 存储任务数据（可选，用于快速访问）
             if task_data:
@@ -483,6 +488,20 @@ def get_redis_queue() -> Optional[RedisTaskQueue]:
 
     # 返回实例（可能是 RedisTaskQueue 或 None）
     return _queue_instance if isinstance(_queue_instance, RedisTaskQueue) else None
+
+
+def discard_redis_queue_memberships() -> bool:
+    """公平调度接管后清除旧的 Redis 待处理和执行中索引。"""
+    if not REDIS_AVAILABLE or os.getenv("REDIS_QUEUE_ENABLED", "false").lower() != "true":
+        return True
+    try:
+        # 直接连接以便稍后重试，队列单例会缓存启动时的连接失败。
+        queue = RedisTaskQueue()
+        queue.client.delete(queue.config.queue_key, queue.config.processing_key)
+        return True
+    except Exception as e:
+        logger.warning(f"清理旧的 Redis 队列索引失败: {e}")
+        return False
 
 
 if __name__ == "__main__":
