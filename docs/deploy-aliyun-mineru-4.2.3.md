@@ -31,6 +31,8 @@ dc() {
 
 后文的 `dc` 均指此函数。原 `.env` 加入下表的 `COMPOSE_FILE` 后，在 `/root/tianshu` 直接运行 `docker compose up -d` 也会按同一顺序加载四份编排，保持原有使用方式。服务器 Docker Compose `2.40.3` 支持叠加文件的 `!override` 与 `!reset`；前者避免新旧端口累计，后者移除原 RustFS 卷的 `driver` 字段以使用现有外部卷。`init-models`、API、Worker、Scheduler、MCP 使用同一后端镜像；运行应用源码来自镜像。vLLM 单独挂载 `scripts/vllm-model-entrypoint.py`，用于动态选择外置模型。
 
+叠加文件保留 API、Worker、MCP、前端、RustFS、Scheduler 与 vLLM 的原有健康检查及启动宽限时间，维持现有可观测性。
+
 ## 2. 保留数据与设置变量
 
 始终使用原有的单一 `.env`。`.env.registry.example` 仅作为非敏感变量的合并模板，完成第 4 节备份后，再由部署脚本或编辑器按键更新原 `.env`；禁止用 `cp` 覆盖原文件，也不创建活动 `.env.registry`。原 `.env` 的 JWT、管理员密码、RustFS 访问密钥、MCP 密钥、内部 API 凭据、`DATABASE_PATH`、网络配置和自定义地址沿用；不要从示例文件重建原 `.env`，也不要把现有密钥复制进文档或提交到 Git。

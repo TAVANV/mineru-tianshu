@@ -35,6 +35,12 @@ services:
 
   backend:
     image: *registry-backend-image
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     ports: !override
       - "${API_PORT:-8100}:8000"
     environment:
@@ -49,6 +55,12 @@ services:
 
   worker:
     image: *registry-backend-image
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     ports: !override
       - "${WORKER_PORT:-8001}:8001"
     environment:
@@ -79,6 +91,12 @@ services:
 
   scheduler:
     image: *registry-backend-image
+    healthcheck:
+      test: ["CMD", "python", "-c", "from pathlib import Path; assert b'task_scheduler.py' in Path('/proc/1/cmdline').read_bytes()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
     command:
       - python
       - task_scheduler.py
@@ -102,6 +120,12 @@ services:
 
   mcp-server:
     image: *registry-backend-image
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     ports: !override
       - "${MCP_PORT:-8002}:8002"
     environment:
@@ -112,6 +136,12 @@ services:
 
   frontend:
     image: ${TIANSHU_FRONTEND_IMAGE:-registry.cn-chengdu.aliyuncs.com/tavan-ai/tianshu-frontend:4}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     ports: !override
       - "${FRONTEND_PORT:-8080}:80"
     environment:
@@ -120,6 +150,12 @@ services:
 
   rustfs:
     image: ${RUSTFS_IMAGE:-rustfs/rustfs@sha256:0725587f6fcca83c1898f321424327d6e6da5e01ea20382905dd258ed5af3be4}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     ports: !override
       # 历史结果使用宿主机 9000 的图片 URL，保留原外部访问路径。
       - "${RUSTFS_PORT:-9000}:9000"
@@ -127,6 +163,12 @@ services:
 
   vllm-mineru:
     image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.31.0-cu129}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:30024/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     restart: "no"
     profiles: ["manual"]
     ports: !override
