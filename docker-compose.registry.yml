@@ -1,0 +1,171 @@
+# 阿里云发布镜像与 /root/tianshu 原位升级配置，必须最后叠加。
+# docker compose --env-file .env \
+#   -f docker-compose.yml -f docker-compose.external-models.yml \
+#   -f docker-compose.vllm.yml -f docker-compose.registry.yml config --quiet
+# 需要 Docker Compose >= 2.24.4（!override）；目标服务器使用 2.40.3。
+# 将 .env.registry.example 的非敏感设置逐项合并到原 .env，COMPOSE_FILE 支持直接 docker compose up。
+
+x-registry-backend-image: &registry-backend-image ${TIANSHU_BACKEND_IMAGE:-registry.cn-chengdu.aliyuncs.com/tavan-ai/tianshu-backend:4}
+
+x-registry-environment: &registry-environment
+  MINERU_CONFIG: /app/models/config.yaml
+  MINERU_MODEL_SOURCE: local
+  MODEL_DOWNLOAD_SOURCE: local
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  MODELSCOPE_OFFLINE: "1"
+  HF_HOME: /app/models/huggingface_cache
+  MODELSCOPE_CACHE: /app/models/modelscope_cache
+  TORCH_HOME: /app/models/torch_cache
+  YOLO_CONFIG_DIR: /app/models/ultralytics_cfg
+
+x-registry-model-volumes: &registry-model-volumes
+  - ${OFFLINE_MODELS_PATH:-/root/tianshu/models-offline-4.2.3}:/app/models:ro
+  - ${OFFLINE_MODELS_PATH:-/root/tianshu/models-offline-4.2.3}/modelscope_cache:/app/models/modelscope_cache:rw
+  - ${OFFLINE_MODELS_PATH:-/root/tianshu/models-offline-4.2.3}/huggingface_cache:/app/models/huggingface_cache:rw
+  - ${OFFLINE_MODELS_PATH:-/root/tianshu/models-offline-4.2.3}/.locks:/app/models/.locks:rw
+  - ${OFFLINE_MODELS_PATH:-/root/tianshu/models-offline-4.2.3}/torch_cache:/app/models/torch_cache:rw
+  - ${OFFLINE_MODELS_PATH:-/root/tianshu/models-offline-4.2.3}/ultralytics_cfg:/app/models/ultralytics_cfg:rw
+
+services:
+  init-models:
+    image: *registry-backend-image
+    environment: *registry-environment
+    volumes: *registry-model-volumes
+
+  backend:
+    image: *registry-backend-image
+    ports: !override
+      - "${API_PORT:-8100}:8000"
+    environment:
+      <<: *registry-environment
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://192.168.100.27:8080,http://localhost:8080,http://127.0.0.1:8080}
+      RUSTFS_PUBLIC_URL: ${RUSTFS_PUBLIC_URL:-http://192.168.100.27:9000}
+      RUSTFS_SECURE: ${RUSTFS_SECURE:-false}
+      FAIR_SCHEDULING_ENABLED: ${FAIR_SCHEDULING_ENABLED:-true}
+      REDIS_QUEUE_ENABLED: ${REDIS_QUEUE_ENABLED:-false}
+      REDIS_DB: ${REDIS_DB:-0}
+    volumes: *registry-model-volumes
+
+  worker:
+    image: *registry-backend-image
+    ports: !override
+      - "${WORKER_PORT:-8001}:8001"
+    environment:
+      <<: *registry-environment
+      MAX_CONCURRENT_TASKS: ${MAX_CONCURRENT_TASKS:-4}
+      MINERU_VIRTUAL_VRAM_SIZE: ${MINERU_VIRTUAL_VRAM_SIZE:-6}
+      MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-8}
+      WORKER_GPUS: null
+      MAX_BATCH_SIZE: null
+      PDF_SPLIT_ENABLED: ${PDF_SPLIT_ENABLED:-true}
+      PDF_SPLIT_THRESHOLD_PAGES: ${PDF_SPLIT_THRESHOLD_PAGES:-40}
+      PDF_SPLIT_CHUNK_SIZE: ${PDF_SPLIT_CHUNK_SIZE:-20}
+      RUSTFS_PUBLIC_URL: ${RUSTFS_PUBLIC_URL:-http://192.168.100.27:9000}
+      RUSTFS_SECURE: ${RUSTFS_SECURE:-false}
+      FAIR_SCHEDULING_ENABLED: ${FAIR_SCHEDULING_ENABLED:-true}
+      REDIS_QUEUE_ENABLED: ${REDIS_QUEUE_ENABLED:-false}
+      REDIS_DB: ${REDIS_DB:-0}
+    volumes: *registry-model-volumes
+    mem_limit: ${WORKER_MEMORY_LIMIT:-32G}
+    memswap_limit: ${WORKER_MEMORY_SWAP_LIMIT:-40G}
+    mem_reservation: ${WORKER_MEMORY_RESERVATION:-8G}
+    deploy:
+      resources:
+        limits:
+          memory: ${WORKER_MEMORY_LIMIT:-32G}
+        reservations:
+          memory: ${WORKER_MEMORY_RESERVATION:-8G}
+
+  scheduler:
+    image: *registry-backend-image
+    command:
+      - python
+      - task_scheduler.py
+      - --litserve-url
+      - "${LITSERVE_URL:-http://worker:8001/predict}"
+      - --wait-for-workers
+      - --monitor-interval
+      - "${SCHEDULER_MONITOR_INTERVAL:-60}"
+      - --stale-task-timeout
+      - "${SCHEDULER_STALE_TASK_TIMEOUT:-60}"
+      - --cleanup-old-files-days
+      - "${SCHEDULER_CLEANUP_OLD_FILES_DAYS:-7}"
+    environment:
+      <<: *registry-environment
+      DATABASE_PATH: ${DATABASE_PATH:-/app/data/db/mineru_tianshu.db}
+      OUTPUT_PATH: /app/data/output
+      UPLOAD_PATH: /app/data/uploads
+      FAIR_SCHEDULING_ENABLED: ${FAIR_SCHEDULING_ENABLED:-true}
+      REDIS_QUEUE_ENABLED: ${REDIS_QUEUE_ENABLED:-false}
+    volumes: *registry-model-volumes
+
+  mcp-server:
+    image: *registry-backend-image
+    ports: !override
+      - "${MCP_PORT:-8002}:8002"
+    environment:
+      <<: *registry-environment
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-192.168.100.27:8002,localhost:*,127.0.0.1:*,[::1]:*}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-http://192.168.100.27:8080,http://192.168.100.27:8002,http://localhost:*,https://localhost:*,http://127.0.0.1:*,https://127.0.0.1:*,http://[::1]:*,https://[::1]:*}
+    volumes: *registry-model-volumes
+
+  frontend:
+    image: ${TIANSHU_FRONTEND_IMAGE:-registry.cn-chengdu.aliyuncs.com/tavan-ai/tianshu-frontend:4}
+    ports: !override
+      - "${FRONTEND_PORT:-8080}:80"
+    environment:
+      VITE_API_BASE_URL: null
+      NGINX_CLIENT_MAX_BODY_SIZE: ${NGINX_CLIENT_MAX_BODY_SIZE:-0}
+
+  rustfs:
+    image: ${RUSTFS_IMAGE:-rustfs/rustfs@sha256:0725587f6fcca83c1898f321424327d6e6da5e01ea20382905dd258ed5af3be4}
+    ports: !override
+      # 历史结果使用宿主机 9000 的图片 URL，保留原外部访问路径。
+      - "${RUSTFS_PORT:-9000}:9000"
+      - "${RUSTFS_CONSOLE_PORT:-9001}:9001"
+
+  vllm-mineru:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.31.0-cu129}
+    restart: "no"
+    profiles: ["manual"]
+    ports: !override
+      - "${VLLM_PORT:-30024}:30024"
+    volumes:
+      - ${OFFLINE_MODELS_PATH:-/root/tianshu/models-offline-4.2.3}:/models:ro
+    environment:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      MODELSCOPE_OFFLINE: "1"
+      MINERU_VLM_MODEL_DIR: ${MINERU_VLM_MODEL_DIR:-}
+    # cu129 镜像的可选 torchcodec 依赖 CUDA 13；MinerU Pro 图像推理无需音频解码。
+    # 保留 Python 入口，根据 config.yaml 或显式环境变量选择 VLM 权重。
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        python3 -m pip uninstall -y torchcodec
+        exec python3 /opt/vllm-model-entrypoint.py "$$@"
+      - vllm
+    command: >
+      --served-model-name MinerU-1.2B
+      --trust-remote-code --host 0.0.0.0 --port 30024
+      --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.2}
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-8192}
+      --max-num-batched-tokens ${VLLM_MAX_BATCHED_TOKENS:-8192}
+      --max-num-seqs ${VLLM_MAX_NUM_SEQS:-32}
+      --enforce-eager --limit-mm-per-prompt '{"image": 1}'
+
+networks:
+  tianshu-network:
+    name: ${TIANSHU_NETWORK_NAME:-tianshu-network}
+
+volumes:
+  rustfs-data:
+    driver: !reset null
+    external: true
+    name: tianshu-rustfs-data
+  rustfs-logs:
+    driver: !reset null
+    external: true
+    name: tianshu-rustfs-logs
