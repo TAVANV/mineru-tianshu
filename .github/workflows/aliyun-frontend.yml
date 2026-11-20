@@ -1,0 +1,136 @@
+name: 手动构建并推送阿里云前端镜像
+run-name: 发布前端镜像 ${{ inputs.version || '自动版本' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "前端版本号，留空从 3 自动递增，可填写大于等于 3 的整数，失败也占号"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aliyun-tianshu-frontend
+  queue: max
+  cancel-in-progress: false
+
+env:
+  REGISTRY_HOST: registry.cn-chengdu.aliyuncs.com
+  REGISTRY_PREFIX: registry.cn-chengdu.aliyuncs.com/tavan-ai
+  IMAGE_NAME: tianshu-frontend
+
+jobs:
+  version:
+    name: 分配前端镜像版本
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: 检出本次源码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: 验证版本分配逻辑
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+
+      - name: 检查私有仓库凭据
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          if [ -z "$REGISTRY_USERNAME" ] || [ -z "$REGISTRY_PASSWORD" ]; then
+            echo "请先配置仓库 Secrets REGISTRY_USERNAME 和 REGISTRY_PASSWORD"
+            exit 1
+          fi
+
+      - name: 登录阿里云镜像仓库
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY_HOST }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: 检查目标标签并预留版本
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/allocate_image_version.py
+
+  build:
+    name: 前端镜像:${{ needs.version.outputs.version }}
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: 检出本次源码
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: 登录阿里云镜像仓库
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY_HOST }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: 配置 Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: 确认发布标签可用
+        env:
+          IMAGE_REF: ${{ env.REGISTRY_PREFIX }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          sys.path.insert(0, ".github/scripts")
+          from allocate_image_version import registry_tag_exists
+
+          image = os.environ["IMAGE_REF"]
+          if registry_tag_exists(image):
+              raise SystemExit(f"镜像标签已存在，请使用新版本 {image}")
+          PY
+
+      - name: 构建并推送镜像
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: frontend/Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            NPM_REGISTRY=https://registry.npmjs.org
+          push: true
+          load: false
+          provenance: false
+          tags: ${{ env.REGISTRY_PREFIX }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+          cache-from: type=gha,scope=aliyun-${{ env.IMAGE_NAME }}-amd64
+          cache-to: type=gha,scope=aliyun-${{ env.IMAGE_NAME }}-amd64,mode=max,ignore-error=true
+
+      - name: 记录发布结果
+        env:
+          IMAGE_REF: ${{ env.REGISTRY_PREFIX }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          printf '已推送 `%s`\n\nDigest `%s`\n' "$IMAGE_REF" "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 查看构建后的磁盘空间
+        if: always()
+        run: df -h /
