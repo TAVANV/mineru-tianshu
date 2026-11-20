@@ -20,7 +20,7 @@ MinerU Tianshu（天枢）是一个**企业级 AI 数据预处理平台**，将�
 |---|---|
 | 前端 | Vue 3、TypeScript、Vite、TailwindCSS、Pinia、Vue Router、vue-i18n（中英文） |
 | 后端 | Python 3.12+、FastAPI、LitServe（GPU 负载均衡）、SQLite（任务队列/认证）、可选 Redis 队列 |
-| AI 引擎 | MinerU 3.4+（pipeline/vlm/hybrid，含 vllm-mineru 远程模式）、SenseVoice/FunASR、MarkItDown |
+| AI 引擎 | MinerU 4.2.3（pipeline/vlm/hybrid，含 vllm-mineru 远程模式）、SenseVoice/FunASR、MarkItDown |
 | 基础设施 | Docker Compose、Nginx（前端）、RustFS（S3 兼容对象存储，minio-py 客户端）、MCP 协议 |
 | 许可证 | Apache License 2.0 |
 
@@ -59,7 +59,7 @@ mineru-tianshu/
 │   ├── output_normalizer/     # 输出标准化（统一 result.md/result.json/images/）
 │   ├── storage/               # RustFS S3 客户端（图片上传、URL 替换）
 │   ├── utils/                 # 工具函数
-│   ├── requirements.txt       # Python 依赖（版本锁定，含 mineru[all]>=3.4.5）
+│   ├── requirements.txt       # Python 依赖（版本锁定，含 mineru[torch]==4.2.3）
 │   └── Dockerfile  Dockerfile.cpu  Dockerfile.offline  install.sh
 │
 ├── dify_plugin/tianshu/       # Dify 插件（manifest.yaml + provider/ + tools/）
@@ -157,7 +157,7 @@ npm run build     # tsc && vite build → dist/
 
 **约定**：每个引擎都在 try/except 中导入并设置 `X_AVAILABLE` 标志，缺失的可选依赖只降级对应引擎，不会拖垮整个 Worker。新增引擎时请保持此模式。
 
-`vllm-mineru` 在 compose 里是 `profiles: ["manual"]` + `restart: no`，不随 `up` 启动。`VLLMController.ensure_running()` 在任务 backend 属于 `LOCAL_VLLM_BACKENDS` 且调用方未自带 `server_url` 时，经挂载的 Docker socket **冷启动**它；容器不存在或 Docker 不可达即视为 vLLM 由外部托管，不插手。就绪判定不归它管，由 `mineru_pipeline/engine.py::_wait_for_server` 轮询 `/v1/models` 完成。
+`vllm-mineru` 在 compose 里是 `profiles: ["manual"]` + `restart: no`，不随 `up` 启动。`VLLMController.ensure_running()` 在任务使用 `vlm-*` 或 `hybrid-*` 且调用方未自带 `server_url` 时，经挂载的 Docker socket **冷启动**它；容器不存在或 Docker 不可达即视为 vLLM 由外部托管，不插手。就绪判定不归它管，由 `mineru_pipeline/engine.py::_wait_for_server` 轮询 `/v1/models` 完成。
 
 ### 输出契约
 
@@ -209,7 +209,7 @@ npm run build     # tsc && vite build → dist/
 - 后端容器以非 root 用户 `tianshu`（UID 10001）运行，挂载到 `/app/data`、`/app/logs` 的宿主机目录必须对其可写（`setup.sh` 的 `create_directories` 会做 best-effort `chmod`）；Worker 例外，因挂载 `/var/run/docker.sock` 在 compose 中保持 `user: root`。
 - 全新部署必须设置 `TIANSHU_ADMIN_PASSWORD`（可选 `TIANSHU_ADMIN_USERNAME`，默认 admin），否则 API 服务拒绝启动；`setup.sh` 会自动生成随机密码写入 `.env`。
 - 模型权重在 `models/`，运行时数据在 `data/{uploads,output,db}`，日志在 `logs/{backend,worker,mcp}`。
-- 模型一律不落镜像：权重与下载缓存都在宿主机 `models/` 下，重建镜像/容器不会重新下载。容器内通过 `HF_HOME=/app/models/huggingface_cache` 与 `MODELSCOPE_CACHE=/app/models/modelscope_cache` 环境变量定位缓存（与运行用户/HOME 无关，不要在 compose 里挂 `~/.cache` 路径）；`MINERU_MODEL_SOURCE=local` 让 MinerU 只使用 `models-dir` 挂载的权重，不做联网探测。`models/mineru.json` 由 `download_models.py` 每次生成（`model-source: local`，pipeline 路径为仓库根 `/app/models/PDF-Extract-Kit-1.0`——MinerU 3.4+ 的模型相对路径自带 `models/` 前缀，不要指向其 `models/` 子目录）。
+- 模型一律不落镜像：权重与下载缓存都在宿主机 `models/` 下，重建镜像/容器不会重新下载。容器内通过 `HF_HOME=/app/models/huggingface_cache` 与 `MODELSCOPE_CACHE=/app/models/modelscope_cache` 环境变量定位缓存（与运行用户/HOME 无关，不要在 compose 里挂 `~/.cache` 路径）；`MINERU_CONFIG` 指向 `models/config.yaml`。由 `download_models.py` 写入 `model.source: local`、`model.small_backend: torch` 和运行时模型根 `model.base_dir`。MinerU 从根目录下的 `MinerU-4_models_torch/` 读取小模型。离线挂载的权重只读，`.locks/` 单独可写。
 
 ## 代码风格
 

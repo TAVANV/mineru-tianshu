@@ -7,6 +7,7 @@
 #      - tianshu-backend:latest
 #      - tianshu-frontend:latest
 #      - rustfs/rustfs:<RUSTFS_VERSION>
+#      - vllm/vllm-openai:v0.31.0-cu129
 #      - redis:7-alpine (可选)
 #   3. 确保已解压模型文件到 ./models-offline 目录
 #   4. 启动服务:
@@ -23,7 +24,7 @@
 # 前置要求:
 #   - Docker 20.10+
 #   - Docker Compose 2.0+
-#   - NVIDIA GPU + NVIDIA Driver 525+
+#   - NVIDIA GPU + Linux NVIDIA Driver 575.57.08+（vLLM CUDA 12.9 Update 1）
 #   - NVIDIA Container Toolkit
 #   - 推荐 32GB+ 内存
 #   - 推荐 16+ CPU 核心
@@ -108,11 +109,11 @@ services:
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
-      # 离线模型目录直接挂载为 /app/models（只读），确保 mineru.json 与模型权重路径一致
+      # 离线模型目录直接挂载为 /app/models（只读），由 MINERU_CONFIG 指向挂载内的配置
       - ./models-offline:/app/models:ro
       # HF/ModelScope 缓存保持可写（子目录覆盖父卷的只读属性）
-      - ./models/huggingface_cache:/app/models/huggingface_cache:rw
-      - ./models/modelscope_cache:/app/models/modelscope_cache:rw
+      - ./models-offline/huggingface_cache:/app/models/huggingface_cache:rw
+      - ./models-offline/modelscope_cache:/app/models/modelscope_cache:rw
       # 上传文件(统一使用 /app/data 路径)
       - ./data/uploads:/app/data/uploads:rw
       # 输出结果
@@ -172,11 +173,13 @@ services:
 
       # 模型下载配置(离线模式)
       - MODEL_DOWNLOAD_SOURCE=${MODEL_DOWNLOAD_SOURCE:-local}
-      - MINERU_MODEL_SOURCE=${MINERU_MODEL_SOURCE:-local}
+      - MINERU_CONFIG=/app/models/config.yaml
+      - MINERU_MODEL_SOURCE=local
       # 模型缓存显式指向宿主机挂载目录（与运行用户/HOME 无关），容器重建后无需重新下载
       - HF_HOME=/app/models/huggingface_cache
       - MODELSCOPE_CACHE=/app/models/modelscope_cache
-      - HF_OFFLINE=1
+      - HF_HUB_OFFLINE=1
+      - MODELSCOPE_OFFLINE=1
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
       - HF_TOKEN=${HF_TOKEN:-}
 
@@ -206,23 +209,73 @@ services:
       - rustfs
       # redis 是可选依赖，不在 depends_on 中强制依赖
 
+  # CUDA 12.9 Update 1 的 Linux 原生驱动要求为 575.57.08 及以上。
+  vllm-mineru:
+    image: vllm/vllm-openai:v0.31.0-cu129
+    container_name: tianshu-vllm-mineru
+    restart: "no"
+    profiles: ["manual"]
+    ports:
+      - "127.0.0.1:30024:30024"
+    volumes:
+      - ./models-offline:/models:ro
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      - TZ=Asia/Shanghai
+      - HF_HUB_OFFLINE=1
+      - VLLM_LOGGING_LEVEL=ERROR
+    # 该镜像的 torchcodec 依赖 CUDA 13，Pro 模型只接收图片。
+    # https://github.com/vllm-project/vllm/issues/60406
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        python3 -m pip uninstall -y torchcodec
+        exec vllm serve "$$@"
+      - vllm
+    command: >
+      --model /models/MinerU2.5-Pro-2605-1.2B
+      --served-model-name MinerU-1.2B
+      --trust-remote-code
+      --host 0.0.0.0
+      --port 30024
+      --gpu-memory-utilization 0.6
+      --max-model-len 8192
+      --max-num-batched-tokens 8192
+      --enforce-eager
+      --limit-mm-per-prompt '{"image": 1}'
+    shm_size: 32gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${VLLM_MINERU_DEVICE:-0}"]
+              capabilities: [gpu]
+    networks:
+      - tianshu-network
+
   # ============================================================================
   # LitServe Worker (Offline)
   # ============================================================================
   worker:
     image: tianshu-backend:latest
     container_name: tianshu-worker
-    user: "${TIANSHU_UID:-0}:${TIANSHU_GID:-0}"
+    user: "0:0"
     restart: unless-stopped
     command: ["worker", "python", "litserve_worker.py"]
     ports:
       - "127.0.0.1:${WORKER_PORT:-8001}:8001"
     volumes:
-      # 离线模型目录直接挂载为 /app/models（只读），确保 mineru.json 与模型权重路径一致
+      # 离线模型目录直接挂载为 /app/models（只读），由 MINERU_CONFIG 指向挂载内的配置
       - ./models-offline:/app/models:ro
       # HF/ModelScope 缓存保持可写（子目录覆盖父卷的只读属性）
-      - ./models/huggingface_cache:/app/models/huggingface_cache:rw
-      - ./models/modelscope_cache:/app/models/modelscope_cache:rw
+      - ./models-offline/huggingface_cache:/app/models/huggingface_cache:rw
+      - ./models-offline/modelscope_cache:/app/models/modelscope_cache:rw
+      - ./models-offline/.locks:/app/models/.locks:rw
+      - ./models-offline/ultralytics_cfg:/app/models/ultralytics_cfg:rw
+      - /var/run/docker.sock:/var/run/docker.sock
       # 上传文件(读写)
       - ./data/uploads:/app/data/uploads:rw
       # 输出结果
@@ -245,7 +298,9 @@ services:
       # GPU 配置
       # 注意：不设置 CUDA_VISIBLE_DEVICES，让容器自然看到所有 GPU
       # Python 代码会自动检测并使用所有可用的 GPU
-      - WORKER_GPUS=${WORKER_GPUS:-2}  # 每个 GPU 的 worker 数量
+      - MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-1}
+      - MINERU_VIRTUAL_VRAM_SIZE=${MINERU_VIRTUAL_VRAM_SIZE:-8}
+      - "MINERU_VLLM_API_LIST=${MINERU_VLLM_API_LIST:-['http://tianshu-vllm-mineru:30024/v1']}"
 
       # 模型路径
       - MODEL_PATH=/app/models
@@ -266,11 +321,16 @@ services:
 
       # 模型下载配置(离线模式)
       - MODEL_DOWNLOAD_SOURCE=local
-      - MINERU_MODEL_SOURCE=${MINERU_MODEL_SOURCE:-local}
+      - WATERMARK_MODEL_DIR=/app/models/watermark_models
+      - LAMA_MODEL=/app/models/watermark_models/big-lama.pt
+      - YOLO_CONFIG_DIR=/app/models/ultralytics_cfg
+      - MINERU_CONFIG=/app/models/config.yaml
+      - MINERU_MODEL_SOURCE=local
       # 模型缓存显式指向宿主机挂载目录（与运行用户/HOME 无关），容器重建后无需重新下载
       - HF_HOME=/app/models/huggingface_cache
       - MODELSCOPE_CACHE=/app/models/modelscope_cache
-      - HF_OFFLINE=1
+      - HF_HUB_OFFLINE=1
+      - MODELSCOPE_OFFLINE=1
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
       - HF_TOKEN=${HF_TOKEN:-}
 
@@ -280,6 +340,7 @@ services:
       - PDF_SPLIT_CHUNK_SIZE=${PDF_SPLIT_CHUNK_SIZE:-20}
 
       # RustFS 对象存储配置
+      - RUSTFS_ENABLED=${RUSTFS_ENABLED:-true}
       - RUSTFS_ENDPOINT=${RUSTFS_ENDPOINT:-tianshu-rustfs:9000}
       - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY}
       - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY}
@@ -416,7 +477,7 @@ volumes:
   # RustFS 数据卷
   rustfs-data:
     driver: local
-    name: tianshu-rustfs-data
+    name: ${TIANSHU_RUSTFS_VOLUME:-tianshu-rustfs-data}
   rustfs-logs:
     driver: local
     name: tianshu-rustfs-logs

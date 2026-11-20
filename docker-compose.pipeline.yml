@@ -15,8 +15,8 @@
 
 services:
   # ============================================================================
-  # 只下载 pipeline 需要的模型（PDF-Extract-Kit-1.0）
-  # mineru.json 仍会正常生成，vlm 路径留空目录不影响 pipeline
+  # 只下载 basic 档需要的小模型（MinerU-4_models_torch）
+  # 生成 config.yaml 供 Worker 读取
   # ============================================================================
   init-models:
     entrypoint:
@@ -35,7 +35,7 @@ services:
   #     应保持 "auto" 由 LitServe 自行枚举可见 GPU。
   #   - MINERU_VIRTUAL_VRAM_SIZE 是「每个 worker 进程」的显存预算（GB）。同卡多进程时必须
   #     显式下调，否则每个进程都按整卡显存规划 batch，会 OOM。
-  #   - base 文件挂载的 /var/run/docker.sock 在 pipeline 模式下不会被使用（VLLMController
+  #   - pipeline 模式无需 docker-compose.vllm.yml 提供的 Docker socket（VLLMController
   #     仅在配置了 vLLM api-list 时才触发）。如需收紧权限，可自行从 docker-compose.yml 移除。
   # ============================================================================
   worker:

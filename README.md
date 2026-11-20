@@ -15,22 +15,18 @@
 
 ### 复用已有外置模型
 
-标准新部署使用上游 `backend/download_models.py`。已有外置目录使用保留的 `backend/offline_models.py`，它保留旧 VLM 选择及目录，并提供增量下载和校验；`backend/prepare_offline_models.py` 也保留，但不再默认下载 PaddleOCR。不要对旧目录运行上游默认下载器来切换模型。
+外置模型目录使用 MinerU 4.2.3 的 `config.yaml`。联网准备机可用 `backend/offline_models.py` 补齐 Torch 小模型和 Pro VLM。已有音频、水印与其他缓存目录可继续挂载。
 
 ```bash
-# 在联网准备机补齐 Pipeline 权重；不会自动切换已有 VLM。
-python backend/offline_models.py --output /data/modelfiles --models mineru_pipeline --strict
-# 如需 Pro VLM，显式下载并切换；原 VLM 权重不删除。
-python backend/offline_models.py --output /data/modelfiles --models mineru_vlm_pro --vlm-model mineru_vlm_pro --strict
-# 只读验证 mineru.json 与所选权重；不下载、不修改配置。
+python backend/offline_models.py --output /data/modelfiles --models mineru_pipeline,mineru_vlm_pro --strict
 python backend/check_external_models.py /data/modelfiles
 
-# .env 中设置 OFFLINE_MODELS_PATH=/data/modelfiles，仍使用原 data/uploads、data/output、data/db。
+# .env 中设置 OFFLINE_MODELS_PATH=/data/modelfiles。
 docker compose -f docker-compose.yml -f docker-compose.build.yml -f docker-compose.external-models.yml build
 docker compose -f docker-compose.yml -f docker-compose.build.yml -f docker-compose.external-models.yml up -d
 ```
 
-外置目录挂到 `/app/models`，`mineru.json` 使用容器路径；模型权重只读，下载缓存与 Ultralytics 配置子目录可写。本地 vLLM 额外叠加上游 `docker-compose.vllm.yml`，模型选择跟随已有 `mineru.json`。启动前只校验权重，不自动下载或复制整份模型。真实 GPU 推理及旧模型与新版引擎的兼容性仍需在部署环境验收。
+外置目录挂到 `/app/models`，并通过 `MINERU_CONFIG` 读取配置。权重只读挂载，缓存与 MinerU 的运行时锁目录可写。需要按需启动本机 vLLM 时，叠加 `docker-compose.vllm.yml`，并用同一套 Compose 文件执行 `docker compose --profile manual create vllm-mineru`。外置模式默认使用 Pro VLM，可通过 `MINERU_VLM_MODEL_DIR` 显式选择已有权重。
 
 ---
 
@@ -81,6 +77,12 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml -f docker-compo
 ---
 
 ## 📝 最新更新
+
+### MinerU 4.2.3 升级
+
+- Python 依赖锁定为 `mineru[torch]==4.2.3` 和 `transformers==5.10.1`，Worker 使用公开解析和渲染 SDK。
+- 原有后端名称继续可用。离线包新增 vLLM CUDA 12.9 镜像及 SHA256 校验。
+- 从 3.4.5 升级请将旧部署留在原目录，在新目录按升级指南完整部署。[MinerU 4.2.3 离线升级指南](docs/upgrade-4.2.3-offline.md)
 
 ### 2026-10-16 🚀 v2.2.1：发布预构建 Docker 镜像
 
@@ -376,7 +378,7 @@ bash setup.sh --mode gpu --dry-run
 | `gpu` | GPU 标准部署（docker-compose.yml，默认） |
 | `pipeline` | 纯 pipeline 部署（只下载 PDF-Extract-Kit 模型，更轻量） |
 | `cpu` | Mac CPU 本地开发（docker-compose.cpu.yml + .env.cpu） |
-| `native` | 本机原生部署（不用 Docker，Apple Silicon 自动 MPS 加速，VLM 走 MLX） |
+| `native` | 本机原生部署（不用 Docker，Apple Silicon 自动 MPS 加速，本地 VLM 使用 llama.cpp） |
 | `offline-build` / `offline-deploy` | 离线部署：联网机构建离线包 / 生产机离线部署 |
 
 交互过程会询问网络环境（国内镜像加速 / 海外官方源直连）、GPU 数量（自动检测）、Worker 并发数、模型源（HuggingFace/ModelScope）、Redis、RustFS 公网地址和端口，并自动完成 JWT 密钥生成、`MINERU_VIRTUAL_VRAM_SIZE`/`WORKER_MEMORY_LIMIT` 计算、目录创建和健康检查。
@@ -523,30 +525,7 @@ python start_all.py --enable-mcp  # MCP Server 端口 8002（默认）
 
 ### 离线部署
 
-Tianshu 支持**完全离线部署**，分为联网机构建、生产机部署两个阶段：
-
-```bash
-# 1. 在联网环境构建离线包（Linux/Mac 均可，产物在 docker-images/）
-bash setup.sh --mode offline-build
-
-# 2. 传输到生产服务器
-rsync -avz docker-images/ user@prod-server:/opt/tianshu/
-
-# 3. 在生产服务器部署
-cd /opt/tianshu
-bash setup.sh --mode offline-deploy
-```
-
-**特点**：
-- ✅ **跨平台构建**：支持在 Mac（Apple Silicon/Intel）构建 Linux amd64 镜像
-- ✅ **完全离线**：所有模型（~15GB）和依赖预先打包
-- ✅ **一键部署**：自动配置环境变量、JWT 密钥、RustFS 对象存储
-- ✅ **Office 文档支持**：MinerU 原生解析 .docx/.xlsx/.pptx，旧版 .doc/.xls/.ppt 经 LibreOffice 转换后解析
-
-**关键修复**：
-- 🔧 Worker uploads 目录读写权限
-- 🔧 albumentations/albucore 版本锁定（解决 MinerU 公式识别依赖）
-- 🔧 RustFS 镜像平台指定（确保 amd64 架构一致性）
+在联网机执行 `bash setup.sh --mode offline-build` 生成 `docker-images/`，将完整离线包传到目标目录后执行 `bash setup.sh --mode offline-deploy`。从 3.4.5 升级时，在新目录复制旧数据和环境变量，并核对 RustFS 命名卷。[完整重新部署与回滚步骤](docs/upgrade-4.2.3-offline.md)
 
 ### 在线 Docker 部署
 

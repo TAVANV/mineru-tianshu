@@ -89,70 +89,23 @@ COPY backend/requirements.txt /tmp/requirements.txt
 # 分步安装依赖（CPU 版本）
 # Step 1: 安装 PyTorch CPU 版本 (包含 torchaudio for SenseVoice/FunASR)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
+    pip install torch==2.7.1+cpu torchvision==0.22.1+cpu torchaudio==2.7.1+cpu \
     --index-url https://download.pytorch.org/whl/cpu \
     --default-timeout=600 \
     --retries 5
 
-# Step 2: 预先安装 Python 3.12 关键依赖
+# 在同一次解析中应用 MinerU、Transformers 和 Web 服务的版本约束。
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "kiwisolver>=1.4.5" "Pillow>=11.0.0" \
-    "numpy>=1.26.0,<2.0.0" "setuptools>=75.0.0" "lxml>=5.3.0" \
-    -i ${PIP_MIRROR} \
-    --default-timeout=300 \
-    --retries 5
-
-# Step 2.5: 安装 transformers 核心依赖（regex、huggingface-hub 等）
-RUN --mount=type=cache,target=/root/.cache/pip \
-    echo "Installing transformers dependencies..." && \
-    pip install regex packaging filelock requests tqdm \
-    "huggingface-hub>=0.23.2,<1.0" \
-    -i ${PIP_MIRROR} \
-    --default-timeout=300 \
-    --retries 5
-
-# Step 3: 安装 MinerU 及其依赖（允许自动解析依赖）
-RUN --mount=type=cache,target=/root/.cache/pip \
-    echo "Installing MinerU with dependencies..." && \
-    pip install "mineru[pipeline,vlm,s3]==3.4.5" \
-    -i ${PIP_MIRROR} \
-    --default-timeout=600 \
-    --retries 5
-
-# Step 3.5: 安装其他核心包
-RUN --mount=type=cache,target=/root/.cache/pip \
-    echo "Installing other core packages..." && \
-    pip install transformers==4.57.6 \
-    fastapi uvicorn litserve aiohttp \
-    PyMuPDF Pillow img2pdf einops easydict addict loguru modelscope \
-    minio markitdown \
-    -i ${PIP_MIRROR} \
-    --default-timeout=300 \
-    --retries 5
-
-# Step 4: 确保 albumentations 版本兼容（MinerU 3.0+ 需要 >=1.4.11）
-RUN --mount=type=cache,target=/root/.cache/pip \
-    echo "Ensuring albumentations compatibility..." && \
-    pip install 'albumentations>=1.4.11' \
-    -i ${PIP_MIRROR} \
-    --default-timeout=300 \
-    --retries 5
-
-# Step 5: 解析剩余依赖（使用 legacy resolver，避免回溯超时）
-RUN --mount=type=cache,target=/root/.cache/pip \
-    echo "Resolving remaining dependencies with legacy resolver..." && \
-    pip install -r /tmp/requirements.txt \
-    -i ${PIP_MIRROR} \
-    --use-deprecated=legacy-resolver \
-    --default-timeout=600 \
-    --retries 5
+    pip install -r /tmp/requirements.txt "torch==2.7.1+cpu" "torchvision==0.22.1+cpu" "torchaudio==2.7.1+cpu" \
+    -i "${PIP_MIRROR}" \
+    --default-timeout=600 --retries 5 && pip check
 
 # 验证安装（CPU 模式）
 RUN python -c "import sys; print('Python:', sys.version)" && \
     python -c "import torch; print('✅ PyTorch:', torch.__version__, '| CPU-only:', not torch.cuda.is_available())" && \
     python -c "import transformers; print('✅ Transformers:', transformers.__version__)" && \
     python -c "import funasr; print('✅ FunASR:', funasr.__version__)" && \
-    python -c "from mineru.cli.common import do_parse; from mineru.utils.model_utils import get_vram, clean_memory; print(chr(9989) + ' MinerU 解析入口: do_parse / get_vram / clean_memory')" && \
+    python -c "from mineru.parser import parse; from mineru.render import render_content_list, render_content_list_v2; print(chr(9989) + ' MinerU 公开解析与渲染入口可用')" && \
     echo "✅ CPU 模式依赖安装完成"
 
 # ============================================================================
@@ -180,7 +133,7 @@ RUN groupadd -g 10001 tianshu && \
     useradd -u 10001 -g tianshu -m -s /bin/bash tianshu && \
     chown -R tianshu:tianshu /app /home/tianshu
 
-# USER 指令不会自动设置 HOME，显式指定以兼容 ~/.cache、~/mineru.json 等路径解析
+# USER 指令不会自动设置 HOME，显式指定以便运行时解析用户缓存路径
 ENV HOME=/home/tianshu
 
 # 设置工作目录为后端

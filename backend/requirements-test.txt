@@ -10,6 +10,7 @@ psutil>=5.9.0
 pydantic>=2.11.0
 pyjwt>=2.10.0
 python-multipart>=0.0.20
+PyYAML==6.0.2
 redis>=5.0.0
 uvicorn[standard]==0.34.0
 

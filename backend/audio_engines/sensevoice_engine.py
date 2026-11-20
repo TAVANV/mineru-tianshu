@@ -21,6 +21,7 @@ SenseVoice 语音识别引擎
 """
 
 import json
+import os
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from threading import Lock
@@ -88,8 +89,6 @@ class SenseVoiceEngine:
             # 默认缓存目录：项目根目录/models/sensevoice
             if cache_dir is None:
                 project_root = Path(__file__).parent.parent.parent
-                import os
-
                 self.cache_dir = os.getenv("MODELSCOPE_CACHE", str(project_root / "models" / "sensevoice"))
             else:
                 self.cache_dir = cache_dir
@@ -120,6 +119,22 @@ class SenseVoiceEngine:
                 f"   Speaker Diarization: {'✅ Enabled (FunASR Native)' if enable_speaker_diarization else '❌ Disabled'}"
             )
 
+    def _model_location(self, model_id: str, offline: bool) -> str:
+        if not offline or Path(model_id).is_dir():
+            return model_id
+
+        from download_models import RUNTIME_AUDIO_MODELS
+
+        name = RUNTIME_AUDIO_MODELS.get(model_id)
+        if name:
+            local = Path(os.getenv("MODEL_PATH", "/app/models")) / name
+            if (local / "configuration.json").is_file():
+                return str(local)
+
+        from modelscope import snapshot_download
+
+        return snapshot_download(model_id, cache_dir=self.cache_dir, local_files_only=True)
+
     def _load_model(self, enable_sd: bool = False):
         """
         延迟加载模型（根据需求加载 SenseVoice 或 Paraformer）
@@ -136,6 +151,12 @@ class SenseVoiceEngine:
             try:
                 from funasr import AutoModel
 
+                offline = os.getenv("MODELSCOPE_OFFLINE") == "1"
+                active_model = self._paraformer_model if enable_sd else self._sensevoice_model
+                vad_model = "fsmn-vad"
+                if offline and active_model is None:
+                    vad_model = self._model_location("iic/speech_fsmn_vad_zh-cn-16k-common-pytorch", offline)
+
                 # 如果需要说话人分离，加载 Paraformer 模型
                 if enable_sd:
                     if self._paraformer_model is None:
@@ -146,12 +167,19 @@ class SenseVoiceEngine:
                         # 使用 Paraformer 模型（支持时间戳和说话人分离）
                         # 参考：https://github.com/lukeewin/AudioSeparationGUI
                         self._paraformer_model = AutoModel(
-                            model="iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
-                            vad_model="fsmn-vad",
+                            model=self._model_location(
+                                "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch", offline
+                            ),
+                            vad_model=vad_model,
                             vad_kwargs={"max_single_segment_time": 30000},
-                            punc_model="ct-punc",  # 标点模型（说话人分离必需）
-                            spk_model="iic/speech_campplus_sv_zh-cn_16k-common",  # 说话人嵌入模型
+                            punc_model=self._model_location(
+                                "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch", True
+                            )
+                            if offline
+                            else "ct-punc",
+                            spk_model=self._model_location("iic/speech_campplus_sv_zh-cn_16k-common", offline),
                             device=self.device,
+                            disable_update=offline,
                         )
 
                         logger.info("=" * 60)
@@ -175,12 +203,13 @@ class SenseVoiceEngine:
                         logger.info(f"🤖 Loading model from: {self.model_dir}")
 
                         self._sensevoice_model = AutoModel(
-                            model=self.model_dir,
-                            trust_remote_code=True,
+                            model=self._model_location(self.model_dir, offline),
+                            trust_remote_code=not offline,
                             remote_code="./model.py",
-                            vad_model="fsmn-vad",
+                            vad_model=vad_model,
                             vad_kwargs={"max_single_segment_time": 30000},
                             device=self.device,
+                            disable_update=offline,
                         )
 
                         logger.info("=" * 60)

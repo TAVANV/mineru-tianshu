@@ -65,26 +65,16 @@ main() {
     mkdir -p /app/models/sensevoice
     mkdir -p /app/models/paraformer
 
-    # 复制 MinerU 配置文件（离线部署的关键文件）
-    if [ -f "/models-external/mineru.json" ]; then
-        log_info "Copying MinerU config (mineru.json)..."
-        cp /models-external/mineru.json /app/models/mineru.json 2>/dev/null || true
-        log_success "mineru.json copied"
+    # MinerU 4 直接按 config.yaml 的 model.base_dir 查找模型目录。
+    if [ -f "/models-external/config.yaml" ]; then
+        cp /models-external/config.yaml /app/models/config.yaml
     fi
-
-    # 复制 MinerU Pipeline 模型
-    if [ -d "/models-external/PDF-Extract-Kit-1.0" ]; then
-        log_info "Copying MinerU Pipeline model..."
-        cp -r /models-external/PDF-Extract-Kit-1.0 /app/models/ 2>/dev/null || true
-        log_success "MinerU Pipeline model copied"
-    fi
-
-    # 复制 MinerU VLM 模型
-    if [ -d "/models-external/MinerU2.5-Pro-2605-1.2B" ]; then
-        log_info "Copying MinerU VLM model..."
-        cp -r /models-external/MinerU2.5-Pro-2605-1.2B /app/models/ 2>/dev/null || true
-        log_success "MinerU VLM model copied"
-    fi
+    for model in MinerU-4_models_torch MinerU2.5-Pro-2605-1.2B; do
+        if [ -d "/models-external/$model" ]; then
+            log_info "复制 MinerU 模型 $model"
+            cp -r "/models-external/$model" /app/models/
+        fi
+    done
 
     # 复制 HuggingFace 模型（旧版布局兼容）
     if [ -d "/models-external/huggingface/hub" ]; then

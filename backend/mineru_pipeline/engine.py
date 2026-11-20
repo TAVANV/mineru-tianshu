@@ -1,165 +1,93 @@
-"""
-MinerU Pipeline Engine
-单例模式，每个进程只加载一次模型
-使用 MinerU 处理 PDF 和图片
+"""通过 MinerU SDK 解析 PDF、图片和 Office 文件。"""
 
-更新日志 (2026-02-15):
-- [新增] 智能显存休眠机制 (Auto-Sleep): 空闲 5 分钟自动释放显存
-- [新增] 自动唤醒机制 (Auto-Wakeup): 新任务自动重新加载模型
-- [优化] 移除每次任务后的强制显存清理，提升连续处理性能
-- [核心修复] 使用临时纯英文目录处理，规避中文路径问题
-"""
-
+import gc
 import json
 import tempfile
-import time
-import urllib.request
-import urllib.error
-import gc
 import threading
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Optional, Dict, Any
 from threading import Lock
+
 from loguru import logger
 
 from utils import copy_file
-import img2pdf
-
-# 尝试导入 torch 用于显存管理
-try:
-    import torch
-except ImportError:
-    torch = None
 
 
-# 配置了本地 vLLM 时，进程内引擎改走 HTTP 客户端：进程内引擎要求镜像里装 vllm 包，
-# 而本项目的 vLLM 跑在独立容器里（见 backend/requirements.txt 中 mineru[core] 的说明）。
-_LOCAL_VLLM_REWRITE = {
-    "vlm-auto-engine": "vlm-http-client",
-    "hybrid-auto-engine": "hybrid-http-client",
-}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".jp2"}
+VLM_MODEL_NAME = "MinerU-1.2B"
+
+
+def _tier_for_backend(backend: str) -> str:
+    if backend.startswith("vlm-"):
+        return "standard"
+    if backend.startswith("hybrid-"):
+        return "advanced"
+    return "basic"
+
+
+def _page_range(options: dict) -> str:
+    def page_number(key: str, default: int) -> int:
+        value = options.get(key)
+        if value is None:
+            value = options.get(f"{key}_id")
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    start = max(0, page_number("start_page", 0))
+    end = page_number("end_page", -1)
+    if end < 0:
+        return f"{start + 1}-r1" if start else ""
+    return f"{start + 1}-{end + 1}"
 
 
 class MinerUPipelineEngine:
-    """
-    MinerU Pipeline 引擎
-    集成自动显存管理功能
-    """
-
-    _instance: Optional["MinerUPipelineEngine"] = None
+    _instance = None
     _lock = Lock()
-    _pipeline = None  # 这里的 pipeline 实际上是 do_parse 函数
-    _initialized = False
 
     def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, device: str = "cpu", vlm_api_base: str = None):
-        if self._initialized:
-            return
-
+    def __init__(self, device: str = "cpu", vlm_api_base: str | None = None):
         with self._lock:
-            if self._initialized:
+            if vlm_api_base:
+                self.vlm_api_base = vlm_api_base
+            if hasattr(self, "_last_active"):
                 return
-
-            self.device = device
             self.vlm_api_base = vlm_api_base
-
-            if "cuda:" in device:
-                self.gpu_id = device.split(":")[-1]
-            else:
-                self.gpu_id = "0"
-
-            # =========================================================
-            # [新增] 智能显存管理状态变量
-            # =========================================================
-            self.last_active_time = time.time()  # 最后活动时间
-            self.is_processing = False  # 是否正在处理任务
-            self.is_offloaded = True  # 是否已卸载显存
-            self.idle_timeout = 300  # 空闲超时时间 (秒) - 5分钟
-
-            # 启动显存监控后台线程
-            self._monitor_thread = threading.Thread(target=self._auto_sleep_monitor, daemon=True)
-            self._monitor_thread.start()
-
-            self._initialized = True
-            logger.info(f"🔧 MinerU Pipeline Engine initialized on {device}")
-            logger.info(f"⏳ Auto-sleep monitor enabled (Timeout: {self.idle_timeout}s)")
-            if self.vlm_api_base:
-                logger.info(f"   VLLM API Base: {self.vlm_api_base}")
+            self._last_active = time.monotonic()
+            self._cache_trimmed = True
+            self._processing = 0
+            threading.Thread(target=self._auto_sleep_monitor, daemon=True).start()
+            logger.info(f"MinerU 解析引擎已初始化（设备 {device}）")
 
     def _auto_sleep_monitor(self):
-        """
-        [后台线程] 监控系统空闲状态，超时自动释放显存
-        """
         while True:
-            time.sleep(10)  # 每10秒检查一次
-            try:
-                # 如果 1. 正在处理任务 或 2. 已经卸载，则跳过
-                if self.is_processing or self.is_offloaded:
+            time.sleep(10)
+            with self._lock:
+                if self._processing or self._cache_trimmed or time.monotonic() - self._last_active < 300:
                     continue
+                self.cleanup()
+                self._cache_trimmed = True
 
-                idle_duration = time.time() - self.last_active_time
-                if idle_duration > self.idle_timeout:
-                    logger.info(f"💤 System idle for {idle_duration:.0f}s. Unloading models to save VRAM...")
-                    self.cleanup()  # 执行清理
-                    self.is_offloaded = True  # 标记为已卸载
-            except Exception as e:
-                logger.error(f"Error in auto-sleep monitor: {e}")
-
-    def _load_pipeline(self):
-        """延迟加载 MinerU 管道 (do_parse)"""
-        if self._pipeline is not None:
-            return self._pipeline
-
-        with self._lock:
-            if self._pipeline is not None:
-                return self._pipeline
-
-            logger.info("=" * 60)
-            logger.info("📥 Loading MinerU Pipeline (do_parse)...")
-            logger.info("=" * 60)
-
-            try:
-                from mineru.cli.common import do_parse
-
-                self._pipeline = do_parse
-                logger.info("✅ MinerU Pipeline loaded successfully!")
-                return self._pipeline
-            except Exception as e:
-                logger.error(f"❌ Error loading MinerU pipeline: {e}")
-                raise
-
-    def _wait_for_server(self, server_url: str, timeout: int = 60) -> bool:
-        """等待 VLLM 服务就绪"""
-        base_url = server_url.rstrip("/")
-        if base_url.endswith("/v1"):
-            base_url = base_url[:-3]
-
-        health_url = f"{base_url}/v1/models"
-
-        logger.info(f"⏳ Waiting for VLLM server at {base_url} (Timeout: {timeout}s)...")
-        start_time = time.time()
-
-        while time.time() - start_time < timeout:
+    def _wait_for_server(self, server_url: str, timeout: int = 60) -> None:
+        health_url = f"{server_url.rstrip('/')}/v1/models"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             try:
                 with urllib.request.urlopen(health_url, timeout=2) as response:
                     if response.status == 200:
-                        logger.info(f"✅ VLLM server is ready: {base_url}")
-                        return True
-            except (urllib.error.URLError, ConnectionRefusedError):
+                        return
+            except urllib.error.URLError:
                 pass
-            except Exception as e:
-                logger.debug(f"Health check warning: {e}")
-
             time.sleep(1)
-
-        logger.warning(f"⚠️  VLLM server wait timed out after {timeout}s. Process may fail.")
-        return False
+        logger.warning(f"等待 VLM 服务就绪超时（{timeout} 秒），将交由 MinerU 处理连接")
 
     @staticmethod
     def _flatten_content_blocks(json_content):
@@ -168,8 +96,6 @@ class MinerUPipelineEngine:
         - v1 (*_content_list.json)    : 扁平数组 [block, block, ...]
         - v2 (*_content_list_v2.json) : 按页分组的嵌套数组 [[block, ...], [block, ...], ...]
 
-        前端 TaskDetail.vue 早已按 v2 处理，这里与之保持一致。历史上这里只按 v1
-        处理，遇到 v2 会抛 AttributeError: 'list' object has no attribute 'get'。
         """
         if not isinstance(json_content, list):
             return []
@@ -222,280 +148,143 @@ class MinerUPipelineEngine:
                 return "".join(parts)
         return ""
 
-    def cleanup(self):
-        """
-        [增强版] 清理显存与模型
-        用于 Auto-Sleep 或程序退出时
-        """
-        with self._lock:
-            logger.info("🧹 Starting memory cleanup...")
-            try:
-                from mineru.utils.model_utils import clean_memory
-
-                clean_memory()
-            except Exception:
-                pass
-
-            # 强制 GC 与 CUDA/MPS 缓存清理
-            try:
-                self._pipeline = None  # 释放函数引用，促使下次重新加载
-                gc.collect()
-                if torch and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
-                if torch and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
-                logger.info("✅ GPU Memory released completely.")
-            except Exception as e:
-                logger.warning(f"Hard cleanup warning: {e}")
-
-    def parse(self, file_path: str, output_path: str, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        处理文件 (增强版：自动唤醒 + 临时目录)
-        """
-        # =========================================================
-        # 1. 状态更新与自动唤醒 (Auto-Wakeup)
-        # =========================================================
-        self.is_processing = True
-        self.last_active_time = time.time()
-
-        if self.is_offloaded:
-            logger.info("🚀 New task received. Waking up models (Auto-Wakeup)...")
-            self.is_offloaded = False
-            # 注意：下方的 _load_pipeline() 会自动处理重新加载逻辑
-
+    @staticmethod
+    def cleanup():
+        gc.collect()
         try:
-            options = options or {}
+            import torch
 
-            final_output_dir = Path(output_path)
-            final_output_dir.mkdir(parents=True, exist_ok=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except ImportError:
+            pass
+        except Exception as error:
+            logger.warning(f"清理 GPU 缓存失败：{error}")
 
-            file_path_obj = Path(file_path)
-            file_ext = file_path_obj.suffix.lower()
+    def parse(self, file_path: str, output_path: str, options: dict | None = None) -> dict:
+        with self._lock:
+            self._processing += 1
+            self._cache_trimmed = False
+        try:
+            return self._parse(Path(file_path), Path(output_path), options or {})
+        finally:
+            with self._lock:
+                self._processing -= 1
+                self._last_active = time.monotonic()
 
-            # 1. 确定 Backend
-            user_backend = options.get("parse_mode", "pipeline")
-            if user_backend == "auto":
-                user_backend = "pipeline"
+    def _parse(self, source: Path, output_dir: Path, options: dict) -> dict:
+        from docvortex.export import materialize_middle, validate_materialized_assets
+        from mineru.config import VlmConfig, get_config
+        from mineru.parser import parse
+        from mineru.render import render_content_list, render_content_list_v2, render_markdown
 
-            backend = user_backend
-            server_url = options.get("server_url")
+        backend = options.get("parse_mode") or "pipeline"
+        tier = _tier_for_backend(backend)
+        ocr_mode = "ocr" if options.get("force_ocr") else (options.get("method") or "auto")
+        is_image = source.suffix.lower() in IMAGE_SUFFIXES
+        is_pdf = source.suffix.lower() == ".pdf" or is_image
+        page_range = _page_range(options) if is_pdf else ""
 
-            # 调用方未指定 server_url 时一律走本地 vLLM：*-auto-engine 先改写成
-            # *-http-client，*-http-client 则直接补上地址。
-            if not server_url and self.vlm_api_base:
-                backend = _LOCAL_VLLM_REWRITE.get(user_backend, user_backend)
-                if "http-client" in backend:
-                    server_url = self.vlm_api_base.replace("/v1", "")
-                    if backend != user_backend:
-                        logger.info(f"🔄 [Accelerate] Switching to {backend} using local vLLM")
+        if is_pdf and tier != "basic":
+            server_url = options.get("server_url") or self.vlm_api_base
+            vlm_config = (
+                VlmConfig(server_url=server_url, model=VLM_MODEL_NAME) if server_url else get_config().model.vlm
+            )
+            if vlm_config.server_url:
+                self._wait_for_server(vlm_config.server_url)
+            elif backend.endswith("-http-client"):
+                raise ValueError("MinerU HTTP 后端需要 server_url 或已配置的 VLM 服务地址")
+        else:
+            vlm_config = None
 
-            # 服务健康检查
-            if "http-client" in backend and server_url:
-                self._wait_for_server(server_url)
+        unsupported = options.keys() & {
+            "lang",
+            "formula_enable",
+            "table_enable",
+            "draw_layout_bbox",
+            "draw_span_bbox",
+            "draw_layout",
+            "draw_span",
+            "dump_model_output",
+        }
+        if unsupported:
+            logger.debug(f"MinerU 4.2.3 SDK 忽略无对应参数的选项：{', '.join(sorted(unsupported))}")
 
-            # 2. 准备参数
-            parse_method = options.get("method", "auto")
-            if options.get("force_ocr"):
-                parse_method = "ocr"
+        with tempfile.TemporaryDirectory(prefix="mineru_") as temp_dir:
+            # 图片转成 PDF 后，共用 OCR 页范围及源 PDF 预览。
+            if is_image:
+                import img2pdf
 
-            formula_enable = options.get("formula_enable", True)
-            table_enable = options.get("table_enable", True)
-
-            f_draw_layout_bbox = options.get("draw_layout_bbox", True)
-            f_draw_span_bbox = options.get("draw_span_bbox", True)
-            f_dump_md = options.get("dump_markdown", True)
-            f_dump_middle_json = options.get("dump_middle_json", True)
-            f_dump_model_output = options.get("dump_model_output", True)
-            f_dump_content_list = options.get("dump_content_list", True)
-            f_dump_orig_pdf = options.get("dump_orig_pdf", True)
-
-            start_page_id = options.get("start_page_id", 0)
-            end_page_id = options.get("end_page_id", None)
-
-            try:
-                start_page_id = int(start_page_id)
-            except Exception:
-                start_page_id = 0
-
-            try:
-                if end_page_id is not None and str(end_page_id).strip() != "":
-                    end_page_id = int(end_page_id)
-                    if end_page_id == -1:
-                        end_page_id = None
-                else:
-                    end_page_id = None
-            except Exception:
-                end_page_id = None
-
-            do_parse_func = self._load_pipeline()
-
-            with open(file_path, "rb") as f:
-                file_bytes = f.read()
-
-            if file_ext in [".png", ".jpg", ".jpeg"]:
-                logger.info("🖼️  Converting image to PDF...")
-                try:
-                    # ifvalid：EXIF 方向值非法（如 0）时告警并忽略，而不是直接抛错
-                    pdf_bytes = img2pdf.convert(file_bytes, rotation=img2pdf.Rotation.ifvalid)
-                except Exception as e:
-                    raise ValueError(f"Image conversion failed: {e}")
-                safe_file_name = "result.pdf"
-            elif file_ext in [".docx", ".xlsx", ".pptx"]:
-                # MinerU 3.0+ 原生 DOCX、3.1+ 原生 PPTX/XLSX 解析：直接传字节，保留原后缀
-                # do_parse 内部通过文件名后缀识别类型
-                logger.info(f"📄 {file_ext.upper()} detected, passing to MinerU native parser...")
-                pdf_bytes = file_bytes
-                safe_file_name = f"result{file_ext}"
+                sdk_source = Path(temp_dir) / "source.pdf"
+                sdk_source.write_bytes(img2pdf.convert(source.read_bytes(), rotation=img2pdf.Rotation.ifvalid))
             else:
-                pdf_bytes = file_bytes
-                safe_file_name = "result.pdf"
+                sdk_source = Path(temp_dir) / f"source{source.suffix.lower()}"
+                copy_file(source, sdk_source)
 
-            lang = options.get("lang", "auto")
-            if lang == "auto":
-                lang = "ch"
+            result = parse(sdk_source, tier=tier, ocr_mode=ocr_mode, page_range=page_range, vlm_config=vlm_config)
+            middle, assets = materialize_middle(result.middle_json)
+            validate_materialized_assets(middle, assets)
+            markdown = render_markdown(middle)
+            content_v1 = render_content_list(middle) if options.get("dump_content_list", True) else None
+            content_v2 = None
+            if content_v1 is not None:
+                content_v2 = []
+                # V2 的外层数组下标须与用于预览的源 PDF 页号一致。
+                for page, blocks in zip(middle.pages, render_content_list_v2(middle), strict=True):
+                    content_v2.extend([] for _ in range(page.page_idx - len(content_v2)))
+                    content_v2.append(blocks)
 
-            # 使用临时纯英文目录处理
-            with tempfile.TemporaryDirectory(prefix="mineru_proc_") as temp_dir:
-                temp_work_dir = Path(temp_dir)
-                logger.info(f"🛠️  Working in temp directory: {temp_work_dir}")
+            if not markdown.strip():
+                blocks = self._flatten_content_blocks(content_v2)
+                markdown = "\n\n".join(text for block in blocks if (text := self._extract_block_text(block)))
+                if not markdown.strip():
+                    markdown = "\n\n".join(block["text"] for block in content_v1 or [] if block.get("text"))
+                if not markdown.strip():
+                    if not is_pdf:
+                        raise ValueError("MinerU 未生成可用的解析内容")
+                    markdown = "> 未提取到文本，请查看源文件预览。"
 
-                do_parse_func(
-                    output_dir=str(temp_work_dir),
-                    pdf_file_names=[safe_file_name],
-                    pdf_bytes_list=[pdf_bytes],
-                    p_lang_list=[lang],
-                    backend=backend,
-                    parse_method=parse_method,
-                    server_url=server_url,
-                    start_page_id=start_page_id,
-                    end_page_id=end_page_id,
-                    formula_enable=formula_enable,
-                    table_enable=table_enable,
-                    f_draw_layout_bbox=f_draw_layout_bbox,
-                    f_draw_span_bbox=f_draw_span_bbox,
-                    f_dump_md=f_dump_md,
-                    f_dump_middle_json=f_dump_middle_json,
-                    f_dump_model_output=f_dump_model_output,
-                    f_dump_orig_pdf=f_dump_orig_pdf,
-                    f_dump_content_list=f_dump_content_list,
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "images").mkdir(exist_ok=True)
+            for path, payload in assets.items():
+                (output_dir / path).write_bytes(payload)
+
+            markdown_file = None
+            if options.get("dump_markdown", True):
+                markdown_file = output_dir / "result.md"
+                markdown_file.write_text(markdown, encoding="utf-8")
+
+            artifacts = output_dir / "mineru"
+            json_file = None
+            if content_v2 is not None:
+                artifacts.mkdir(exist_ok=True)
+                v1_json = json.dumps(content_v1, ensure_ascii=False, indent=2)
+                # 根目录的 V1 供图片描述、RustFS 和分片合并按 img_path、page_idx 处理。
+                (output_dir / "result.json").write_text(v1_json, encoding="utf-8")
+                (artifacts / "result_content_list.json").write_text(v1_json, encoding="utf-8")
+                json_file = artifacts / "result_content_list_v2.json"
+                json_file.write_text(json.dumps(content_v2, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            if options.get("dump_middle_json", True):
+                artifacts.mkdir(exist_ok=True)
+                (artifacts / "result_middle.json").write_text(
+                    json.dumps(middle.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
                 )
 
-                # 结果提取与搬运
-                generated_result_dir = temp_work_dir / "result"
+            if options.get("dump_orig_pdf", True) or (is_image and options.get("draw_layout_bbox", True)):
+                copy_file(sdk_source, output_dir / f"result_origin{sdk_source.suffix}")
 
-                if not generated_result_dir.exists():
-                    temp_md_files = list(temp_work_dir.rglob("*.md"))
-                    if temp_md_files:
-                        generated_result_dir = temp_md_files[0].parent.parent
-                    else:
-                        temp_json_files = list(temp_work_dir.rglob("*_content_list.json"))
-                        if temp_json_files:
-                            generated_result_dir = temp_json_files[0].parent.parent
-                        else:
-                            raise FileNotFoundError("Processing failed internally - No output generated")
-
-                # 1. 读取内容（保持 MinerU 原样输出，不做文本改写）
-                content = ""
-                json_content = None
-
-                temp_md_files = list(generated_result_dir.rglob("*.md"))
-                if temp_md_files:
-                    content = temp_md_files[0].read_text(encoding="utf-8")
-                    logger.info(f"✅ Read MD content: {len(content)} chars")
-
-                # MinerU 3.0 新增 content_list_v2.json（推荐格式），优先使用；兼容 v1
-                temp_json_files = list(generated_result_dir.rglob("*_content_list_v2.json"))
-                if not temp_json_files:
-                    temp_json_files = list(generated_result_dir.rglob("*_content_list.json"))
-                if temp_json_files:
-                    try:
-                        with open(temp_json_files[0], "r", encoding="utf-8") as f:
-                            json_content = json.load(f)
-                    except Exception:
-                        pass
-
-                # 2. 如果 MD 为空，尝试从 JSON 恢复
-                if not content.strip() and json_content:
-                    logger.warning("⚠️  Markdown file is empty, attempting to recover text from JSON...")
-                    recovered_text = []
-                    for block in self._flatten_content_blocks(json_content):
-                        text = self._extract_block_text(block)
-                        if text:
-                            recovered_text.append(text)
-                    content = "\n\n".join(recovered_text)
-
-                    if temp_md_files:
-                        temp_md_files[0].write_text(content, encoding="utf-8")
-
-                    logger.info(f"ℹ️  Recovered {len(content)} chars from JSON")
-
-                # 3. 搬运文件
-                logger.info(f"📦 Moving results from {generated_result_dir} to {final_output_dir}")
-                if generated_result_dir.exists():
-                    for src_path in generated_result_dir.rglob("*"):
-                        if src_path.is_file():
-                            rel_path = src_path.relative_to(generated_result_dir)
-                            dest_path = final_output_dir / rel_path
-                            dest_path.parent.mkdir(parents=True, exist_ok=True)
-                            copy_file(src_path, dest_path)
-
-                # 4. 返回路径
-                final_md_path = None
-                final_json_path = None
-
-                final_mds = list(final_output_dir.rglob("*.md"))
-                if final_mds:
-                    final_md_path = str(final_mds[0])
-                    # 覆盖写入
-                    Path(final_md_path).write_text(content, encoding="utf-8")
-
-                # MinerU 3.0 新增 content_list_v2.json，优先使用；兼容 v1
-                final_jsons = list(final_output_dir.rglob("*_content_list_v2.json"))
-                if not final_jsons:
-                    final_jsons = list(final_output_dir.rglob("*_content_list.json"))
-                if final_jsons:
-                    final_json_path = str(final_jsons[0])
-
-                if not content.strip():
-                    layout_pdfs = list(final_output_dir.rglob("*_layout.pdf"))
-                    if layout_pdfs:
-                        content = "> ⚠️ Text extraction returned empty content. Please check layout PDF."
-                    else:
-                        raise FileNotFoundError("No valid content generated.")
-
-                return {
-                    "markdown": content,
-                    "result_path": str(final_output_dir),
-                    "markdown_file": final_md_path,
-                    "json_path": final_json_path,
-                    "json_content": json_content,
-                }
-
-        except Exception as e:
-            logger.error(f"❌ Pipeline processing failed: {e}")
-            import traceback
-
-            logger.debug(traceback.format_exc())
-            raise
-
-        finally:
-            # =========================================================
-            # [关键修改]
-            # 移除之前的强制 self.cleanup()
-            # 改为更新活跃时间戳，让后台线程处理释放
-            # =========================================================
-            self.is_processing = False
-            self.last_active_time = time.time()
-            logger.info("🏁 Task finished. Model remains loaded for fast reuse (Auto-sleep in 5min).")
+        return {
+            "markdown": markdown,
+            "result_path": str(output_dir),
+            "markdown_file": str(markdown_file) if markdown_file else None,
+            "json_path": str(json_file) if json_file else None,
+            "json_content": content_v2,
+        }
 
 
-# 全局单例
-_engine = None
-
-
-def get_engine(vlm_api_base: str = None) -> MinerUPipelineEngine:
-    global _engine
-    if _engine is None:
-        _engine = MinerUPipelineEngine(vlm_api_base=vlm_api_base)
-    return _engine
+def get_engine(vlm_api_base: str | None = None) -> MinerUPipelineEngine:
+    return MinerUPipelineEngine(vlm_api_base=vlm_api_base)

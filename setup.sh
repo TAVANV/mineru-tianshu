@@ -14,6 +14,7 @@
 # 非交互参数:
 #   --gpus N          GPU 数量（默认 nvidia-smi -L 自动检测）
 #   --concurrency N   每个 GPU 的 Worker 并发数 MAX_CONCURRENT_TASKS（默认 1）
+#   --reuse-from DIR  offline-build 复用旧模型目录，可重复指定
 #   --network cn|global  网络环境（cn=国内镜像加速 / global=海外官方源直连，默认交互询问，非交互默认 cn）
 #   --yes             跳过全部交互提问，未指定的配置保持 .env 默认值
 #   --dry-run         只生成配置文件并打印将执行的操作，不构建、不启动
@@ -61,6 +62,7 @@ usage() {
 MODE=""
 OPT_GPUS=""
 OPT_CONCURRENCY=""
+OPT_REUSE_FROM=()
 OPT_NETWORK=""
 ASSUME_YES=0
 DRY_RUN=0
@@ -84,6 +86,14 @@ while [ $# -gt 0 ]; do
             ;;
         --concurrency | -c)
             OPT_CONCURRENCY="${2:-}"
+            shift 2
+            ;;
+        --reuse-from)
+            if [ -z "${2:-}" ]; then
+                log_error "--reuse-from 需要旧模型目录"
+                exit 1
+            fi
+            OPT_REUSE_FROM+=("$2")
             shift 2
             ;;
         --yes | -y)
@@ -744,13 +754,16 @@ interactive_configure() {
 
 # 自动调谐：并发/显存/内存按 GPU 资源自动计算
 tune_env() {
+    local preserve_storage_config="${1:-0}"
     local detected_gpus
     local min_vram
     detected_gpus=$(detect_gpu_count)
     min_vram=$(detect_min_vram_gb)
 
-    ensure_jwt_secret
-    ensure_rustfs_keys
+    if [ "$preserve_storage_config" -eq 0 ]; then
+        ensure_jwt_secret
+        ensure_rustfs_keys
+    fi
     ensure_redis_password
     ensure_admin_password
 
@@ -805,44 +818,46 @@ tune_env() {
         log_warning "显存超配（${vram} x ${concurrency} > ${min_vram} GB），如遇 CUDA OOM 请降低并发"
     fi
 
-    # --- RustFS 公网地址 -----------------------------------------------------
-    # 解析结果中的图片会改写为该地址，必须浏览器可达；
-    # RustFS 端口仅绑定回环，默认经前端 nginx /s3/ 路径反代
-    # 对象存储是必需依赖：Worker 侧对含图片的任务已是 fail-closed，
-    # 这里把开关强制打开，并保证公网地址一定有值，否则拒绝部署
-    if [ "$(get_env_key RUSTFS_ENABLED)" != "true" ]; then
-        set_env_key RUSTFS_ENABLED true
-        log_info "RUSTFS_ENABLED = true（对象存储为必需依赖，已强制启用）"
-    fi
+    if [ "$preserve_storage_config" -eq 0 ]; then
+        # --- RustFS 公网地址 -----------------------------------------------------
+        # 解析结果中的图片会改写为该地址，必须浏览器可达；
+        # RustFS 端口仅绑定回环，默认经前端 nginx /s3/ 路径反代
+        # 对象存储是必需依赖：Worker 侧对含图片的任务已是 fail-closed，
+        # 这里把开关强制打开，并保证公网地址一定有值，否则拒绝部署
+        if [ "$(get_env_key RUSTFS_ENABLED)" != "true" ]; then
+            set_env_key RUSTFS_ENABLED true
+            log_info "RUSTFS_ENABLED = true（对象存储为必需依赖，已强制启用）"
+        fi
 
-    local rustfs_url
-    local front_port
-    local server_ip
-    rustfs_url=$(get_env_key RUSTFS_PUBLIC_URL)
-    front_port=$(get_env_key FRONTEND_PORT)
-    front_port="${front_port:-80}"
-    server_ip=$(detect_server_ip)
-    case "$rustfs_url" in
-        "" | *192.168.1.100* | http://localhost/s3 | http://127.0.0.1/s3)
-            if [ -n "$server_ip" ]; then
-                local derived_url
-                derived_url=$(build_rustfs_public_url "$server_ip" "$front_port")
-                set_env_key RUSTFS_PUBLIC_URL "$derived_url"
-                log_success "RUSTFS_PUBLIC_URL = ${derived_url}（经前端 nginx 反代）"
-            elif [ "$DRY_RUN" -eq 1 ]; then
-                log_warning "未能探测服务器 IP（dry-run 继续；正式部署时会直接报错退出）"
-                log_warning "正式部署前请手动设置 RUSTFS_PUBLIC_URL=$(build_rustfs_public_url "<服务器IP>" "$front_port")"
-            else
-                log_error "未能探测服务器 IP，无法确定 RUSTFS_PUBLIC_URL"
-                log_error "请手动在 $ENV_FILE 中设置，例如 RUSTFS_PUBLIC_URL=$(build_rustfs_public_url "<服务器IP>" "$front_port")"
-                log_error "该地址必须是浏览器可达的；留空会让所有含图片的解析任务失败"
-                exit 1
-            fi
-            ;;
-        *)
-            log_info "RUSTFS_PUBLIC_URL 已配置（${rustfs_url}），保持不变"
-            ;;
-    esac
+        local rustfs_url
+        local front_port
+        local server_ip
+        rustfs_url=$(get_env_key RUSTFS_PUBLIC_URL)
+        front_port=$(get_env_key FRONTEND_PORT)
+        front_port="${front_port:-80}"
+        server_ip=$(detect_server_ip)
+        case "$rustfs_url" in
+            "" | *192.168.1.100* | http://localhost/s3 | http://127.0.0.1/s3)
+                if [ -n "$server_ip" ]; then
+                    local derived_url
+                    derived_url=$(build_rustfs_public_url "$server_ip" "$front_port")
+                    set_env_key RUSTFS_PUBLIC_URL "$derived_url"
+                    log_success "RUSTFS_PUBLIC_URL = ${derived_url}（经前端 nginx 反代）"
+                elif [ "$DRY_RUN" -eq 1 ]; then
+                    log_warning "未能探测服务器 IP（dry-run 继续；正式部署时会直接报错退出）"
+                    log_warning "正式部署前请手动设置 RUSTFS_PUBLIC_URL=$(build_rustfs_public_url "<服务器IP>" "$front_port")"
+                else
+                    log_error "未能探测服务器 IP，无法确定 RUSTFS_PUBLIC_URL"
+                    log_error "请手动在 $ENV_FILE 中设置，例如 RUSTFS_PUBLIC_URL=$(build_rustfs_public_url "<服务器IP>" "$front_port")"
+                    log_error "该地址必须是浏览器可达的；留空会让所有含图片的解析任务失败"
+                    exit 1
+                fi
+                ;;
+            *)
+                log_info "RUSTFS_PUBLIC_URL 已配置（${rustfs_url}），保持不变"
+                ;;
+        esac
+    fi
 
     # --- Worker 内存上限 -----------------------------------------------------
     # cgroup 硬上限而非预留：随 worker 进程数放大，防止失控进程拖垮宿主机
@@ -1277,6 +1292,9 @@ deploy_gpu_mode() {
 
     create_directories
     build_images
+    if [ "$MODE" = "gpu" ]; then
+        "${DC[@]}" --profile manual create vllm-mineru
+    fi
     start_services
     if ! verify_deployment; then
         log_warning "部署完成但存在告警，请查看上方信息"
@@ -1337,11 +1355,11 @@ deploy_cpu() {
     set_env_key ACCELERATOR cpu
     set_env_key CUDA_VISIBLE_DEVICES ""
     set_env_key MODEL_DOWNLOAD_SOURCE local
-    set_env_key HF_OFFLINE 1
+    set_env_key HF_HUB_OFFLINE 1
     ensure_jwt_secret
     ensure_rustfs_keys
     ensure_admin_password
-    log_success ".env.cpu 已配置（ACCELERATOR=cpu / CUDA_VISIBLE_DEVICES=空 / MODEL_DOWNLOAD_SOURCE=local / HF_OFFLINE=1）"
+    log_success ".env.cpu 已配置（ACCELERATOR=cpu / CUDA_VISIBLE_DEVICES=空 / MODEL_DOWNLOAD_SOURCE=local / HF_HUB_OFFLINE=1）"
 
     if [ "$DRY_RUN" -eq 1 ]; then
         dry_run_summary
@@ -1442,247 +1460,188 @@ deploy_cpu() {
 # ----------------------------------------------------------------------------
 # 模式：offline-build（联网机构建离线包）
 # ----------------------------------------------------------------------------
+offline_sha256() {
+    if command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$@"
+    else
+        shasum -a 256 "$@"
+    fi
+}
+
 build_offline() {
     MODE="offline-build"
     local platform="${PLATFORM:-amd64}"
     local output_dir="./docker-images"
     local models_dir="./models-offline"
-    # 须与 docker-compose.offline.yml 中 RUSTFS_VERSION 的默认值一致
-    local RUSTFS_IMAGE="rustfs/rustfs:${RUSTFS_VERSION:-1.0.1}"
+    # 镜像名与离线 Compose 一致。
+    local images=(
+        tianshu-backend:latest tianshu-frontend:latest
+        "rustfs/rustfs:${RUSTFS_VERSION:-1.0.1}" vllm/vllm-openai:v0.31.0-cu129 redis:7-alpine
+    )
+    local archives=(
+        "tianshu-backend-${platform}.tar.gz" "tianshu-frontend-${platform}.tar.gz"
+        "rustfs-${platform}.tar.gz" "vllm-mineru-${platform}.tar.gz" "redis-${platform}.tar.gz"
+    )
 
-    log_info "离线镜像包构建（平台: linux/${platform}，输出: ${output_dir}）"
-
+    log_info "离线镜像包构建（linux/${platform}，输出 ${output_dir}）"
     if [ "$DRY_RUN" -eq 1 ]; then
-        log_info "将执行的操作:"
-        echo "    1. 检查 Docker / NVIDIA 环境"
-        echo "    2. 检查 ${models_dir}，缺失则运行 python3 backend/download_models.py --output ${models_dir}"
-        echo "    3. buildx 构建 tianshu-backend:latest（backend/Dockerfile.offline，linux/${platform}）"
-        echo "    4. buildx 构建 tianshu-frontend:latest（frontend/Dockerfile，linux/${platform}）"
-        echo "    5. 拉取 ${RUSTFS_IMAGE}（linux/${platform}）"
-        echo "    6. docker save | gzip 导出三个镜像到 ${output_dir}/*-${platform}.tar.gz"
-        echo "    7. 打包模型: tar czf ${output_dir}/models-offline.tar.gz ${models_dir}/"
-        echo "    8. 复制 docker-compose.offline.yml / .env.example / mcp_config.example.json / setup.sh 到 ${output_dir}"
-        log_warning "dry-run 模式：未执行任何构建"
+        log_info "将准备 ${models_dir} 中的 MinerU 4.2.3 模型与离线缓存，可用 --reuse-from 复用旧模型"
+        log_info "将通过 backend/Dockerfile.offline 和 frontend/Dockerfile 构建后端和前端"
+        log_info "将打包镜像 ${images[*]}、模型、配置文件并生成 SHA256SUMS"
         return 0
     fi
 
-    if ! command -v docker > /dev/null 2>&1; then
-        log_error "未安装 Docker"
+    if ! command -v docker > /dev/null 2>&1 || ! command -v python3 > /dev/null 2>&1; then
+        log_error "离线打包需要 Docker、Python 3 和 Python venv"
         exit 1
     fi
-    detect_compose
-    log_success "Docker: $(docker --version)"
-
-    if command -v nvidia-smi > /dev/null 2>&1 && nvidia-smi > /dev/null 2>&1; then
-        log_success "NVIDIA 驱动: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2> /dev/null | head -1)"
-    else
-        log_warning "本机未检测到 NVIDIA GPU（仅构建镜像，不影响在 GPU 服务器上部署）"
-    fi
-
-    # 模型检查 / 下载
-    if [ ! -d "$models_dir" ] || [ -z "$(ls -A "$models_dir" 2> /dev/null)" ]; then
-        log_warning "模型目录缺失或为空，开始下载..."
-        if ! command -v python3 > /dev/null 2>&1; then
-            log_error "未安装 Python 3，无法下载模型"
-            exit 1
+    log_info "准备离线模型..."
+    (
+        download_venv=$(mktemp -d "${TMPDIR:-/tmp}/tianshu-models.XXXXXX")
+        trap 'rm -rf "$download_venv"' EXIT
+        python3 -m venv "$download_venv"
+        "$download_venv/bin/python" -m pip install -i "$PIP_MIRROR" \
+            'huggingface-hub[hf-xet]>=1.16' 'modelscope>=1.39.1' PyYAML loguru socksio
+        local model_endpoint="${HF_ENDPOINT:-https://huggingface.co}"
+        if [ "$NETWORK_ENV" = "cn" ]; then
+            model_endpoint="${HF_ENDPOINT:-https://hf-mirror.com}"
         fi
-        python3 -m pip install --quiet huggingface-hub modelscope loguru 2> /dev/null || true
-        if python3 backend/download_models.py --output "$models_dir"; then
-            log_success "模型下载完成"
-        else
-            log_error "模型下载失败，请手动执行: python3 backend/download_models.py --output $models_dir"
-            exit 1
-        fi
-    else
-        log_success "模型目录已存在: $models_dir（重新下载请加 --force 手动执行 download_models.py）"
-    fi
+        local model_args=(--output "$models_dir" --offline)
+        local source
+        for source in "${OPT_REUSE_FROM[@]}"; do
+            model_args+=(--reuse-from "$source")
+        done
+        HF_ENDPOINT="$model_endpoint" "$download_venv/bin/python" backend/download_models.py "${model_args[@]}"
+    )
 
-    # 构建镜像
-    log_info "构建后端镜像（backend/Dockerfile.offline，约 60-90 分钟）..."
-    DOCKER_BUILDKIT=1 docker buildx build \
-        --platform "linux/${platform}" \
-        --file backend/Dockerfile.offline \
-        --build-arg APT_MIRROR="$APT_MIRROR" \
-        --build-arg PIP_MIRROR="$PIP_MIRROR" \
-        --tag tianshu-backend:latest \
-        --load \
-        .
-    log_success "后端镜像构建完成"
+    log_info "构建离线后端镜像..."
+    docker buildx build --platform "linux/${platform}" --file backend/Dockerfile.offline \
+        --build-arg APT_MIRROR="$APT_MIRROR" --build-arg PIP_MIRROR="$PIP_MIRROR" --tag "${images[0]}" --load .
+    log_info "构建离线前端镜像..."
+    docker buildx build --platform "linux/${platform}" --file frontend/Dockerfile \
+        --build-arg NPM_REGISTRY="$NPM_REGISTRY" --tag "${images[1]}" --load .
 
-    log_info "构建前端镜像..."
-    DOCKER_BUILDKIT=1 docker buildx build \
-        --platform "linux/${platform}" \
-        --file frontend/Dockerfile \
-        --build-arg NPM_REGISTRY="$NPM_REGISTRY" \
-        --tag tianshu-frontend:latest \
-        --load \
-        .
-    log_success "前端镜像构建完成"
+    local i
+    for i in 2 3 4; do
+        docker pull --platform "linux/${platform}" "${images[$i]}"
+    done
 
-    log_info "拉取 RustFS 镜像（linux/${platform}）..."
-    docker pull --platform "linux/${platform}" "$RUSTFS_IMAGE"
-    log_success "RustFS 镜像就绪"
+    log_info "导出离线镜像及模型..."
+    mkdir -p "$output_dir/scripts"
+    rm -f "$output_dir/SHA256SUMS"
+    for i in "${!images[@]}"; do
+        docker save "${images[$i]}" | gzip > "$output_dir/${archives[$i]}"
+    done
+    tar czf "$output_dir/models-offline.tar.gz" "${models_dir#./}"
 
-    # 导出镜像
-    log_info "导出镜像（约 10-20 分钟）..."
-    mkdir -p "$output_dir"
-
-    docker save tianshu-backend:latest | gzip > "${output_dir}/tianshu-backend-${platform}.tar.gz" &
-    local pid_backend=$!
-    docker save tianshu-frontend:latest | gzip > "${output_dir}/tianshu-frontend-${platform}.tar.gz" &
-    local pid_frontend=$!
-    docker save "$RUSTFS_IMAGE" | gzip > "${output_dir}/rustfs-${platform}.tar.gz" &
-    local pid_rustfs=$!
-    wait "$pid_backend"
-    wait "$pid_frontend"
-    wait "$pid_rustfs"
-    log_success "镜像导出完成"
-
-    # 打包模型
-    if [ -d "$models_dir" ] && [ ! -f "${output_dir}/models-offline.tar.gz" ]; then
-        log_info "打包模型..."
-        tar czf "${output_dir}/models-offline.tar.gz" "${models_dir}/"
-        log_success "模型打包完成"
-    else
-        log_warning "模型目录不存在或已打包，跳过"
-    fi
-
-    # 复制配置文件
-    log_info "复制配置文件..."
-    cp docker-compose.offline.yml "${output_dir}/docker-compose.yml"
-    cp docker-compose.offline.yml "${output_dir}/docker-compose.offline.yml"
-    cp .env.example "${output_dir}/" 2> /dev/null || log_warning ".env.example 未找到，跳过"
-    [ -f mcp_config.example.json ] && cp mcp_config.example.json "${output_dir}/"
-    # 把本脚本一并打包，生产机直接 bash setup.sh --mode offline-deploy
-    cp "$0" "${output_dir}/setup.sh"
-    # 部署自检用的样例 PDF（离线环境同样要能跑通解析验证）
-    mkdir -p "${output_dir}/scripts"
-    cp scripts/smoke-sample.pdf "${output_dir}/scripts/" 2> /dev/null         || log_warning "scripts/smoke-sample.pdf 未找到，离线部署将跳过解析自检"
-    chmod +x "${output_dir}/setup.sh" 2> /dev/null || true
-    log_success "配置文件复制完成"
-
-    echo ""
-    log_success "=========================================="
-    log_success " 离线包构建完成: ${output_dir}"
-    log_success "=========================================="
-    ls -lh "$output_dir/"
-    echo ""
-    log_info "总大小: $(du -sh "$output_dir" | cut -f1)"
-    echo ""
-    log_info "下一步（传输到生产机并部署）:"
-    echo "  rsync -avz --progress ${output_dir}/ user@server:/opt/tianshu/"
-    echo "  ssh user@server 'cd /opt/tianshu && bash setup.sh --mode offline-deploy'"
-    echo ""
+    cp docker-compose.offline.yml "$output_dir/docker-compose.yml"
+    cp docker-compose.offline.yml .env.example mcp_config.example.json "$output_dir/"
+    cp setup.sh "$output_dir/setup.sh"
+    cp scripts/smoke-sample.pdf "$output_dir/scripts/"
+    (
+        cd "$output_dir"
+        offline_sha256 "${archives[@]}" models-offline.tar.gz docker-compose.yml docker-compose.offline.yml \
+            .env.example mcp_config.example.json setup.sh scripts/smoke-sample.pdf > SHA256SUMS.tmp
+        mv SHA256SUMS.tmp SHA256SUMS
+    )
+    log_success "离线包已生成：${output_dir}（$(du -sh "$output_dir" | cut -f1)）"
 }
 
 # ----------------------------------------------------------------------------
-# 模式：offline-deploy（生产机部署离线包）
+# 模式：offline-deploy（离线部署）
 # ----------------------------------------------------------------------------
 deploy_offline() {
     MODE="offline-deploy"
 
-    # 离线包内 docker-compose.yml 即 docker-compose.offline.yml 的副本
-    local compose_file=""
-    if [ -f docker-compose.offline.yml ]; then
-        compose_file="docker-compose.offline.yml"
-    elif [ -f docker-compose.yml ]; then
-        compose_file="docker-compose.yml"
-    else
-        log_error "未找到 docker-compose.offline.yml / docker-compose.yml"
-        log_error "请在离线包目录（含镜像 tar 包）中运行本脚本"
-        exit 1
-    fi
-
-    log_info "离线部署（compose 文件: ${compose_file}）"
-
-    # NVIDIA 强制检查（dry-run 放宽为告警）
-    if ! command -v nvidia-smi > /dev/null 2>&1 || ! nvidia-smi > /dev/null 2>&1; then
-        if [ "$DRY_RUN" -eq 1 ]; then
-            log_warning "dry-run：未检测到 NVIDIA GPU（正式执行时将直接报错退出）"
-        else
-            log_error "未检测到可用的 NVIDIA 驱动，离线 GPU 部署无法继续"
+    local compose_file="docker-compose.offline.yml"
+    local platform
+    case "$(uname -m)" in
+        x86_64) platform=amd64 ;;
+        aarch64 | arm64) platform=arm64 ;;
+        *)
+            log_error "不支持的离线部署架构：$(uname -m)"
             exit 1
-        fi
-    else
-        log_success "NVIDIA 驱动正常"
-        nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
-    fi
-
+            ;;
+    esac
+    local archives=(
+        "tianshu-backend-${platform}.tar.gz" "tianshu-frontend-${platform}.tar.gz"
+        "rustfs-${platform}.tar.gz" "vllm-mineru-${platform}.tar.gz" "redis-${platform}.tar.gz"
+    )
     if [ "$DRY_RUN" -eq 1 ]; then
-        log_info "将执行的操作:"
-        echo "    1. 检查 NVIDIA Container Toolkit"
-        echo "    2. 检查 tianshu-backend-amd64.tar.gz / tianshu-frontend-amd64.tar.gz / rustfs-amd64.tar.gz / models-offline.tar.gz"
-        echo "    3. docker load 加载三个镜像，tar xzf 解压模型"
-        echo "    4. 生成 .env（JWT 自动生成、RUSTFS_PUBLIC_URL 按本机 IP 改写、显存/内存自动调谐）"
-        echo "    5. docker compose -f ${compose_file} up -d（.env 启用 Redis 时附加 --profile redis）"
-        echo "    6. 健康检查（端口读 .env 的 API_PORT / FRONTEND_PORT）+ 容器内 nvidia-smi 验证"
-        log_warning "dry-run 模式：未执行任何部署操作"
+        log_info "将校验 SHA256SUMS，加载后端、前端、RustFS、vLLM 和 Redis 镜像"
+        log_info "将通过已加载的镜像测试 GPU，解压模型，配置环境并启动服务"
+        log_info "将创建 vLLM 容器，由 Worker 在解析请求到达时启动"
         return 0
     fi
 
     detect_compose
-    if docker run --rm --gpus all nvidia/cuda:12.6.2-base-ubuntu22.04 nvidia-smi > /dev/null 2>&1; then
-        log_success "NVIDIA Container Toolkit 工作正常"
-    else
-        log_error "Docker 无法访问 GPU（NVIDIA Container Toolkit 缺失或配置错误）"
-        log_error "安装指南: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html"
+    if ! command -v nvidia-smi > /dev/null 2>&1 || ! nvidia-smi > /dev/null 2>&1; then
+        log_error "未检测到可用的 NVIDIA 驱动，离线 GPU 部署无法继续"
         exit 1
     fi
+    nvidia-smi --query-gpu=index,name,driver_version,memory.total --format=csv,noheader
 
-    # 检查离线包文件
-    local missing=0
-    local f
-    for f in tianshu-backend-amd64.tar.gz tianshu-frontend-amd64.tar.gz rustfs-amd64.tar.gz models-offline.tar.gz; do
-        if [ ! -f "$f" ] && [ ! -L "$f" ]; then
-            log_error "缺少文件: $f"
-            missing=1
+    if [ ! -f SHA256SUMS ]; then
+        log_error "缺少 SHA256SUMS，请重新传输完整的 4.2.3 离线包"
+        exit 1
+    fi
+    local file
+    for file in "${archives[@]}" models-offline.tar.gz "$compose_file" .env.example mcp_config.example.json setup.sh scripts/smoke-sample.pdf; do
+        if [ ! -f "$file" ] || ! awk -v name="$file" '$2 == name { found=1 } END { exit !found }' SHA256SUMS; then
+            log_error "离线包缺少文件或校验记录：$file"
+            exit 1
         fi
     done
-    if [ "$missing" -eq 1 ]; then
-        log_error "请确认离线包全部文件已传输到当前目录"
+    if ! offline_sha256 -c SHA256SUMS; then
+        log_error "离线包校验失败，请重新传输报错的文件"
         exit 1
     fi
-    log_success "离线包文件齐全"
 
-    # 加载镜像
-    log_info "加载 Docker 镜像（约 5-10 分钟）..."
-    docker load < tianshu-backend-amd64.tar.gz
-    docker load < tianshu-frontend-amd64.tar.gz
-    docker load < rustfs-amd64.tar.gz
-    log_success "镜像加载完成"
+    log_info "加载离线镜像..."
+    for file in "${archives[@]}"; do
+        docker load < "$file"
+    done
+    local image
+    for image in tianshu-backend:latest vllm/vllm-openai:v0.31.0-cu129; do
+        if ! docker run --rm --pull never --gpus all --entrypoint nvidia-smi "$image" > /dev/null; then
+            log_error "镜像 $image 无法访问 GPU，请检查 NVIDIA Container Toolkit 和宿主机驱动"
+            exit 1
+        fi
+    done
+    log_success "离线后端与 vLLM 镜像可访问 GPU"
 
-    # 解压模型
-    log_info "解压模型（约 5-10 分钟）..."
+    log_info "解压离线模型..."
     tar xzf models-offline.tar.gz
-    log_success "模型解压完成"
+    mkdir -p models-offline/huggingface_cache models-offline/modelscope_cache models-offline/ultralytics_cfg
+    chmod a+rwx models-offline/huggingface_cache models-offline/modelscope_cache 2> /dev/null || true
 
+    local existing_env=0
+    if [ -f "$ENV_FILE" ]; then
+        existing_env=1
+    fi
+    prepare_env
+    tune_env "$existing_env"
     create_directories
 
-    # 生成配置并调谐（GPU 机器，tune_env 全量生效）
-    prepare_env
-    tune_env
-
+    # 保证复制来的 manual profile 不会使 vLLM 随常规服务一起启动。
+    export COMPOSE_PROFILES=""
+    set_env_key COMPOSE_PROFILES ""
     DC+=(-f "$compose_file")
     add_redis_profile
     persist_compose_file
 
-    log_info "启动服务..."
-    "${DC[@]}" up -d
-    log_success "容器已启动"
-
-    # 健康检查（端口读 .env）
+    log_info "创建按需启动的 vLLM 容器..."
+    "${DC[@]}" --profile manual create --pull never vllm-mineru
+    log_info "启动离线服务..."
+    "${DC[@]}" up -d --pull never
     verify_deployment || log_warning "健康检查存在告警，请查看上方信息"
+    run_smoke_test || log_warning "解析自检未通过，请查看 Worker 日志"
 
-    run_smoke_test || log_warning "解析自检未通过：服务已启动，但解析链路可能存在问题"
-
-    # 容器内 GPU 验证
-    sleep 5
     if "${DC[@]}" exec -T worker nvidia-smi > /dev/null 2>&1; then
-        log_success "Worker 容器可正常访问 GPU"
+        log_success "Worker 容器可访问 GPU"
     else
-        log_warning "无法在 Worker 容器内验证 GPU（可能仍在初始化）"
+        log_warning "当前无法在 Worker 容器内验证 GPU"
     fi
-
     show_info
 }
 
@@ -1702,15 +1661,15 @@ deploy_native() {
 
     log_info "原生部署模式（不依赖 Docker）"
     if [ "$is_mac_arm" -eq 1 ]; then
-        log_info "检测到 Apple Silicon，MinerU 将自动使用 MPS 加速，VLM 走 MLX"
+        log_info "检测到 Apple Silicon，MinerU 小模型自动使用 MPS 加速，本地 VLM 使用 llama.cpp"
     fi
 
     if [ "$DRY_RUN" -eq 1 ]; then
         log_info "将执行的操作:"
-        echo "    1. 检查 Python 3.10~3.12、ffmpeg（音视频解析需要）"
+        echo "    1. 检查 Python 3.11 或 3.12、ffmpeg（音视频解析需要）"
         echo "    2. 创建 .venv 虚拟环境并安装 backend/requirements.txt"
         echo "    3. 交互选择是否下载 VLM 模型，下载模型到 ./models"
-        echo "    4. 生成 ~/mineru.json（指向本机 ./models 绝对路径）"
+        echo "    4. 生成 models/config.yaml（指向本机 ./models 绝对路径）"
         echo "    5. 生成 backend/.env（若不存在）"
         echo "    6. 前台启动: .venv/bin/python backend/start_all.py --output-dir ./data/output"
         log_warning "dry-run 模式：未执行任何操作"
@@ -1720,11 +1679,11 @@ deploy_native() {
     # --- 1. 环境检查 ---
     local py=""
     local cand ver
-    for cand in python3.12 python3.11 python3.10 python3; do
+    for cand in python3.12 python3.11 python3; do
         if command -v "$cand" > /dev/null 2>&1; then
             ver=$("$cand" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2> /dev/null || true)
             case "$ver" in
-                3.10 | 3.11 | 3.12)
+                3.11 | 3.12)
                     py="$cand"
                     break
                     ;;
@@ -1732,7 +1691,7 @@ deploy_native() {
         fi
     done
     if [ -z "$py" ]; then
-        log_error "未找到 Python 3.10~3.12（MinerU 依赖的 ray 不支持 Python 3.13+）"
+        log_error "未找到 Python 3.11 或 3.12"
         [ "$os_type" = "Darwin" ] && log_info "可执行: brew install python@3.12"
         exit 1
     fi
@@ -1761,27 +1720,22 @@ deploy_native() {
 
     # --- 3. 模型下载 ---
     local models="mineru_pipeline,sensevoice"
-    if ask_yn "是否下载 VLM 模型 MinerU2.5-Pro（vlm/hybrid 后端需要，约 3GB）" "Y"; then
-        models="mineru_pipeline,mineru_vlm,sensevoice"
+    if ask_yn "是否下载本地 VLM 模型 MinerU2.5-Pro GGUF（用于 llama.cpp）" "Y"; then
+        models="mineru_pipeline,mineru_vlm_gguf,sensevoice"
     fi
-    log_info "下载模型到 ./models ..."
-    if ! .venv/bin/python backend/download_models.py --output ./models --models "$models"; then
-        log_warning "模型下载不完整，可稍后重试: .venv/bin/python backend/download_models.py --output ./models"
-    fi
-
-    # --- 4. mineru.json（本机绝对路径，容器路径版本不适用于原生运行） ---
     local root
     root=$(pwd)
-    cat > "$HOME/mineru.json" << EOF
-{
-    "models-dir": {
-        "pipeline": "${root}/models/PDF-Extract-Kit-1.0/models",
-        "vlm": "${root}/models/MinerU2.5-Pro-2605-1.2B"
-    },
-    "config_version": "1.3.1"
-}
-EOF
-    log_success "已生成 ~/mineru.json"
+    local model_endpoint="${HF_ENDPOINT:-https://huggingface.co}"
+    if [ "$NETWORK_ENV" = "cn" ]; then
+        model_endpoint="${HF_ENDPOINT:-https://hf-mirror.com}"
+    fi
+    log_info "下载模型到 ./models ..."
+    if ! HF_ENDPOINT="$model_endpoint" .venv/bin/python backend/download_models.py \
+        --output ./models --runtime-root "${root}/models" --models "$models"; then
+        log_error "模型准备失败，请修复下载问题后重新执行原生部署"
+        exit 1
+    fi
+    export MINERU_CONFIG="${root}/models/config.yaml"
 
     # --- 5. backend/.env ---
     if [ ! -f "backend/.env" ]; then
@@ -1832,7 +1786,7 @@ choose_mode() {
 
     local choice=""
     while true; do
-        printf "${BLUE}[?]${NC} 请输入选项 [0-6]: "
+        printf '%b[?]%b 请输入选项 [0-6]: ' "$BLUE" "$NC"
         read -r choice
         case "$choice" in
             1) MODE="gpu"; break ;;

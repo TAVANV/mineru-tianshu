@@ -1,0 +1,41 @@
+{
+  "page_indices": [
+    0
+  ],
+  "content_list": [
+    {
+      "type": "text",
+      "text": "Tianshu deployment smoke test.",
+      "bbox": [
+        115,
+        143,
+        704,
+        178
+      ],
+      "page_idx": 0
+    }
+  ],
+  "content_list_v2": [
+    [
+      {
+        "type": "paragraph",
+        "content": {
+          "paragraph_content": [
+            {
+              "type": "text",
+              "content": "Tianshu deployment smoke test."
+            }
+          ]
+        },
+        "bbox": [
+          115,
+          143,
+          704,
+          178
+        ]
+      }
+    ]
+  ],
+  "markdown": "Tianshu deployment smoke test.",
+  "images": []
+}

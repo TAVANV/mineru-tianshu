@@ -46,6 +46,11 @@ English | [简体中文](./README.md)
 
 ## 📝 Latest Updates
 
+### MinerU 4.2.3 Upgrade
+
+- The worker now uses the public MinerU parser and renderers with `mineru[torch]==4.2.3` and `transformers==5.10.1`.
+- The offline bundle includes the vLLM CUDA 12.9 image, model weights, and SHA256 checksums. For upgrades from 3.4.5, use a fresh deployment directory. [Offline upgrade guide (Chinese)](docs/upgrade-4.2.3-offline.md)
+
 ### 2026-10-16 🚀 v2.2.1: Prebuilt Docker Images
 
 - ✅ **Prebuilt images**: GPU backend, CPU backend and frontend images are published to GHCR with each release (`ghcr.io/magicyuan876/tianshu-backend` / `tianshu-backend-cpu` / `tianshu-frontend`), so deployments pull them instead of building locally
@@ -341,7 +346,7 @@ bash setup.sh --mode gpu --dry-run
 | `gpu` | GPU standard deployment (docker-compose.yml, default) |
 | `pipeline` | Pipeline-only deployment (downloads PDF-Extract-Kit models only, lighter) |
 | `cpu` | Mac CPU local development (docker-compose.cpu.yml + .env.cpu) |
-| `native` | Native host deployment (no Docker; auto MPS acceleration on Apple Silicon, VLM via MLX) |
+| `native` | Native host deployment (no Docker; auto MPS acceleration on Apple Silicon, local VLM via llama.cpp) |
 | `offline-build` / `offline-deploy` | Offline deployment: build the bundle online / deploy on the production host |
 
 The wizard asks for network environment (China mirrors / overseas direct), GPU count (auto-detected), worker concurrency, model source (HuggingFace/ModelScope), Redis, RustFS public URL and ports, and automatically generates the JWT secret, computes `MINERU_VIRTUAL_VRAM_SIZE`/`WORKER_MEMORY_LIMIT`, creates directories and runs health checks.
@@ -629,25 +634,7 @@ See [frontend/README.md](frontend/README.md) for details.
 
 ### Offline Deployment
 
-Tianshu supports **fully offline (air-gapped) deployment**, in two stages:
-
-```bash
-# 1. Build the offline bundle on an online machine (Linux/Mac, output in docker-images/)
-bash setup.sh --mode offline-build
-
-# 2. Transfer to the production server
-rsync -avz docker-images/ user@prod-server:/opt/tianshu/
-
-# 3. Deploy on the production server
-cd /opt/tianshu
-bash setup.sh --mode offline-deploy
-```
-
-**Highlights**:
-- ✅ **Cross-Platform Build**: Build Linux amd64 images on Mac (Apple Silicon/Intel)
-- ✅ **Fully Offline**: All models (~15GB) and dependencies pre-packaged
-- ✅ **One-Click Deploy**: Auto-configures environment variables, JWT secret, RustFS object storage
-- ✅ **Office Document Support**: MinerU natively parses .docx/.xlsx/.pptx; legacy .doc/.xls/.ppt converted via LibreOffice before parsing
+Run `bash setup.sh --mode offline-build` on a connected machine, transfer the complete `docker-images/` bundle, then run `bash setup.sh --mode offline-deploy` on the target. Deploy into a fresh directory when upgrading from 3.4.5. [Complete redeployment and rollback guide (Chinese)](docs/upgrade-4.2.3-offline.md)
 
 ### Frontend Build
 

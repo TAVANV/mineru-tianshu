@@ -1,6 +1,6 @@
 # ============================================================================
 # MinerU Server - Enterprise AI Data Preprocessing (CUDA 13.0 Edition)
-# Optimized for: MinerU 3.4.5 (VLM Support)
+# Optimized for: MinerU 4.2.3 (VLM Support)
 # Fixes: Missing botocore, s3transfer, reportlab, and other sub-dependencies
 # ============================================================================
 
@@ -63,56 +63,14 @@ WORKDIR /tmp
 COPY backend/requirements.txt /tmp/requirements.txt
 ARG PIP_MIRROR
 
-# Step 1: [地基] 锁定科学计算基础包
+# 保持 FlashAttention 和 CUDA 13 镜像所使用的 Torch ABI。
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "numpy==1.26.4" "pandas>=1.3.0" "psutil" "py-cpuinfo" -i ${PIP_MIRROR} --break-system-packages
+    pip install torch==2.10.0+cu130 torchvision==0.25.0+cu130 torchaudio==2.10.0+cu130 \
+    --index-url https://download.pytorch.org/whl/cu130 --break-system-packages
 
-# Step 2: [框架] PyTorch 2.10.0+cu130
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install torch==2.10.0+cu130 torchvision==0.25.0+cu130 --index-url https://download.pytorch.org/whl/cu130 --break-system-packages
-
-# Step 3: [核心业务包] (注意：移除 --no-deps，补全缺失的 botocore/reportlab 等)
-#
-# 使用解析/S3 extras，避免未使用的 Gradio 与 Starlette 安全版本冲突。
-#
-# 版本钉死不用 >=：本项目直接 import 了 mineru.utils.model_utils 与
-# mineru.cli.common，二者都不是 MinerU 承诺稳定的公共 API。线上曾因 >=3.4.5
-# 在重新构建时解析到上游新版本，Worker 启动即崩溃重启：
-#     ModuleNotFoundError: No module named 'mineru.utils.model_utils'
-# 升级 MinerU 时务必同步确认下面 Step 7 的入口断言仍然通过。
-# 加入了日志中提示缺失的所有包
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "huggingface-hub<1.0" \
-                "mineru[pipeline,vlm,s3]==3.4.5" \
-                "transformers==4.57.6" \
-                "openai>=1.50.0" \
-                "boto3>=1.34.0" \
-                "botocore>=1.34.0" \
-                "pypdf>=5.1.0" \
-                "reportlab" \
-                "pdfminer.six>=20251230" \
-                "albumentations>=1.4.11" \
-                "opencv-python>=4.11.0.86" \
-                "scikit-image>=0.25.0" \
-                "mineru-vl-utils" \
-                "qwen-vl-utils" \
-                "doclayout-yolo==0.0.4" \
-                "prettytable" \
-                "ruamel.yaml" \
-                "ujson" \
-    -i ${PIP_MIRROR} --break-system-packages
-
-# Step 4: [补全] 安装 requirements.txt 并过滤掉已安装的重型框架
-RUN --mount=type=cache,target=/root/.cache/pip \
-    sed -i '/torch/d; /nvidia/d; /opencv/d; /numpy/d; /pandas/d; /transformers/d; /mineru/d; /boto3/d; /openai/d; /pypdf/d' /tmp/requirements.txt && \
-    pip install -r /tmp/requirements.txt -i ${PIP_MIRROR} --break-system-packages
-
-# Step 5: [重新锁定 PyTorch] 防止上游包降级或替换 torch 版本
-# flash_attn 必须与运行时 torch 版本严格匹配，此步确保一致性
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install torch==2.10.0+cu130 torchvision==0.25.0+cu130 \
-    --index-url https://download.pytorch.org/whl/cu130 \
-    --break-system-packages
+    pip install -r /tmp/requirements.txt torch==2.10.0+cu130 torchvision==0.25.0+cu130 torchaudio==2.10.0+cu130 \
+    -i "${PIP_MIRROR}" --break-system-packages
 
 # Step 6: [扩展] FlashAttention (必须在 torch 版本确认后最后安装)
 # 该 wheel 有 242MB 且只在 GitHub Releases 上，国内直连经常几十 KB/s 且反复断连。
@@ -139,13 +97,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install onnxruntime-gpu==1.30.0 -i ${PIP_MIRROR} --break-system-packages
 
 # Step 7: [最终验证]
-# 除了三方包，这里还显式导入本项目真正用到的 MinerU 入口。
-# 这三个入口不是 MinerU 承诺稳定的公共 API，上游版本漂移就可能消失；
-# 在构建期验证，可以让问题当场暴露，而不是等到线上 Worker 起不来。
+# 在构建阶段验证实际调用的公开入口。
 RUN python -c "import torch; import pypdf; import boto3; import botocore; import openai; print(chr(9989) + ' 三方依赖验证通过')" \
     && python -c "import flash_attn; print(chr(9989) + ' flash_attn 可用')" \
     && python -c "import onnxruntime as o; p = o.get_available_providers(); assert 'CUDAExecutionProvider' in p, p; print(chr(9989) + ' onnxruntime-gpu ' + o.__version__ + ' ' + str(p))" \
-    && python -c "from mineru.cli.common import do_parse; from mineru.utils.model_utils import get_vram, clean_memory; print(chr(9989) + ' MinerU 解析入口验证通过 (do_parse / get_vram / clean_memory)')" \
+    && python -c "from mineru.parser import parse; from mineru.render import render_content_list, render_content_list_v2; print(chr(9989) + ' MinerU 公开解析与渲染入口可用')" \
     && pip show mineru flash-attn | grep -E "^(Name|Version)"
 
 # -----------------------------------------------------------------------------
@@ -166,7 +122,7 @@ RUN groupadd -g 10001 tianshu && \
     useradd -u 10001 -g tianshu -m -s /bin/bash tianshu && \
     chown -R tianshu:tianshu /app /home/tianshu
 
-# USER 指令不会自动设置 HOME，显式指定以兼容 ~/.cache、~/mineru.json 等路径解析
+# USER 指令不会自动设置 HOME，显式指定以便运行时解析用户缓存路径
 ENV HOME=/home/tianshu
 
 WORKDIR /app/backend

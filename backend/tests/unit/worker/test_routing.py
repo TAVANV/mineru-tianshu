@@ -322,3 +322,25 @@ def test_spreadsheet_without_markitdown_fails_task(monkeypatch, mocker, tmp_path
 
     worker._process_with_mineru.assert_not_called()
     assert worker.task_db.update_task_status.call_args.args[1] == "failed"
+
+
+def test_mineru_pdf_preview_uses_original_and_converted_image(monkeypatch, tmp_path):
+    worker_module = load_worker_module(monkeypatch)
+    worker = worker_module.MinerUWorkerAPI.__new__(worker_module.MinerUWorkerAPI)
+    document = tmp_path / "source.pdf"
+    document.write_bytes(minimal_pdf())
+    output = tmp_path / "output"
+    output.mkdir()
+
+    assert worker._ensure_pdf_in_output(str(document), output) == document.name
+    assert (output / document.name).read_bytes() == document.read_bytes()
+
+    (output / "result_origin.pdf").write_bytes(minimal_pdf())
+    assert worker._ensure_pdf_in_output(str(tmp_path / "scan.png"), output) == "result_origin.pdf"
+
+
+def test_pdf_with_requested_range_is_not_split(monkeypatch, tmp_path):
+    worker_module = load_worker_module(monkeypatch)
+    worker = worker_module.MinerUWorkerAPI.__new__(worker_module.MinerUWorkerAPI)
+    monkeypatch.setenv("PDF_SPLIT_ENABLED", "true")
+    assert not worker._should_split_pdf("task", str(tmp_path / "source.pdf"), {}, {"start_page": 4})

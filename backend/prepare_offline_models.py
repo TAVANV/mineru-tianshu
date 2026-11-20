@@ -1,36 +1,9 @@
 #!/usr/bin/env python3
-"""
-天枢离线模型准备脚本（宿主机裸跑，不依赖 docker）
-================================================================================
-把所有模型下载到统一目录（默认 /data/modelfiles），**下载路径严格对齐容器内代码的实际
-加载路径**，避免"下载位置 ≠ 使用位置"的坑。
-
-经过对引擎代码逐个审计，已规避 download_models.py 的 3 个路径不一致问题：
-  1. 音频(funasr) 只认 ~/.cache/modelscope，绝不是 /app/models/SenseVoiceSmall
-  2. YOLO 水印认死文件名 ~/.cache/watermark_models/yolo11x_watermark.pt
-  3. LaMa 走 LAMA_MODEL 环境变量
-
-用法：
-    pip install "modelscope" "huggingface_hub" "paddlepaddle==3.0.0" "paddlex>=3.4.1"
-    python prepare_offline_models.py /data/modelfiles
-
-下载完成后，按脚本末尾打印的 docker-compose volumes / environment 配置挂载即可。
-================================================================================
-
-宿主机目录          ->  容器挂载                       ->  代码查找路径
-/data/modelfiles/
-  PDF-Extract-Kit-1.0/   -> /app/models/PDF-Extract-Kit-1.0/   <- mineru.json pipeline
-  MinerU2.5-2509-1.2B/   -> /app/models/MinerU2.5-2509-1.2B/   <- mineru.json vlm
-  mineru.json            -> /app/models/mineru.json            <- entrypoint 分发到 ~/mineru.json
-  paddlex_cache/         -> /root/.paddlex/                    <- PADDLEX_HOME
-  modelscope_cache/      -> /root/.cache/modelscope/           <- funasr 默认缓存
-  watermark_models/      -> /root/.cache/watermark_models/     <- YOLO / LaMa(LAMA_MODEL)
-"""
+"""准备外置模型目录，供 docker-compose.external-models.yml 挂载使用。"""
 
 import argparse
 import os
 import sys
-import json
 import traceback
 import urllib.request
 from pathlib import Path
@@ -95,14 +68,16 @@ def step(title):
 
 
 # ------------------------------------------------------------------------------
-# 1. MinerU pipeline + VLM —— 用 local_dir 下到精确目录（mineru.json 指向）
+# 1. MinerU 4 Torch 小模型与 Pro VLM
 # ------------------------------------------------------------------------------
 def dl_mineru():
-    step("MinerU pipeline + VLM (ModelScope)")
-    from modelscope import snapshot_download as ms
+    from offline_models import main as prepare
 
-    ms("OpenDataLab/PDF-Extract-Kit-1.0", local_dir=str(ROOT / "PDF-Extract-Kit-1.0"))
-    ms("opendatalab/MinerU2.5-2509-1.2B", local_dir=str(ROOT / "MinerU2.5-2509-1.2B"))
+    models = "mineru_pipeline,mineru_vlm_pro"
+    if ACTIVE_VLM == "mineru_vlm":
+        models += ",mineru_vlm"
+    if prepare(str(ROOT), selected_models=models, strict=True, vlm_model=ACTIVE_VLM):
+        raise RuntimeError("MinerU 模型准备失败")
 
 
 # ------------------------------------------------------------------------------
@@ -179,21 +154,13 @@ def dl_extras():
 
 
 # ------------------------------------------------------------------------------
-# 6. mineru.json —— 内部写【容器内】路径（不是宿主机路径！mineru 在容器里跑）
+# 6. 按需更新外置目录中的 Pro VLM
 # ------------------------------------------------------------------------------
-def gen_mineru_json():
-    step("Generate mineru.json (container paths)")
-    from offline_models import generate_mineru_json
-
-    generate_mineru_json(ROOT, ACTIVE_VLM)
-    print(f"   -> {ROOT / 'mineru.json'}")
-
-
 def dl_mineru_pro():
     from offline_models import main as prepare
 
     if prepare(str(ROOT), selected_models="mineru_vlm_pro", strict=True, vlm_model=ACTIVE_VLM):
-        raise RuntimeError("New VLM preparation failed; existing model selection is unchanged")
+        raise RuntimeError("Pro VLM 模型准备失败")
 
 
 # ------------------------------------------------------------------------------
@@ -204,15 +171,12 @@ TASKS = [
     ("Audio", dl_audio),
     ("YOLO", dl_yolo),
     ("Fonts/LaMa", dl_extras),
-    ("mineru.json", gen_mineru_json),
 ]
 
 
 def main(argv=None):
     global ACTIVE_VLM
-    parser = argparse.ArgumentParser(
-        description="Prepare the existing external-model layout; new VLM downloads are opt-in"
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", nargs="?", default="/data/modelfiles")
     parser.add_argument(
         "--only",
@@ -259,48 +223,7 @@ def main(argv=None):
         print("   ⚠️ LaMa github 直链国内可加代理前缀: https://mirror.ghproxy.com/")
         print("!" * 70)
 
-    active_vlm_dir = "MinerU2.5-2509-1.2B"
-    config_path = ROOT / "mineru.json"
-    if config_path.exists():
-        active_vlm_dir = Path(json.loads(config_path.read_text())["models-dir"]["vlm"]).name
-    print(
-        f"""
-下一步：docker-compose 按下面挂载（worker 和 backend 服务都加），保证路径一致：
-
-    volumes:
-      - {ROOT}/PDF-Extract-Kit-1.0:/app/models/PDF-Extract-Kit-1.0:ro
-      - {ROOT}/{active_vlm_dir}:/app/models/{active_vlm_dir}:ro
-      - {ROOT}/mineru.json:/app/models/mineru.json:ro
-      - {ROOT}/paddlex_cache:/root/.paddlex:rw
-      - {ROOT}/modelscope_cache:/root/.cache/modelscope:rw
-      - {ROOT}/watermark_models:/root/.cache/watermark_models:rw
-      - {ROOT}/ultralytics_cfg:/root/.config/Ultralytics:rw
-
-    environment:
-      - MODEL_DOWNLOAD_SOURCE=local
-      - MINERU_MODEL_SOURCE=local
-      - MINERU_VLM_MODEL_DIR={active_vlm_dir}
-      - HF_OFFLINE=1
-      - HF_HUB_OFFLINE=1
-      - TRANSFORMERS_OFFLINE=1
-      - MODELSCOPE_OFFLINE=1
-      - MODELSCOPE_CACHE=/root/.cache/modelscope        # 音频(sensevoice_engine 已对齐读此变量)
-      - PADDLEX_HOME=/root/.paddlex
-      - PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
-      - WATERMARK_MODEL_DIR=/root/.cache/watermark_models  # YOLO(watermark_remover 已对齐读此变量)
-      - LAMA_MODEL=/root/.cache/watermark_models/big-lama.pt
-      - YOLO_CONFIG_DIR=/root/.config/Ultralytics              # ultralytics 字体 Arial.ttf 目录
-
-验证（起容器前在宿主机确认这些文件/目录存在）：
-      ls {ROOT}/PDF-Extract-Kit-1.0/models/
-      ls {ROOT}/{active_vlm_dir}/*.safetensors
-      ls {ROOT}/paddlex_cache/official_models/        # 应有 PaddleOCR-VL-1.5-0.9B 及若干 PP-*
-      ls {ROOT}/modelscope_cache/hub/iic/             # 应有 5 个音频模型
-      ls {ROOT}/watermark_models/yolo11x_watermark.pt {ROOT}/watermark_models/big-lama.pt
-      ls {ROOT}/ultralytics_cfg/Arial.ttf
-      cat {ROOT}/mineru.json
-"""
-    )
+    print(f"外置模型目录：{ROOT}。设置 OFFLINE_MODELS_PATH 后叠加 docker-compose.external-models.yml。")
     return 1 if _fail else 0
 
 

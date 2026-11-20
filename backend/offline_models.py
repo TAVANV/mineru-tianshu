@@ -18,6 +18,15 @@ from datetime import datetime
 from pathlib import Path
 from urllib.request import urlretrieve
 
+import yaml
+
+from download_models import (
+    MODELS as STANDARD_MODELS,
+    download_mineru_snapshot,
+    generate_mineru_config,
+    verify_mineru_snapshot,
+)
+
 try:
     from loguru import logger
 
@@ -41,21 +50,9 @@ ULTRALYTICS_ARIAL_URL = "https://github.com/ultralytics/assets/releases/download
 
 MODELS = {
     "mineru_pipeline": {
-        "name": "MinerU Pipeline (PDF-Extract-Kit)",
-        "source": "modelscope",
-        "model_id": "OpenDataLab/PDF-Extract-Kit-1.0",
-        "target_dir": "PDF-Extract-Kit-1.0",
-        "required": True,
-        "verify": [
-            "models/Layout/PP-DocLayoutV2/model.safetensors",
-            "models/MFR/unimernet_hf_small_2503/model.safetensors",
-            "models/OCR/paddleocr_torch/ch_PP-OCRv6_small_det_infer.safetensors",
-            "models/OCR/paddleocr_torch/ch_PP-OCRv6_small_rec_infer.safetensors",
-            "models/OCR/paddleocr_torch/ch_PP-OCRv6_medium_rec_infer.safetensors",
-            "models/TabRec/SlanetPlus/slanet-plus.onnx",
-            "models/TabRec/UnetStructure/unet.onnx",
-            "models/TabCls/paddle_table_cls/PP-LCNet_x1_0_table_cls.onnx",
-        ],
+        **STANDARD_MODELS["mineru_pipeline"],
+        "name": "MinerU 4 Torch 小模型",
+        "source": "huggingface",
     },
     "mineru_vlm": {
         "name": "MinerU 2.5 VLM (1.2B)",
@@ -63,17 +60,13 @@ MODELS = {
         "model_id": "opendatalab/MinerU2.5-2509-1.2B",
         "target_dir": "MinerU2.5-2509-1.2B",
         "required": True,
+        "default": False,
         "verify_glob": ["*.safetensors"],
     },
     "mineru_vlm_pro": {
+        **STANDARD_MODELS["mineru_vlm"],
         "name": "MinerU 2.5 Pro VLM (1.2B)",
-        "source": "modelscope",
-        "model_id": "OpenDataLab/MinerU2.5-Pro-2605-1.2B",
-        "target_dir": "MinerU2.5-Pro-2605-1.2B",
-        "required": True,
-        "default": False,  # Additive download; old --models mineru_vlm keeps its meaning.
-        "verify": ["config.json"],
-        "verify_glob": ["*.safetensors"],
+        "source": "huggingface",
     },
     "paddleocr_vl_1_5": {
         "default": False,
@@ -214,15 +207,11 @@ def download_from_huggingface(config: dict, target: Path) -> Path | None:
             repo_id=config["repo_id"],
             filename=config["filename"],
             local_dir=str(target),
-            local_dir_use_symlinks=False,
-            resume_download=True,
         )
     else:
         snapshot_download(
             repo_id=config["repo_id"],
             local_dir=str(target),
-            local_dir_use_symlinks=False,
-            resume_download=True,
         )
     return target
 
@@ -312,7 +301,7 @@ def verify_model(output_path: Path, name: str, config: dict) -> tuple[bool, str]
         return False, f"empty directory: {target}"
 
     for rel_path in config.get("verify", []):
-        if not (target / rel_path).exists():
+        if not (target / rel_path).is_file() or not (target / rel_path).stat().st_size:
             return False, f"missing required path: {target / rel_path}"
 
     for pattern in config.get("verify_glob", []):
@@ -330,6 +319,9 @@ def verify_model(output_path: Path, name: str, config: dict) -> tuple[bool, str]
 
     if name == "yolo11" and not list(target.rglob("*.pt")):
         return False, f"missing .pt files in {target}"
+
+    if config.get("revision") and not verify_mineru_snapshot(target, config):
+        return False, f"缺少或损坏的 MinerU 完成标记：{target}"
 
     return True, "verified"
 
@@ -398,25 +390,17 @@ def atomic_json(path: Path, config: dict) -> None:
         temp.unlink(missing_ok=True)
 
 
-def generate_mineru_json(output_path: Path, vlm_model: str | None = None, runtime_root: str = "/app/models") -> None:
-    config_path = output_path / "mineru.json"
-    config = json.loads(config_path.read_text()) if config_path.exists() else {}
-    model_dirs = config.setdefault("models-dir", {})
-    if not isinstance(model_dirs, dict):
-        raise ValueError("Unsupported legacy models-dir; migrate the custom config explicitly")
-    if model_dirs.get("pipeline") == "/app/models/PDF-Extract-Kit-1.0/models":
-        model_dirs["pipeline"] = "/app/models/PDF-Extract-Kit-1.0"
-    model_dirs.setdefault("pipeline", str(Path(runtime_root) / "PDF-Extract-Kit-1.0"))
-    model_dirs.setdefault("vlm", str(Path(runtime_root) / MODELS["mineru_vlm"]["target_dir"]))
+def configure_mineru(output_path: Path, vlm_model: str | None = None, runtime_root: str = "/app/models") -> None:
     if vlm_model:
         verified, reason = verify_model(output_path, vlm_model, MODELS[vlm_model])
         if not verified:
-            raise ValueError(f"Cannot activate an unverified VLM: {reason}")
-        model_dirs["vlm"] = str(Path(runtime_root) / MODELS[vlm_model]["target_dir"])
-    # MinerU 3.4 would otherwise migrate an old config to an online model source.
-    config.update({"model-source": "local", "config_version": "1.3.2"})
-    atomic_json(config_path, config)
-    logger.success(f"✅ mineru.json ready at: {config_path}")
+            raise ValueError(f"无法启用未经验证的 VLM：{reason}")
+    generate_mineru_config(output_path, runtime_root)
+    if vlm_model:
+        path = output_path / "config.yaml"
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        config.setdefault("tianshu", {})["vllm_model_dir"] = MODELS[vlm_model]["target_dir"]
+        path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
 
 def generate_ultralytics_settings(output_path: Path) -> None:
@@ -437,26 +421,14 @@ def generate_ultralytics_settings(output_path: Path) -> None:
     logger.success(f"✅ Ultralytics settings created at: {settings_path}")
 
 
-def verify_mineru_json(output_path: Path) -> tuple[bool, str]:
-    config_path = output_path / "mineru.json"
-    if not config_path.exists():
-        return False, f"missing: {config_path}"
-
+def verify_mineru_config(output_path: Path) -> tuple[bool, str]:
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        return False, f"invalid JSON in {config_path}: {exc}"
-
-    models_dir = config.get("models-dir", {})
-    if not isinstance(models_dir, dict) or not all(
-        isinstance(models_dir.get(k), str) and models_dir[k] for k in ("pipeline", "vlm")
-    ):
-        return False, "models-dir must contain pipeline and vlm paths"
-    # Existing 1.3.1 offline packs remain valid: runtime distribution adds model-source=local.
-    if config.get("model-source", "local") != "local":
-        return False, "Offline configuration must use local models"
-
-    return True, "verified"
+        model = yaml.safe_load((output_path / "config.yaml").read_text(encoding="utf-8"))["model"]
+        if model["source"] == "local" and model["small_backend"] == "torch" and Path(model["base_dir"]).is_absolute():
+            return True, "校验通过"
+    except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError) as error:
+        return False, str(error)
+    return False, "须设置本地 Torch 小模型及绝对路径"
 
 
 def verify_ultralytics_settings(output_path: Path) -> tuple[bool, str]:
@@ -514,7 +486,9 @@ def prepare_model(output_path: Path, name: str, config: dict, force: bool, verif
 
     source = config["source"]
     logger.info(f"    Downloading to: {target}")
-    if source == "huggingface":
+    if config.get("revision"):
+        download_mineru_snapshot(config, target, force=force)
+    elif source == "huggingface":
         download_from_huggingface(config, target)
     elif source == "modelscope":
         download_from_modelscope(config, target)
@@ -589,12 +563,12 @@ def main(
         logger.info("")
 
     if verify_only and selected_models is None:
-        verified, reason = verify_mineru_json(output_path)
-        manifest["mineru_json"] = {"status": "verified" if verified else "missing", "reason": reason}
+        verified, reason = verify_mineru_config(output_path)
+        manifest["mineru_config"] = {"status": "verified" if verified else "missing", "reason": reason}
         if verified:
-            logger.success(f"✅ mineru.json {reason}")
+            logger.success(f"✅ config.yaml {reason}")
         else:
-            logger.error(f"❌ mineru.json {reason}")
+            logger.error(f"❌ config.yaml {reason}")
             total_fail += 1
 
         verified, reason = verify_ultralytics_settings(output_path)
@@ -606,7 +580,7 @@ def main(
             if strict:
                 total_fail += 1
     elif not verify_only:
-        generate_mineru_json(output_path, vlm_model if total_fail == 0 else None, runtime_root)
+        configure_mineru(output_path, vlm_model if total_fail == 0 else None, runtime_root)
 
     if not verify_only:
         generate_ultralytics_settings(output_path)

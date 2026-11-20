@@ -140,11 +140,12 @@ services:
 
       # 模型下载配置（本地模式）
       - MODEL_DOWNLOAD_SOURCE=${MODEL_DOWNLOAD_SOURCE:-local}
+      - MINERU_CONFIG=/app/models/config.yaml
       - MINERU_MODEL_SOURCE=${MINERU_MODEL_SOURCE:-local}
       # 模型缓存显式指向宿主机挂载目录（与运行用户/HOME 无关），容器重建后无需重新下载
       - HF_HOME=/app/models/huggingface_cache
       - MODELSCOPE_CACHE=/app/models/modelscope_cache
-      - HF_OFFLINE=${HF_OFFLINE:-1}
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
       - HF_TOKEN=${HF_TOKEN:-}
 
@@ -238,11 +239,12 @@ services:
 
       # 模型下载配置（本地模式）
       - MODEL_DOWNLOAD_SOURCE=${MODEL_DOWNLOAD_SOURCE:-local}
+      - MINERU_CONFIG=/app/models/config.yaml
       - MINERU_MODEL_SOURCE=${MINERU_MODEL_SOURCE:-local}
       # 模型缓存显式指向宿主机挂载目录（与运行用户/HOME 无关），容器重建后无需重新下载
       - HF_HOME=/app/models/huggingface_cache
       - MODELSCOPE_CACHE=/app/models/modelscope_cache
-      - HF_OFFLINE=${HF_OFFLINE:-1}
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
       - HF_TOKEN=${HF_TOKEN:-}
 

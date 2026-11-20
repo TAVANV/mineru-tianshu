@@ -1,69 +1,86 @@
 import json
 
 import pytest
+import yaml
 
 from check_external_models import check_models
-from offline_models import MODELS, generate_mineru_json, verify_model
+from download_models import MODEL_COMPLETE_MARKER, generate_mineru_config, reuse_models
+from offline_models import MODELS, configure_mineru, verify_model
 
 
-def prepare_models(root, vlm="MinerU2.5-2509-1.2B"):
-    for relative in MODELS["mineru_pipeline"]["verify"]:
-        target = root / "PDF-Extract-Kit-1.0" / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(b"synthetic weight")
-    target = root / vlm
-    target.mkdir()
-    (target / "config.json").write_text("{}")
-    (target / "model.safetensors").write_bytes(b"synthetic weight")
-    (root / "mineru.json").write_text(
-        json.dumps(
-            {
-                "model-source": "local",
-                "models-dir": {"pipeline": "/app/models/PDF-Extract-Kit-1.0", "vlm": f"/app/models/{vlm}"},
-            }
-        )
-    )
+def prepare_snapshot(root, key):
+    spec = MODELS[key]
+    target = root / spec["target_dir"]
+    sizes = {}
+    for relative in spec.get("verify", ["model.safetensors"]):
+        path = target / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"synthetic weight")
+        sizes[relative] = path.stat().st_size
+    if spec.get("revision"):
+        (target / MODEL_COMPLETE_MARKER).write_text(json.dumps({"version": 1, "files": sizes}))
+    return target
 
 
-@pytest.mark.parametrize("vlm", ["MinerU2.5-2509-1.2B", "MinerU2.5-Pro-2605-1.2B"])
-def test_external_validation_is_read_only_and_preserves_selected_model(tmp_path, vlm):
-    prepare_models(tmp_path, vlm)
+@pytest.mark.parametrize("vlm", ["mineru_vlm", "mineru_vlm_pro"])
+def test_external_validation_reads_config_without_modifying_models(tmp_path, vlm):
+    prepare_snapshot(tmp_path, "mineru_pipeline")
+    prepare_snapshot(tmp_path, vlm)
+    configure_mineru(tmp_path, vlm)
     before = {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
     check_models(tmp_path)
     assert before == {p.relative_to(tmp_path): p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
 
 
-def test_external_validation_rejects_missing_ocrv6_and_weight_shards(tmp_path):
-    prepare_models(tmp_path)
-    ocr = tmp_path / "PDF-Extract-Kit-1.0" / MODELS["mineru_pipeline"]["verify"][2]
+def test_external_validation_rejects_missing_weights_and_shards(tmp_path):
+    torch_root = prepare_snapshot(tmp_path, "mineru_pipeline")
+    vlm_root = prepare_snapshot(tmp_path, "mineru_vlm")
+    configure_mineru(tmp_path, "mineru_vlm")
+    ocr = torch_root / "OCR/paddleocr/ch_PP-OCRv6_small_rec_infer.safetensors"
+    payload = ocr.read_bytes()
     ocr.unlink()
     with pytest.raises(ValueError, match="pipeline"):
         check_models(tmp_path)
-    ocr.write_bytes(b"synthetic weight")
-    (tmp_path / "MinerU2.5-2509-1.2B" / "model.safetensors.index.json").write_text(
+    ocr.write_bytes(payload)
+    (vlm_root / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {"tensor": "missing-shard.safetensors"}})
     )
     with pytest.raises(ValueError, match="shards"):
         check_models(tmp_path)
 
 
-def test_invalid_activation_does_not_change_existing_config(tmp_path):
-    prepare_models(tmp_path)
-    config = tmp_path / "mineru.json"
+def test_invalid_activation_preserves_existing_config(tmp_path):
+    prepare_snapshot(tmp_path, "mineru_vlm")
+    configure_mineru(tmp_path, "mineru_vlm")
+    config = tmp_path / "config.yaml"
     before = config.read_bytes()
-    with pytest.raises(ValueError, match="unverified"):
-        generate_mineru_json(tmp_path, "mineru_vlm_pro")
+    with pytest.raises(ValueError, match="未经验证"):
+        configure_mineru(tmp_path, "mineru_vlm_pro")
     assert config.read_bytes() == before
-    generate_mineru_json(tmp_path)
-    assert json.loads(config.read_text())["models-dir"]["vlm"].endswith("MinerU2.5-2509-1.2B")
+    generate_mineru_config(tmp_path)
+    data = yaml.safe_load(config.read_text())
+    assert data["model"] == {
+        "source": "local",
+        "base_dir": "/app/models",
+        "small_backend": "torch",
+        "vlm": {"engine": "auto", "model": "MinerU-1.2B"},
+    }
+    assert data["tianshu"]["vllm_model_dir"] == MODELS["mineru_vlm"]["target_dir"]
 
 
-def test_old_pipeline_config_is_corrected_without_changing_vlm(tmp_path):
-    prepare_models(tmp_path)
-    config = tmp_path / "mineru.json"
-    data = json.loads(config.read_text())
-    data["models-dir"]["pipeline"] += "/models"
-    config.write_text(json.dumps(data))
-    generate_mineru_json(tmp_path)
-    check_models(tmp_path)
-    assert verify_model(tmp_path, "mineru_pipeline", MODELS["mineru_pipeline"])[0]
+def test_reuse_copies_unchanged_models_and_leaves_old_mineru_config(tmp_path):
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    new.mkdir()
+    source = prepare_snapshot(old, "mineru_vlm_pro")
+    (old / "SenseVoiceSmall").mkdir()
+    (old / "SenseVoiceSmall/model.pt").write_bytes(b"audio")
+    (old / "PDF-Extract-Kit-1.0").mkdir()
+    (old / "mineru.json").write_text("{}")
+    reuse_models(old, new)
+    assert (new / "SenseVoiceSmall/model.pt").read_bytes() == b"audio"
+    assert (new / source.name / "model.safetensors").read_bytes() == b"synthetic weight"
+    assert not (new / source.name / MODEL_COMPLETE_MARKER).exists()
+    assert verify_model(old, "mineru_vlm_pro", MODELS["mineru_vlm_pro"])[0]
+    assert not (new / "PDF-Extract-Kit-1.0").exists()
+    assert not (new / "mineru.json").exists()

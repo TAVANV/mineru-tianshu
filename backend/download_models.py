@@ -1,364 +1,301 @@
 #!/usr/bin/env python3
-"""
-模型预下载脚本 - Tianshu
+"""下载部署所需的模型，并生成 MinerU 4.2.3 的本地配置。"""
 
-策略说明:
-1. MinerU / YOLO / Audio 模型: 使用此脚本预先下载到 ./models 目录。
-2. LaMa 等运行时按需获取的模型: 设置为 auto_download，首次使用时由引擎自动下载。
-3. 配置文件生成:
-   - 自动在模型目录生成 mineru.json（MinerU 3.0 新格式），供 entrypoint 脚本分发到各服务。
-   - 配置文件格式: {"models-dir": {"pipeline": "...", "vlm": "..."}, "config_version": "1.3.1"}
-"""
-
-import os
-import sys
-import json
 import argparse
-from pathlib import Path
+import json
+import os
+import shutil
+import sys
 from datetime import datetime
+from pathlib import Path
+from urllib.request import urlretrieve
+
+import yaml
 from loguru import logger
 
-# 配置日志
-logger.remove()
-logger.add(sys.stdout, format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>")
 
-# ==============================================================================
-# 模型配置清单
-# ==============================================================================
 MODELS = {
-    # -------------------------------------------------------------------------
-    # 1. MinerU 核心模型 (需要预下载)
-    # -------------------------------------------------------------------------
     "mineru_pipeline": {
-        "name": "MinerU Pipeline (PDF-Extract-Kit)",
-        "repo_id": "OpenDataLab/PDF-Extract-Kit-1.0",
-        "source": "modelscope",
-        "target_dir": "PDF-Extract-Kit-1.0",
-        "description": "PDF OCR, Layout Analysis models (For 'pipeline' mode)",
+        "repo_id": "opendatalab/MinerU-4_models_torch",
+        "revision": "2b3afb86f4d23fa623f6b2f4b2279ed4ef93a89d",
+        "target_dir": "MinerU-4_models_torch",
         "required": True,
+        "verify": [
+            "Layout/PP-DocLayoutV2/config.json",
+            "Layout/PP-DocLayoutV2/inference.yml",
+            "Layout/PP-DocLayoutV2/model.safetensors",
+            "Layout/PP-DocLayoutV2/preprocessor_config.json",
+            "MFR/pp_formulanet_plus_m/PP-FormulaNet_plus-M.pth",
+            "MFR/pp_formulanet_plus_m/PP-FormulaNet_plus-M_inference.yml",
+            "OCR/paddleocr/ch_PP-OCRv6_tiny_det_infer.safetensors",
+            "OCR/paddleocr/ch_PP-OCRv6_small_rec_infer.safetensors",
+            "OCR/paddleocr/seal_PP-OCRv4_det_infer.pth",
+            "Table/slanet-plus.onnx",
+            "Table/unet.onnx",
+            "Table/PP-LCNet_x1_0_table_cls.onnx",
+        ],
     },
     "mineru_vlm": {
-        "name": "MinerU 2.5 Pro VLM (1.2B)",
-        "model_id": "OpenDataLab/MinerU2.5-Pro-2605-1.2B",
-        "source": "modelscope",
+        "repo_id": "opendatalab/MinerU2.5-Pro-2605-1.2B",
+        "revision": "08aaea840498d49ce16247b6263196cf02814885",
         "target_dir": "MinerU2.5-Pro-2605-1.2B",
-        "description": "Vision Language Model (For 'vlm-engine' & 'hybrid-engine')",
         "required": True,
+        "verify": ["config.json", "model.safetensors", "preprocessor_config.json", "tokenizer.json"],
     },
-    # -------------------------------------------------------------------------
-    # 2. 其他模型 (需要预下载)
-    # -------------------------------------------------------------------------
+    "mineru_vlm_gguf": {
+        "repo_id": "jinzhenj/MinerU2.5-Pro-2605-1.2B-GGUF",
+        "revision": "9185688a0495e1577d521a757c7c0b62dd38ca48",
+        "target_dir": "MinerU2.5-Pro-2605-1.2B-GGUF",
+        "required": True,
+        "verify": ["MinerU2.5-Pro-2605-1.2B-Q8_0.gguf", "mmproj-MinerU2.5-Pro-2605-1.2B-Q8_0.gguf"],
+    },
     "sensevoice": {
-        "name": "SenseVoice Audio Recognition",
         "model_id": "iic/SenseVoiceSmall",
-        "source": "modelscope",
         "target_dir": "SenseVoiceSmall",
-        "description": "Multi-language speech recognition model",
         "required": True,
     },
     "paraformer": {
-        "name": "Paraformer Speaker Diarization",
         "model_id": "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
-        "source": "modelscope",
         "target_dir": "Paraformer",
-        "description": "Speaker diarization and VAD model",
         "required": False,
     },
     "yolo11": {
-        "name": "YOLO11x Watermark Detection",
         "repo_id": "corzent/yolo11x_watermark_detection",
         "filename": "best.pt",
-        "source": "huggingface",
         "target_dir": "YOLO11",
-        "description": "Watermark detection model",
-        "required": False,
-    },
-    "lama": {
-        "name": "LaMa Watermark Inpainting",
-        "auto_download": True,
-        "description": "Will be downloaded by simple_lama_inpainting on first use",
+        "verify": ["best.pt"],
         "required": False,
     },
 }
+MODEL_COMPLETE_MARKER = ".mineru_complete"
+RUNTIME_AUDIO_MODELS = {
+    MODELS["sensevoice"]["model_id"]: "SenseVoiceSmall",
+    MODELS["paraformer"]["model_id"]: "Paraformer",
+    "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch": "speech_fsmn_vad_zh-cn-16k-common-pytorch",
+    "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch": "punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
+    "iic/speech_campplus_sv_zh-cn_16k-common": "speech_campplus_sv_zh-cn_16k-common",
+}
+LAMA_URL = "https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt"
 
-# ==============================================================================
-# 下载函数
-# ==============================================================================
+
+def _has_files(target: Path, names: list[str]) -> bool:
+    return all((target / name).is_file() and (target / name).stat().st_size > 0 for name in names)
 
 
-def download_from_huggingface(repo_id, target_dir, filename=None):
-    """从 HuggingFace 下载"""
+def verify_mineru_snapshot(target: Path, config: dict) -> bool:
+    if not _has_files(target, config["verify"]):
+        return False
     try:
-        from huggingface_hub import snapshot_download, hf_hub_download
-
-        # 配置国内镜像
-        hf_endpoint = os.getenv("HF_ENDPOINT", "https://hf-mirror.com")
-        os.environ.setdefault("HF_ENDPOINT", hf_endpoint)
-
-        if filename:
-            logger.info(f"    Downloading file: {filename}")
-            path = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                local_dir=str(target_dir),
-                local_dir_use_symlinks=False,
-                resume_download=True,
+        record = json.loads((target / MODEL_COMPLETE_MARKER).read_text(encoding="utf-8"))
+        files = record["files"]
+        return (
+            record["version"] == 1
+            and all(name in files for name in config["verify"])
+            and all(
+                (target / name).is_file() and (target / name).stat().st_size == size for name, size in files.items()
             )
-        else:
-            logger.info(f"    Downloading repository: {repo_id}")
-            path = snapshot_download(
-                repo_id=repo_id, local_dir=str(target_dir), local_dir_use_symlinks=False, resume_download=True
-            )
-        return path
-    except Exception as e:
-        logger.error(f"    ❌ Download failed: {e}")
-        return None
-
-
-def download_from_modelscope(model_id, target_dir):
-    """从 ModelScope 下载"""
-    try:
-        from modelscope import snapshot_download
-
-        logger.info(f"    Downloading from ModelScope: {model_id}")
-        path = snapshot_download(model_id, local_dir=str(target_dir), revision="master")
-        return path
-    except Exception as e:
-        logger.error(f"    ❌ Download failed: {e}")
-        return None
-
-
-# ==============================================================================
-# 验证与辅助函数
-# ==============================================================================
-
-
-def verify_model_files(path, model_name):
-    """验证下载是否完整"""
-    path_obj = Path(path)
-    if not path_obj.exists():
+        )
+    except (OSError, ValueError, KeyError, AttributeError, TypeError):
         return False
 
-    # 1. MinerU Pipeline - 校验 MinerU 3.0 必需的子路径
-    # 参考: mineru/utils/enum_class.py ModelPath
-    if model_name == "mineru_pipeline":
-        models_dir = path_obj / "models"
-        required_subpaths = [
-            models_dir / "Layout" / "PP-DocLayoutV2",
-            models_dir / "MFR" / "unimernet_hf_small_2503",  # MinerU 3.0 新版本路径(带 _2503 后缀)
-            models_dir / "MFR" / "pp_formulanet_plus_m",  # MinerU 3.0 新增
-            models_dir / "OCR" / "paddleocr_torch",
-        ]
-        missing = [str(p) for p in required_subpaths if not p.exists()]
-        if missing:
-            logger.warning("    ⚠️  Missing MinerU 3.0 required paths:")
-            for m in missing:
-                logger.warning(f"        - {m}")
-            return False
-        return True
 
-    # 2. MinerU VLM
-    elif model_name == "mineru_vlm":
-        if not any(path_obj.rglob("*.safetensors")):
-            logger.warning(f"    ⚠️  No safetensors found in {path}")
-            return False
+def download_mineru_snapshot(config: dict, target: Path, force: bool = False) -> None:
+    from huggingface_hub import HfApi, snapshot_download
 
-    # 3. YOLO (单文件或目录)
-    elif model_name == "yolo11":
-        if path_obj.is_file():
-            if path_obj.suffix != ".pt":
-                return False
-        elif not list(path_obj.rglob("*.pt")):
-            logger.warning("    ⚠️  No .pt files found")
-            return False
+    repo_id, revision = config["repo_id"], config["revision"]
+    endpoint = os.getenv("HF_ENDPOINT") or None
+    info = HfApi(endpoint=endpoint).model_info(repo_id, revision=revision, files_metadata=True)
+    if info.sha != revision:
+        raise ValueError(f"{repo_id} 返回了非预期的提交 {info.sha}")
+    files = {item.rfilename: item.size for item in info.siblings or []}
+    if any(not isinstance(files.get(name), int) or files[name] <= 0 for name in config["verify"]):
+        raise ValueError(f"{repo_id}@{revision} 缺少必需的模型文件")
 
-    logger.info("    ✅ Model files verified")
-    return True
+    target.mkdir(parents=True, exist_ok=True)
+    # Hugging Face 会按固定快照校验已有权重，旧版 Pro 权重内容相同时可原地复用。
+    snapshot_download(repo_id, revision=revision, local_dir=target, endpoint=endpoint, force_download=force)
+    if any(not (target / name).is_file() or (target / name).stat().st_size != size for name, size in files.items()):
+        raise ValueError(f"{repo_id}@{revision} 的模型文件不完整")
+
+    # 这是 MinerU 4.2.3 本地加载目录型模型所需的上游完成标记。
+    marker = target / MODEL_COMPLETE_MARKER
+    temp = marker.with_suffix(".tmp")
+    temp.write_text(json.dumps({"version": 1, "files": files}, ensure_ascii=False) + "\n", encoding="utf-8")
+    temp.replace(marker)
 
 
-def get_directory_size(path):
-    path_obj = Path(path)
-    if not path_obj.exists():
-        return 0
-    if path_obj.is_file():
-        return path_obj.stat().st_size / (1024 * 1024)
-    return sum(f.stat().st_size for f in path_obj.rglob("*") if f.is_file()) / (1024 * 1024)
+def generate_mineru_config(output_path: Path, runtime_root: str = "/app/models") -> None:
+    path = output_path / "config.yaml"
+    config = (yaml.safe_load(path.read_text(encoding="utf-8")) or {}) if path.exists() else {}
+    model = config.setdefault("model", {})
+    model.update(source="local", base_dir=runtime_root, small_backend="torch")
+    vlm = model.setdefault("vlm", {})
+    vlm.setdefault("engine", "auto")
+    vlm.setdefault("model", "MinerU-1.2B")
+    path.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    (output_path / ".locks").mkdir(exist_ok=True)
+    logger.info(f"已生成 MinerU 配置 {path}")
 
 
-def check_model_exists(output_path, config, name):
-    target_dir = output_path / config["target_dir"]
-    if config.get("filename"):
-        f = target_dir / config["filename"]
-        return (f.exists() and f.stat().st_size > 0), "File found"
-    if not target_dir.exists():
-        return False, "Dir missing"
-    # MinerU Pipeline: 额外校验 MinerU 3.0 必需的子路径，防止旧版本目录跳过更新
-    if name == "mineru_pipeline":
-        models_dir = target_dir / "models"
-        required = [
-            models_dir / "Layout" / "PP-DocLayoutV2",
-            models_dir / "MFR" / "unimernet_hf_small_2503",
-            models_dir / "MFR" / "pp_formulanet_plus_m",
-            models_dir / "OCR" / "paddleocr_torch",
-        ]
-        missing = [p for p in required if not p.exists()]
-        if missing:
-            return False, f"Missing MinerU 3.0 paths: {[p.name for p in missing]}"
-    if any(target_dir.iterdir()):
-        return True, "Files found"
-    return False, "Dir empty"
+def reuse_models(source: Path, target: Path) -> None:
+    source = source.resolve(strict=True)
+    if not source.is_dir() or source == target.resolve():
+        raise ValueError("复用目录必须是独立的旧模型目录")
 
-
-def generate_mineru_json(output_dir):
-    """
-    生成 mineru.json (MinerU 3.0 新格式)
-    ✅ [核心修复] 将配置文件直接保存到共享的 models 目录下 (output_dir)，
-    这样该文件会持久化到宿主机 ./models/mineru.json，
-    并由 docker-entrypoint.sh 脚本分发到各容器的 ~/mineru.json。
-
-    MinerU 3.0 配置格式变更:
-    - 旧: {"models-dir": "...", "vlm-models-dir": "..."}
-    - 新: {"models-dir": {"pipeline": "...", "vlm": "..."}, "model-source": "...", "config_version": "1.3.2"}
-
-    model-source 必须显式写 "local"：缺省时 MinerU 3.4+ 会按旧版配置做原地迁移，
-    把 model-source 写成 huggingface，离线/本地模型部署下解析时会尝试联网下载而失败。
-    """
-    config_path = Path(output_dir) / "mineru.json"
-
-    # 注意：这里的 paths 是容器内的绝对路径。
-    # pipeline 必须指向仓库根（不含 models/ 后缀）：MinerU 3.4+ 的模型相对路径
-    # （如 models/MFR/unimernet_hf_small_2503）自带 models/ 前缀，指到子目录会拼出
-    # models/models/... 的双重路径。
-    config = {
-        "models-dir": {
-            "pipeline": "/app/models/PDF-Extract-Kit-1.0",
-            "vlm": "/app/models/MinerU2.5-Pro-2605-1.2B",
-        },
-        "model-source": "local",
-        "config_version": "1.3.2",
+    names = {
+        *RUNTIME_AUDIO_MODELS.values(),
+        MODELS["mineru_vlm"]["target_dir"],
+        "YOLO11",
+        "watermark_models",
+        "big-lama.pt",
+        "torch_cache",
+        "ultralytics_cfg",
+        "modelscope_cache",
+        "huggingface_cache",
     }
-    try:
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=4)
-        logger.success(f"✅ mineru.json created at: {config_path}")
-        logger.info("    -> pipeline: /app/models/PDF-Extract-Kit-1.0/models")
-        logger.info("    -> vlm:      /app/models/MinerU2.5-Pro-2605-1.2B")
-    except Exception as e:
-        logger.error(f"❌ Failed to create mineru.json: {e}")
+    for name in sorted(names):
+        old, new = source / name, target / name
+        if old.is_dir():
+            if not new.exists():
+                # 已复用的权重仍由固定快照校验，避免把旧目录的完成标记当成当前快照的凭据。
+                shutil.copytree(old, new, ignore=shutil.ignore_patterns(MODEL_COMPLETE_MARKER, ".mineru_files.json"))
+                logger.info(f"已复用模型目录 {old}")
+        elif old.is_file() and not new.exists():
+            shutil.copy2(old, new)
+            logger.info(f"已复用模型文件 {old}")
 
 
-# ==============================================================================
-# 主程序
-# ==============================================================================
+def _prepare_runtime_assets(output_path: Path) -> None:
+    from modelscope import snapshot_download
+    from modelscope_hub.errors import CacheNotFound
+
+    cache = output_path / "modelscope_cache"
+    cache.mkdir(exist_ok=True)
+    for model_id, directory in RUNTIME_AUDIO_MODELS.items():
+        target = output_path / directory
+        weights = "campplus_cn_common.bin" if model_id == "iic/speech_campplus_sv_zh-cn_16k-common" else "model.pt"
+        required = ["configuration.json", "config.yaml", weights]
+        if _has_files(target, required):
+            continue
+        try:
+            try:
+                cached = Path(snapshot_download(model_id, cache_dir=cache, local_files_only=True))
+            except CacheNotFound:
+                cached = None
+            if cached and _has_files(cached, required):
+                shutil.copytree(cached, target, dirs_exist_ok=True)
+            else:
+                snapshot_download(model_id, local_dir=str(target), revision="master")
+            if not _has_files(target, required):
+                raise ValueError(f"离线音频模型不完整：{target}")
+        except Exception as error:
+            if directory in ("SenseVoiceSmall", "speech_fsmn_vad_zh-cn-16k-common-pytorch"):
+                raise
+            logger.warning(f"准备可选的音频权重失败（{directory}）：{error}")
+
+    watermark = output_path / "watermark_models"
+    watermark.mkdir(exist_ok=True)
+    old_yolo = output_path / "YOLO11" / "best.pt"
+    yolo = watermark / "yolo11x_watermark.pt"
+    if old_yolo.is_file() and not yolo.exists():
+        shutil.copy2(old_yolo, yolo)
+
+    lama = watermark / "big-lama.pt"
+    if not lama.exists():
+        reused_lama = next(
+            (
+                path
+                for path in [output_path / "big-lama.pt", output_path / "torch_cache/hub/checkpoints/big-lama.pt"]
+                if path.is_file()
+            ),
+            None,
+        )
+        if reused_lama:
+            shutil.copy2(reused_lama, lama)
+        else:
+            partial = lama.with_suffix(".download")
+            try:
+                urlretrieve(LAMA_URL, partial)
+                if not partial.stat().st_size:
+                    raise ValueError("LaMa 下载为空")
+                partial.replace(lama)
+            except Exception as error:
+                logger.warning(f"准备可选的 LaMa 权重失败：{error}")
+            finally:
+                partial.unlink(missing_ok=True)
 
 
-def main(output_dir, selected_models=None, force=False):
-    logger.info("=" * 60)
-    logger.info("🚀 Tianshu Model Download Script (Hybrid Strategy)")
-    logger.info("=" * 60)
-
+def main(
+    output_dir: str,
+    selected_models: str | None = None,
+    force: bool = False,
+    *,
+    reuse_from: list[str] | None = None,
+    runtime_root: str = "/app/models",
+    offline: bool = False,
+) -> int:
     output_path = Path(output_dir).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
-    logger.info(f"📁 Output directory (Container/Host mapped): {output_path}")
+    for path in reuse_from or []:
+        reuse_models(Path(path), output_path)
 
-    # 本服务覆盖了 entrypoint，拿不到 docker-entrypoint.sh 的可写性预检。不先判一次的话，
-    # 每个模型都会以 ModelScope 的 SDK 目录创建失败告终，最后再撞上写 manifest 的 traceback，
-    # 真正的原因淹没在一堆 "Download failed" 里。
-    if not os.access(output_path, os.W_OK):
-        logger.error(f"❌ Output directory is not writable: {output_path}")
-        logger.error("   容器以非 root 用户 tianshu (UID 10001) 运行，需在宿主机放权：")
-        logger.error("   chmod -R a+rwX models")
-        return 1
-
-    # 筛选模型
-    models_to_download = MODELS
-    if selected_models:
-        selected_list = [m.strip() for m in selected_models.split(",")]
-        models_to_download = {k: v for k, v in MODELS.items() if k in selected_list}
-
-    manifest = {"created": datetime.now().isoformat(), "models": {}, "total_size_mb": 0}
-    total_dl, total_skip, total_fail = 0, 0, 0
-
-    for name, config in models_to_download.items():
-        logger.info(f"📦 [{name.upper()}] {config['name']}")
-
+    names = selected_models.split(",") if selected_models else [key for key in MODELS if key != "mineru_vlm_gguf"]
+    manifest = {"created": datetime.now().isoformat(), "models": {}}
+    failed = False
+    for name in names:
+        name = name.strip()
+        config = MODELS[name]
+        if offline and config.get("model_id"):
+            continue
+        target = output_path / config["target_dir"]
         try:
-            # 策略：运行时自动下载的模型直接跳过
-            if config.get("auto_download"):
-                logger.info(f"    ℹ️  {name} will be auto-downloaded by runtime engine")
-                logger.info(f"        Target: {config.get('description', 'Cache directory')}")
-                manifest["models"][name] = {"status": "auto_download"}
-                continue
+            if config.get("revision"):
+                if force or not verify_mineru_snapshot(target, config):
+                    download_mineru_snapshot(config, target, force=force)
+            elif config.get("model_id"):
+                if force or not target.is_dir() or not any(target.iterdir()):
+                    from modelscope import snapshot_download
 
-            target = output_path / config["target_dir"]
-
-            # 检查存在
-            if not force:
-                exists, reason = check_model_exists(output_path, config, name)
-                if exists:
-                    size_mb = get_directory_size(target)
-                    logger.info(f"    ✅ Already exists ({size_mb:.1f} MB)")
-                    logger.info(f"    📂 Path: {target}")
-                    manifest["models"][name] = {"status": "exists", "path": str(target), "size_mb": round(size_mb, 2)}
-                    total_skip += 1
-                    logger.info("")
-                    continue
-
-            # 下载
-            logger.info(f"    ⬇️  Downloading to {config['target_dir']}...")
-            path = None
-            src = config["source"]
-
-            if src == "huggingface":
-                path = download_from_huggingface(config["repo_id"], str(target), config.get("filename"))
-            elif src == "modelscope":
-                # 优先使用 model_id，如果没有则用 repo_id (兼容旧配置)
-                mid = config.get("model_id") or config.get("repo_id")
-                path = download_from_modelscope(mid, str(target))
-
-            # ✅ 核心优化：容错处理
-            if path and verify_model_files(path, name):
-                size_mb = get_directory_size(path)
-                manifest["models"][name] = {"status": "downloaded", "path": str(path)}
-                logger.info(f"    ✅ Success ({size_mb:.1f} MB)")
-                logger.info(f"    📂 Path: {path}")
-                total_dl += 1
-            else:
-                logger.error(f"    ❌ Validation failed for {name}")
-                if config.get("required", False):
-                    total_fail += 1
+                    snapshot_download(config["model_id"], local_dir=str(target), revision="master")
+            elif force or not _has_files(target, config["verify"]):
+                if _has_files(output_path, ["watermark_models/yolo11x_watermark.pt"]) and not force:
+                    target.mkdir(exist_ok=True)
+                    shutil.copy2(output_path / "watermark_models/yolo11x_watermark.pt", target / config["filename"])
                 else:
-                    logger.warning(f"    ⚠️ [IGNORED] Optional model {name} failed, but not required. Skipping...")
+                    from huggingface_hub import hf_hub_download
 
-        except Exception as e:
-            logger.error(f"    ❌ Error: {e}")
-            if config.get("required", False):
-                total_fail += 1
-            else:
-                logger.warning(f"    ⚠️ [IGNORED] Optional model {name} failed, but not required. Skipping...")
-        logger.info("")
+                    hf_hub_download(config["repo_id"], config["filename"], local_dir=target, force_download=force)
 
-    # 无论模型下载成功与否，都尝试生成配置文件，确保容器有配置可用
-    generate_mineru_json(output_path)
-
-    with open(output_path / "manifest.json", "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-
-    logger.info("=" * 60)
-    logger.info(f"✅ Downloaded: {total_dl} | ⏭️  Skipped: {total_skip} | ❌ Failed: {total_fail}")
-
-    # 只要必填项没有失败，脚本即以 0 状态退出，确保后续服务(如 vllm)能够启动
-    return 0 if total_fail == 0 else 1
+            manifest["models"][name] = {"status": "ready", "path": str(target)}
+            logger.info(f"模型已就绪 {target}")
+        except Exception as error:
+            failed = failed or config["required"]
+            manifest["models"][name] = {"status": "error"}
+            logger.error(f"准备模型 {name} 失败：{error}")
+    if offline and not failed:
+        _prepare_runtime_assets(output_path)
+    if not failed:
+        generate_mineru_config(output_path, runtime_root)
+    (output_path / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return int(failed)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", default="./models")
     parser.add_argument("--models")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--reuse-from", action="append", help="复用旧模型目录，可重复指定")
+    parser.add_argument("--runtime-root", default="/app/models", help="写入配置的运行时模型目录")
+    parser.add_argument("--offline", action="store_true", help="准备离线推理所需的音频缓存及水印权重")
     args = parser.parse_args()
-
-    try:
-        sys.exit(main(args.output, args.models, args.force))
-    except KeyboardInterrupt:
-        sys.exit(130)
+    sys.exit(
+        main(
+            args.output,
+            args.models,
+            args.force,
+            reuse_from=args.reuse_from,
+            runtime_root=args.runtime_root,
+            offline=args.offline,
+        )
+    )

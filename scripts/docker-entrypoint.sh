@@ -92,7 +92,7 @@ initialize_directories() {
         fi
     done
 
-    # /app/models 只读即可：mineru.json 与模型权重都只被读取。
+    # /app/models 只读即可：config.yaml 与模型权重都只被读取。
     # 只有需要在容器内下载模型时才必须可写，这里降级为提示。
     if [ ! -w /app/models ]; then
         log_info "/app/models is read-only (expected for offline deployments; models are only read)"
@@ -102,24 +102,15 @@ initialize_directories() {
 }
 
 # ============================================================================
-# Config initialization (✅ 核心修复：自动分发配置文件)
-# MinerU 3.0 配置文件从 magic-pdf.json 改名为 mineru.json
-# 默认路径: ~/mineru.json (由 MINERU_TOOLS_CONFIG_JSON 环境变量控制)
+# MinerU 直接读取挂载的配置。
 # ============================================================================
 setup_mineru_config() {
-    log_info "Setting up MinerU configuration (mineru.json)..."
-
-    # 该文件由 download_models.py 生成到共享卷 /app/models 中
-    # 目标路径随容器运行用户变化（非 root 时为 /home/tianshu）
-    CONFIG_SRC="/app/models/mineru.json"
-    CONFIG_FILENAME="${MINERU_TOOLS_CONFIG_JSON:-mineru.json}"
-    CONFIG_DEST="${HOME:-/root}/${CONFIG_FILENAME}"
-
-    if [ -f "$CONFIG_SRC" ]; then
-        cp "$CONFIG_SRC" "${CONFIG_DEST}"
-        log_success "mineru.json distributed to ${CONFIG_DEST}"
-    else
-        log_warning "$CONFIG_SRC not found. MinerU might use default internal settings."
+    local config="${MINERU_CONFIG:-/app/models/config.yaml}"
+    if [ -f "$config" ]; then
+        export MINERU_CONFIG="$config"
+        log_success "已加载 MinerU 配置路径 $MINERU_CONFIG"
+    elif [ -n "${MINERU_CONFIG:-}" ]; then
+        log_warning "MinerU 配置文件不存在：$config"
     fi
 }
 
@@ -215,7 +206,7 @@ check_gpu() {
     log_info "Checking GPU availability..."
 
     # Check PyTorch
-    python -c "import torch; print('PyTorch CUDA:', torch.cuda.is_available())" 2>&1 | while read line; do
+    python -c "import torch; print('PyTorch CUDA:', torch.cuda.is_available())" 2>&1 | while read -r line; do
         log_info "$line"
     done
 
@@ -250,7 +241,7 @@ main() {
         initialize_models
     fi
 
-    # 模型初始化完成后再分发 mineru.json（离线/外部模型卷此时已复制到 /app/models）
+    # 先完成外置模型初始化，再设置配置路径。
     setup_mineru_config
 
     check_models

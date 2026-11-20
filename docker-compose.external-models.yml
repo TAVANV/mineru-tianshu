@@ -2,6 +2,7 @@
 # docker compose -f docker-compose.yml -f docker-compose.build.yml -f docker-compose.external-models.yml up -d
 x-external-environment: &external-environment
   MODEL_PATH: /app/models
+  MINERU_CONFIG: /app/models/config.yaml
   MINERU_MODEL_SOURCE: local
   MODEL_DOWNLOAD_SOURCE: local
   HF_HUB_OFFLINE: "1"
@@ -17,13 +18,16 @@ x-external-volumes: &external-volumes
   - ${OFFLINE_MODELS_PATH:-/data/modelfiles}:/app/models:ro
   - ${OFFLINE_MODELS_PATH:-/data/modelfiles}/modelscope_cache:/app/models/modelscope_cache:rw
   - ${OFFLINE_MODELS_PATH:-/data/modelfiles}/huggingface_cache:/app/models/huggingface_cache:rw
+  - ${OFFLINE_MODELS_PATH:-/data/modelfiles}/.locks:/app/models/.locks:rw
   - ${OFFLINE_MODELS_PATH:-/data/modelfiles}/ultralytics_cfg:/app/models/ultralytics_cfg:rw
 
 services:
   init-models:
     image: tianshu-backend:latest
     entrypoint: ["python", "check_external_models.py", "/app/models"]
-    environment: *external-environment
+    environment:
+      <<: *external-environment
+      MINERU_VLM_MODEL_DIR: ${MINERU_VLM_MODEL_DIR:-}
     volumes: *external-volumes
   backend:
     environment: *external-environment

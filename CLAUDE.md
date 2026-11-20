@@ -117,7 +117,7 @@ degrades that one backend instead of killing the worker. Preserve that pattern w
 
 `vllm-mineru` is `profiles: ["manual"]` + `restart: no`, so it never starts with `up`.
 `VLLMController.ensure_running()` **cold-starts it** over the mounted Docker socket when a task's
-backend is in `LOCAL_VLLM_BACKENDS` and the caller supplied no `server_url` of its own. A missing
+backend starts with `vlm-` or `hybrid-` and the caller supplied no `server_url` of its own. A missing
 container (or unreachable Docker) means vLLM is externally managed and is left alone. Readiness is
 not its job — `mineru_pipeline/engine.py::_wait_for_server` polls `/v1/models` for that.
 

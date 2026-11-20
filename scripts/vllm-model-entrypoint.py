@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
-"""Resolve the offline VLM selection before starting the existing vLLM server."""
+"""在外置模型目录中选择本机 vLLM 要加载的权重。"""
 
-import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
+
+import yaml
 
 
 def selected_model(root=Path("/models"), explicit=None):
     root = Path(root)
-    if explicit:
-        return root / explicit
-    config = root / "mineru.json"
-    if config.exists():
-        configured = json.loads(config.read_text()).get("models-dir", {}).get("vlm")
-        if configured:
-            path = Path(configured)
-            if path.is_relative_to("/app/models"):
-                return root / path.relative_to("/app/models")
-            if path.is_relative_to(root):
-                return path
-            raise ValueError("VLM path is not mounted in this container; set MINERU_VLM_MODEL_DIR explicitly")
-    return root / "MinerU2.5-2509-1.2B"
+    path = root / "config.yaml"
+    config = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    configured = (
+        explicit or config.get("tianshu", {}).get("vllm_model_dir") or "MinerU2.5-Pro-2605-1.2B"
+    )
+    model = Path(configured)
+    if model.is_relative_to("/app/models"):
+        model = model.relative_to("/app/models")
+    model = (root / model).resolve()
+    if not model.is_relative_to(root.resolve()):
+        raise ValueError("VLM 模型路径必须位于挂载目录内")
+    return model
 
 
 if __name__ == "__main__":
     model = selected_model(explicit=os.getenv("MINERU_VLM_MODEL_DIR"))
     if not model.is_dir():
-        raise SystemExit(f"Offline VLM directory is missing: {model}. Prepare the selected model first.")
+        raise SystemExit(f"找不到外置 VLM 模型目录：{model}")
     os.execv(
         sys.executable,
         [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--model", str(model), *sys.argv[1:]],

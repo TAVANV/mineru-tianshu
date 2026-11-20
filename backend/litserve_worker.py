@@ -130,7 +130,7 @@ try:
 except ImportError:
     logger.info("ℹ️  MarkItDown not available (optional)")
 
-MINERU_PIPELINE_AVAILABLE = check_dependency("mineru_pipeline", "MinerU Pipeline")
+MINERU_PIPELINE_AVAILABLE = check_dependency("mineru", "MinerU")
 SENSEVOICE_AVAILABLE = check_dependency("audio_engines", "SenseVoice")
 VIDEO_ENGINE_AVAILABLE = check_dependency("video_engines", "Video Engine")
 WATERMARK_REMOVAL_AVAILABLE = check_dependency("remove_watermark", "Watermark Removal")
@@ -163,10 +163,6 @@ except ImportError as e:
 # compose 中 vllm-mineru 是 profiles: ["manual"] + restart: no，不随 up 启动，
 # 由 worker 在确认某个任务要用本地 vLLM 时冷启动。
 VLLM_MINERU_CONTAINER = "tianshu-vllm-mineru"
-
-# 会落到本地 vLLM 的 backend：*-auto-engine 由 mineru_pipeline/engine.py 改写成
-# *-http-client，*-http-client 则直接用 mineru_vllm_api —— 两者都要求容器在运行。
-LOCAL_VLLM_BACKENDS = frozenset({"vlm-auto-engine", "hybrid-auto-engine", "vlm-http-client", "hybrid-http-client"})
 
 # 表格文件统一走 MarkItDown（pandas 读表，.xlsx 用 openpyxl、.xls 用 xlrd，无需先转格式）。
 # 不走 MinerU 原生 XLSX 解析：它对每个 sheet 按 3 档间隔容忍度各做一遍全量表格检测，
@@ -372,19 +368,17 @@ class MinerUWorkerAPI(ls.LitAPI):
 
         # 配置模型源
         model_source = os.getenv("MODEL_DOWNLOAD_SOURCE", "auto").lower()
-        if model_source in ["modelscope", "auto"]:
-            try:
-                importlib.util.find_spec("modelscope")
+        if model_source == "modelscope" and not os.getenv("MINERU_MODEL_SOURCE"):
+            if importlib.util.find_spec("modelscope"):
                 os.environ["MINERU_MODEL_SOURCE"] = "modelscope"
-            except ImportError:
-                if model_source == "modelscope":
-                    logger.warning("⚠️  ModelScope not available, falling back to HuggingFace")
+            else:
+                logger.warning("ModelScope 不可用，将使用 MinerU 配置的模型源")
 
         if model_source == "huggingface":
-            hf_endpoint = os.getenv("HF_ENDPOINT", "https://hf-mirror.com")
-            os.environ.setdefault("HF_ENDPOINT", hf_endpoint)
+            os.environ.setdefault("MINERU_MODEL_SOURCE", "huggingface")
+            os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
-        # CPU 线程上限：必须在下方首次导入 torch（mineru.utils.model_utils）之前设置环境变量
+        # CPU 线程上限需在首次导入 torch 之前设置。
         configure_cpu_threads()
 
         # 设备配置
@@ -437,9 +431,6 @@ class MinerUWorkerAPI(ls.LitAPI):
 
     def _setup_engines(self):
         cpu_threads = configure_cpu_threads()
-        # MinerU VRAM 设置
-        from mineru.utils.model_utils import get_vram
-
         apply_cpu_threads_to_libs(cpu_threads)
         ort_providers = configure_onnxruntime_sessions(cpu_threads, use_cuda=self.accelerator == "cuda")
         logger.info(
@@ -451,7 +442,9 @@ class MinerUWorkerAPI(ls.LitAPI):
         if os.getenv("MINERU_VIRTUAL_VRAM_SIZE", None) is None:
             if self.accelerator == "cuda":
                 try:
-                    vram = round(get_vram("cuda:0"))
+                    import torch
+
+                    vram = round(torch.cuda.get_device_properties(0).total_memory / (1024**3))
                     os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = str(vram)
                 except Exception:
                     os.environ["MINERU_VIRTUAL_VRAM_SIZE"] = "8"
@@ -585,7 +578,7 @@ class MinerUWorkerAPI(ls.LitAPI):
 
             # 1. 冷启动本地 vLLM 容器；调用方自带 server_url 时指向的是外部服务，不插手
             if (
-                backend in LOCAL_VLLM_BACKENDS
+                backend.startswith(("vlm-", "hybrid-"))
                 and not route_spreadsheet
                 and self.mineru_vllm_api
                 and not options.get("server_url")
@@ -765,21 +758,13 @@ class MinerUWorkerAPI(ls.LitAPI):
         output_dir = Path(output_dir)
         source_file = Path(file_path)
 
-        # 1. 如果源文件不是 PDF (可能是图片)，尝试找转换后的 PDF
+        # 旧产物可带布局 PDF，4.2.3 直接预览原始 PDF 或由图片转换出的 PDF。
+        preview = next(output_dir.glob("*_origin.pdf"), None) or next(output_dir.glob("*_layout.pdf"), None)
+        if preview:
+            return preview.name
         if source_file.suffix.lower() != ".pdf":
-            # 检查是否有 layout.pdf
-            layout_pdfs = list(output_dir.glob("*_layout.pdf"))
-            if layout_pdfs:
-                return layout_pdfs[0].name
             return None
 
-        # 2. 如果源文件是 PDF
-        # 优先查找 MinerU 生成的带布局信息的 PDF
-        layout_pdfs = list(output_dir.glob("*_layout.pdf"))
-        if layout_pdfs:
-            return layout_pdfs[0].name
-
-        # 3. 如果没有布局 PDF，则复制源 PDF 到输出目录
         target_name = preferred_name or source_file.name
         target_path = output_dir / target_name
 
@@ -1132,6 +1117,12 @@ class MinerUWorkerAPI(ls.LitAPI):
         from utils.pdf_utils import get_pdf_page_count, split_pdf_file
 
         if os.getenv("PDF_SPLIT_ENABLED", "true").lower() != "true":
+            return False
+
+        # 显式页范围相对于源 PDF，不能原样传给每个分片。
+        from mineru_pipeline.engine import _page_range
+
+        if _page_range(options):
             return False
 
         threshold = int(os.getenv("PDF_SPLIT_THRESHOLD_PAGES", "40"))
@@ -1547,7 +1538,7 @@ if __name__ == "__main__":
     parser.add_argument("--devices", type=str, default="auto")
     parser.add_argument("--poll-interval", type=float, default=0.5)
     parser.add_argument("--disable-worker-loop", action="store_true")
-    parser.add_argument("--mineru-vllm-api-list", type=parse_list_arg, default=[])
+    parser.add_argument("--mineru-vllm-api-list", type=parse_list_arg, default=os.getenv("MINERU_VLLM_API_LIST", "[]"))
     args = parser.parse_args()
 
     # Env Var Fallbacks
