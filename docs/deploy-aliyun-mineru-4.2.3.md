@@ -245,3 +245,17 @@ docker compose --project-name tianshu --project-directory /root/tianshu \
 ```
 
 回滚编排从受限备份中恢复原 `.env`、配置与脚本，使用升级前的数据与原 RustFS 卷。原模型、兼容包和镜像 `:3` 保留到新版本验收结束，禁止在此阶段执行镜像清理或带卷删除。通常保留原 RustFS 卷及新增对象即可，不直接覆盖对象卷；对象卷损坏时使用经过校验的独立快照另行恢复。回滚完成后再次验收旧账号、API Key、历史结果和图片，并核对恢复后的默认 `docker compose config` 指向原部署。
+
+## 本次发布验收记录（2026-11-20）
+
+最终使用后端 `:6`、前端 `:4`、MinerU `4.2.3`，本机 vLLM 加载 Pro VLM。模型权重保持外置，Worker 保持四并发。
+
+- 24 类真实任务通过：Pipeline、VLM、Hybrid、Word/Excel/PPT、图片、文本、HTML、CSV、FASTA、GenBank、加密 PDF、页范围、PDF/ZIP 父子任务、普通音频、说话人模式、视频关键帧及去水印等。
+- 正式镜像内完整 Linux 回归 `294 passed`；真实关键帧文字、四个不同 Worker 执行时间重叠、YOLO/LaMa 断网 CUDA 推理均有独立记录。
+- 新图片上传、公开下载与本地 SHA256 对照、历史图片访问、MCP 握手/文件解析/状态查询通过。
+- 175 项声明环境变量与实际容器一致；七个运行服务健康，`init-models` 只做离线校验并以 `0` 退出。
+- 账号/API Key 关键字段与业务任务保留；本次测试记录、测试对象和临时文件已清理。
+
+本次修复了视频音频结果缺少 `source`、媒体及 YOLO/LaMa 依赖遗漏、格式引擎误读 `content` 字段，以及一项依赖 CPU 版 ONNX 环境的测试假设。LaMa 使用镜像内的离线 TorchScript 适配器，避免旧第三方包对 Pillow 的版本限制。
+
+模板与文档只保留通用地址示例。实际地址、密钥和包含真实地址的运行报告只保存在服务器；旧 Git 提交历史未在本次操作中改写。
