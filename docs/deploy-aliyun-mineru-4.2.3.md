@@ -1,12 +1,12 @@
 # 阿里云镜像升级到 MinerU 4.2.3
 
-本文用于在目标服务器的 `/root/tianshu` 原位升级。本次后端镜像标签为 `5`，前端为 `4`，后端内安装的 MinerU SDK 版本为 `4.2.3`。本文提供配置与执行步骤；是否已上线，以 Actions 产物、实际运行镜像和端到端验收记录为准。
+本文用于在目标服务器的 `/root/tianshu` 原位升级。本次后端镜像标签为 `6`，前端为 `4`，后端内安装的 MinerU SDK 版本为 `4.2.3`。本文提供配置与执行步骤；是否已上线，以 Actions 产物、实际运行镜像和端到端验收记录为准。
 
 软件版本与模型发布名分别管理：新版 SDK 是 `4.2.3`，小模型目录为 `MinerU-4_models_torch`，VLM 使用 `MinerU2.5-Pro-2605-1.2B`。VLM 名称中的 `2.5` 不代表仍在运行旧 SDK；旧 `2509` 权重保留用于兼容与回滚，新配置默认选择 Pro。
 
 ## 1. 发布与部署组合
 
-发布前先把经过检查的修改推送到 `deploy/mineru-4.2.3`。现有 main 分支未包含本次修改，应在 Actions 中选择该升级分支，本次后端发布 `5`，前端代码没有变化，继续使用已发布的 `4`；后续构建填写未占用的整数或留空自动分配。也可在有仓库权限的联网终端执行：
+发布前先把经过检查的修改推送到 `deploy/mineru-4.2.3`。现有 main 分支未包含本次修改，应在 Actions 中选择该升级分支，本次后端发布 `6`，前端代码没有变化，继续使用已发布的 `4`；后续构建填写未占用的整数或留空自动分配。也可在有仓库权限的联网终端执行：
 
 ```bash
 gh workflow run aliyun-backend.yml --ref deploy/mineru-4.2.3
@@ -44,7 +44,7 @@ dc() {
 | --- | --- |
 | `COMPOSE_FILE` | `docker-compose.yml:docker-compose.external-models.yml:docker-compose.vllm.yml:docker-compose.registry.yml`，Linux 服务器使用冒号分隔 |
 | `SERVER_HOST` | `your-server.example.com` 占位符，仅在本地配置真实地址 |
-| `TIANSHU_BACKEND_IMAGE` / `TIANSHU_FRONTEND_IMAGE` | `registry.cn-chengdu.aliyuncs.com/tavan-ai/tianshu-backend:5` / `tianshu-frontend:4` |
+| `TIANSHU_BACKEND_IMAGE` / `TIANSHU_FRONTEND_IMAGE` | `registry.cn-chengdu.aliyuncs.com/tavan-ai/tianshu-backend:6` / `tianshu-frontend:4` |
 | `VLLM_IMAGE` | `vllm/vllm-openai:v0.31.0-cu129`，可由变量覆盖 |
 | `RUSTFS_IMAGE` | 保留现场 `rustfs/rustfs@sha256:0725587f6fcca83c1898f321424327d6e6da5e01ea20382905dd258ed5af3be4` |
 | `OFFLINE_MODELS_PATH` | `/root/tianshu/models-offline-4.2.3` |
@@ -165,7 +165,7 @@ dc run --rm --no-deps --entrypoint python backend -c \
   'from importlib.metadata import version; assert version("mineru") == "4.2.3"; print("MinerU", version("mineru"))'
 ```
 
-默认 `docker compose config` 必须与显式四文件 `dc config` 相同；`cmp` 成功后再继续，确保后续直接执行 `docker compose up -d` 使用本次完整配置。`config --images` 应显示阿里云后端 `:5`、前端 `:4`、固定 RustFS 摘要和 cu129 vLLM，不应包含旧 GHCR 镜像。完整 `config` 会含密钥，上述两个 JSON 文件仅保存在受限备份目录：不得出现应用源码挂载、运行时补包挂载或旧音频兼容挂载；应保留 Docker socket、MCP 配置和 vLLM 模型选择脚本挂载。确认 RustFS 原命名卷存在，`9000` 仍对外开放。
+默认 `docker compose config` 必须与显式四文件 `dc config` 相同；`cmp` 成功后再继续，确保后续直接执行 `docker compose up -d` 使用本次完整配置。`config --images` 应显示阿里云后端 `:6`、前端 `:4`、固定 RustFS 摘要和 cu129 vLLM，不应包含旧 GHCR 镜像。完整 `config` 会含密钥，上述两个 JSON 文件仅保存在受限备份目录：不得出现应用源码挂载、运行时补包挂载或旧音频兼容挂载；应保留 Docker socket、MCP 配置和 vLLM 模型选择脚本挂载。确认 RustFS 原命名卷存在，`9000` 仍对外开放。
 
 预检成功后，停止旧容器，使 SQLite、结果与 RustFS 备份相互一致。下面的备份使用已拉取的后端镜像执行 `tar`，不会启动应用或加载 GPU：
 

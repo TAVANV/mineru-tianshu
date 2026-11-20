@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -344,3 +345,31 @@ def test_pdf_with_requested_range_is_not_split(monkeypatch, tmp_path):
     worker = worker_module.MinerUWorkerAPI.__new__(worker_module.MinerUWorkerAPI)
     monkeypatch.setenv("PDF_SPLIT_ENABLED", "true")
     assert not worker._should_split_pdf("task", str(tmp_path / "source.pdf"), {}, {"start_page": 4})
+
+
+@pytest.mark.parametrize(
+    ("engine_name", "suffix"), [(None, ".fasta"), ("fasta", ".fasta"), (None, ".gb"), ("genbank", ".gb")]
+)
+def test_format_engine_markdown_contract_is_saved_and_returned(monkeypatch, mocker, tmp_path, engine_name, suffix):
+    worker_module = load_worker_module(monkeypatch)
+    worker = make_worker(worker_module, mocker)
+    worker.output_dir = str(tmp_path / "output")
+    source = tmp_path / f"sequence{suffix}"
+    source.write_text(">sequence\nATGCGT\n", encoding="utf-8")
+    markdown = "# Sequence validation\n\nATGCGT"
+    structured = {"format": engine_name or "sequence", "records": [{"id": "sequence", "length": 6}]}
+    engine = mocker.Mock()
+    engine.parse.return_value = {"markdown": markdown, "json_content": structured}
+    monkeypatch.setattr(
+        worker_module,
+        "FormatEngineRegistry",
+        types.SimpleNamespace(get_engine=lambda name: engine, get_engine_by_extension=lambda path: engine),
+    )
+
+    result = worker._process_with_format_engine(str(source), {"use_rustfs": False}, engine_name=engine_name)
+
+    assert result["content"] == markdown
+    assert result["json_content"] == structured
+    output = Path(result["result_path"])
+    assert (output / "result.md").read_text(encoding="utf-8") == markdown
+    assert json.loads((output / "result.json").read_text(encoding="utf-8")) == structured

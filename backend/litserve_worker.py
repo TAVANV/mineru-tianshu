@@ -931,7 +931,7 @@ class MinerUWorkerAPI(ls.LitAPI):
         )
 
         normalize_output(output_dir, use_rustfs=(options or {}).get("use_rustfs"))
-        return {"result_path": str(output_dir), "content": result["content"], "json_content": result["json_content"]}
+        return {"result_path": str(output_dir), "content": result["markdown"], "json_content": result["json_content"]}
 
     # -------------------------------------------------------------------------
     # Utilities

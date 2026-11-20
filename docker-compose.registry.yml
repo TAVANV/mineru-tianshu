@@ -5,7 +5,7 @@
 # 需要 Docker Compose >= 2.24.4（!override）；目标服务器使用 2.40.3。
 # 将 .env.registry.example 的非敏感设置逐项合并到原 .env，COMPOSE_FILE 支持直接 docker compose up。
 
-x-registry-backend-image: &registry-backend-image ${TIANSHU_BACKEND_IMAGE:-registry.cn-chengdu.aliyuncs.com/tavan-ai/tianshu-backend:5}
+x-registry-backend-image: &registry-backend-image ${TIANSHU_BACKEND_IMAGE:-registry.cn-chengdu.aliyuncs.com/tavan-ai/tianshu-backend:6}
 
 x-registry-environment: &registry-environment
   MINERU_CONFIG: /app/models/config.yaml
