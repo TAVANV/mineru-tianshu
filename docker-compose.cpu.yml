@@ -150,6 +150,7 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
 
       # Redis 队列配置（可选）
+      - FAIR_SCHEDULING_ENABLED=${FAIR_SCHEDULING_ENABLED:-true}
       - REDIS_QUEUE_ENABLED=${REDIS_QUEUE_ENABLED:-false}
       - REDIS_HOST=${REDIS_HOST:-redis}
       - REDIS_PORT=${REDIS_PORT:-6379}
@@ -229,6 +230,8 @@ services:
       - DATABASE_PATH=${DATABASE_PATH:-/app/data/db/mineru_tianshu.db}
 
       # Worker 配置（CPU 模式降低批次大小和延长超时）
+      - MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-1}
+      - MINERU_VIRTUAL_VRAM_SIZE=${MINERU_VIRTUAL_VRAM_SIZE:-1}
       - MAX_BATCH_SIZE=${MAX_BATCH_SIZE:-1}
       - TIMEOUT=${WORKER_TIMEOUT:-600}
       - TASK_EXECUTION_POLL_INTERVAL=${TASK_EXECUTION_POLL_INTERVAL:-0.25}
@@ -241,6 +244,7 @@ services:
       - MODEL_DOWNLOAD_SOURCE=${MODEL_DOWNLOAD_SOURCE:-local}
       - MINERU_CONFIG=/app/models/config.yaml
       - MINERU_MODEL_SOURCE=${MINERU_MODEL_SOURCE:-local}
+      - "MINERU_VLLM_API_LIST=${MINERU_VLLM_API_LIST:-[]}"
       # 模型缓存显式指向宿主机挂载目录（与运行用户/HOME 无关），容器重建后无需重新下载
       - HF_HOME=/app/models/huggingface_cache
       - MODELSCOPE_CACHE=/app/models/modelscope_cache
@@ -267,6 +271,7 @@ services:
       - RUSTFS_PUBLIC_URL=${RUSTFS_PUBLIC_URL:-http://127.0.0.1:9000}
 
       # Redis 队列配置（可选）
+      - FAIR_SCHEDULING_ENABLED=${FAIR_SCHEDULING_ENABLED:-true}
       - REDIS_QUEUE_ENABLED=${REDIS_QUEUE_ENABLED:-false}
       - REDIS_HOST=${REDIS_HOST:-redis}
       - REDIS_PORT=${REDIS_PORT:-6379}

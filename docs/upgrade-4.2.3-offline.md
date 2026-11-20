@@ -52,6 +52,8 @@ bash setup.sh --mode offline-deploy --yes
 
 复制后的 `.env` 沿用旧 `JWT_SECRET_KEY`、`RUSTFS_*` 和 `DATABASE_PATH` 值。自定义挂载的 SQLite 或输出目录也要复制到新部署的对应位置，确保旧实例与新实例使用独立的目录。升级与回滚都使用 `docker compose down`，以保留 RustFS 和 Redis 命名卷。
 
+`FAIR_SCHEDULING_ENABLED` 默认为 `true`，开启后即使配置了 Redis 队列，Worker 也只从 SQLite 领取任务，单用户的任务顺序和可用并发数与升级前一致。
+
 部署脚本会先校验离线包，再加载镜像并检查 GPU。脚本会创建 vLLM 容器，Worker 会在收到 vLLM 或 hybrid 解析任务时启动容器。
 
 ## 4. 验收

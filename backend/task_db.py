@@ -4,11 +4,9 @@ MinerU Tianshu - SQLite Task Database Manager
 
 负责任务的持久化存储、状态管理和原子性操作
 
-架构说明 (Hybrid Queue):
-    - SQLite: 任务元数据存储、历史记录、结果管理
-    - Redis (可选): 高性能任务队列、优先级调度
-    - 当 Redis 可用时，队列操作由 Redis 处理
-    - 当 Redis 不可用时，自动回退到 SQLite
+架构说明:
+    - SQLite 存储任务、历史记录和结果，默认按用户公平调度
+    - 关闭公平调度后优先使用可选的 Redis 优先级队列，SQLite 兜底
 
 更新日志:
     - [新增] data 字段支持，用于存储 json_content 和 pdf_path 等扩展元数据
@@ -21,6 +19,7 @@ import uuid
 import shutil
 import os
 from contextlib import contextmanager
+from time import monotonic
 from typing import Optional, List, Dict
 from pathlib import Path
 from loguru import logger
@@ -29,7 +28,7 @@ from utils import assert_local_filesystem
 
 # 导入 Redis 队列（可选）
 try:
-    from redis_queue import get_redis_queue
+    from redis_queue import discard_redis_queue_memberships, get_redis_queue
 
     REDIS_QUEUE_AVAILABLE = True
 except ImportError:
@@ -84,6 +83,9 @@ class TaskDB:
         self.db_path = str(Path(db_path).resolve())
         self._execution = None
         self._execution_locks = {}
+        self._fair_scheduling_enabled = os.getenv("FAIR_SCHEDULING_ENABLED", "true").lower() == "true"
+        self._next_redis_cleanup_at = 0.0
+        self._redis_backlog_synced = False
 
         # WAL 依赖 POSIX 文件锁，NFS/CIFS 上会静默损坏数据库，启动时直接拦截
         assert_local_filesystem(self.db_path)
@@ -249,6 +251,8 @@ class TaskDB:
                 cursor.execute("ALTER TABLE tasks ADD COLUMN user_id TEXT")
                 logger.info("✅ user_id field added")
 
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_status_user ON tasks(status, user_id)")
+
             # 迁移：添加 data 字段（如果不存在）- 用于存储 pdf_path, json_content 等
             try:
                 cursor.execute("SELECT data FROM tasks LIMIT 1")
@@ -315,7 +319,7 @@ class TaskDB:
 
     def _enqueue_to_redis(self, task_id: str, priority: int, task_data: dict = None) -> bool:
         """将任务加入 Redis 队列"""
-        if not REDIS_QUEUE_AVAILABLE:
+        if self._fair_scheduling_enabled or not REDIS_QUEUE_AVAILABLE:
             return False
 
         redis_queue = get_redis_queue()
@@ -340,6 +344,10 @@ class TaskDB:
         只补差集，不整体重入：enqueue 的 score 含时间戳，重复 ZADD 会刷新 score，
         把同优先级下的 FIFO 顺序打乱。
         """
+        if self._fair_scheduling_enabled:
+            self._discard_legacy_redis_queue()
+            return 0
+
         if not REDIS_QUEUE_AVAILABLE:
             return 0
 
@@ -353,7 +361,11 @@ class TaskDB:
             return 0
 
         with self.get_cursor() as cursor:
-            cursor.execute("SELECT task_id, priority, file_name, backend FROM tasks WHERE status = 'pending'")
+            cursor.execute("""
+                SELECT task_id, priority, file_name, backend,
+                       CAST(strftime('%s', created_at) AS INTEGER) AS created_timestamp
+                FROM tasks WHERE status = 'pending'
+            """)
             pending = cursor.fetchall()
 
         missing = [row for row in pending if row["task_id"] not in queued]
@@ -361,14 +373,29 @@ class TaskDB:
         # pending 的任务不可能同时还被某个 worker 持有，清掉 processing 里的残留
         redis_queue.prune_processing([row["task_id"] for row in pending])
 
+        synced = 0
         for row in missing:
-            self._enqueue_to_redis(
-                row["task_id"], row["priority"], {"file_name": row["file_name"], "backend": row["backend"]}
-            )
+            if not redis_queue.enqueue(
+                row["task_id"],
+                row["priority"],
+                {"file_name": row["file_name"], "backend": row["backend"]},
+                queued_at=row["created_timestamp"],
+                only_if_missing=True,
+            ):
+                break
+            synced += 1
 
-        if missing:
-            logger.warning(f"🔄 Re-enqueued {len(missing)} pending task(s) missing from the Redis queue")
-        return len(missing)
+        self._redis_backlog_synced = synced == len(missing)
+        if synced:
+            logger.info(f"🔄 已向 Redis 补入 {synced} 个待处理任务")
+        return synced
+
+    def _discard_legacy_redis_queue(self):
+        if REDIS_QUEUE_AVAILABLE and monotonic() >= self._next_redis_cleanup_at:
+            if discard_redis_queue_memberships():
+                self._next_redis_cleanup_at = float("inf")
+            else:
+                self._next_redis_cleanup_at = monotonic() + 60
 
     def get_next_task(self, worker_id: str, max_retries: int = 3, with_execution_lock: bool = False) -> Optional[Dict]:
         """
@@ -376,12 +403,21 @@ class TaskDB:
         """
         from loguru import logger
 
-        # 尝试使用 Redis 队列（如果可用）
-        task = self._get_next_task_redis(worker_id, with_execution_lock)
-        if task is not None:
-            return task
+        # Redis 的固定分数无法跟随各用户在 SQLite 事务内变化的占用量。
+        if self._fair_scheduling_enabled:
+            self._discard_legacy_redis_queue()
+        else:
+            # 回退后可能已有仅在 SQLite 排队的任务，补齐后才能按优先级出队。
+            if not self._redis_backlog_synced:
+                try:
+                    self.sync_pending_to_redis()
+                except sqlite3.Error as e:
+                    logger.warning(f"同步 Redis 队列前读取 SQLite 失败: {e}")
+            if self._redis_backlog_synced:
+                task = self._get_next_task_redis(worker_id, with_execution_lock)
+                if task is not None:
+                    return task
 
-        # Redis 不可用或出错，回退到 SQLite
         for attempt in range(max_retries):
             locked_task_id = None
             try:
@@ -389,12 +425,27 @@ class TaskDB:
                     # 使用事务确保原子性
                     cursor.execute("BEGIN IMMEDIATE")
 
-                    # 按优先级和创建时间获取任务
-                    cursor.execute("""
-                        SELECT task_id FROM tasks
-                        WHERE status = 'pending'
-                        ORDER BY priority DESC, created_at ASC
-                    """)
+                    if self._fair_scheduling_enabled:
+                        cursor.execute("""
+                            SELECT pending.task_id FROM tasks AS pending
+                            LEFT JOIN (
+                                SELECT user_id, COUNT(*) AS active_count
+                                FROM tasks
+                                WHERE status = 'processing'
+                                AND NOT (COALESCE(is_parent, 0) = 1 AND COALESCE(child_count, 0) > 0
+                                         AND execution_id IS NULL)
+                                GROUP BY user_id
+                            ) AS active ON pending.user_id IS active.user_id
+                            WHERE pending.status = 'pending'
+                            ORDER BY pending.priority DESC, COALESCE(active.active_count, 0) ASC,
+                                     pending.created_at ASC
+                        """)
+                    else:
+                        cursor.execute("""
+                            SELECT task_id FROM tasks
+                            WHERE status = 'pending'
+                            ORDER BY priority DESC, created_at ASC
+                        """)
 
                     task = next(
                         (
@@ -631,7 +682,7 @@ class TaskDB:
 
     def _notify_redis_task_done(self, task_id: str, worker_id: str, status: str):
         """通知 Redis 任务已完成/失败"""
-        if not REDIS_QUEUE_AVAILABLE:
+        if self._fair_scheduling_enabled or not REDIS_QUEUE_AVAILABLE:
             return
 
         redis_queue = get_redis_queue()
@@ -1387,7 +1438,7 @@ class TaskDB:
         不入队也不会丢任务（SQLite 抢锁路径兜底），但那样就绕开了 Redis，
         正是我们要避免的锁竞争路径。在事务提交后调用。
         """
-        if not REDIS_QUEUE_AVAILABLE:
+        if self._fair_scheduling_enabled or not REDIS_QUEUE_AVAILABLE:
             return
         with self.get_cursor() as cursor:
             cursor.execute("SELECT task_id, priority, file_name, backend FROM tasks WHERE task_id = ?", (task_id,))
