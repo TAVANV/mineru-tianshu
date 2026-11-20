@@ -18,6 +18,8 @@ x-registry-environment: &registry-environment
   MODELSCOPE_CACHE: /app/models/modelscope_cache
   TORCH_HOME: /app/models/torch_cache
   YOLO_CONFIG_DIR: /app/models/ultralytics_cfg
+  YOLO_OFFLINE: "true"
+  YOLO_AUTOINSTALL: "false"
 
 x-registry-model-volumes: &registry-model-volumes
   - ${OFFLINE_MODELS_PATH:-/root/tianshu/models-offline-4.2.3}:/app/models:ro

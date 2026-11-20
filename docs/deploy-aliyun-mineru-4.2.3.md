@@ -85,7 +85,7 @@ MCP 的 Host/Origin 白名单显式传入容器，避免远程客户端访问服
 
 保留旧的 `models/`、`models-offline/` 及其缓存和模型；新模型目录应使用独立的普通文件副本，避免修改硬链接影响旧权重。模型准备可参考 [完整离线升级文档](upgrade-4.2.3-offline.md)。部署时 `init-models` 仅校验外置权重，不负责下载。
 
-新配置固定 `MINERU_CONFIG=/app/models/config.yaml`，并启用 `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1`、`MODELSCOPE_OFFLINE=1`。整个模型根只读，上述五类缓存与锁目录按目标路径覆盖为可写；HF 与 ModelScope 自身的锁也位于各自可写缓存目录中。
+新配置固定 `MINERU_CONFIG=/app/models/config.yaml`，并启用 `HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1`、`MODELSCOPE_OFFLINE=1`；同时设置 `YOLO_OFFLINE=true`、`YOLO_AUTOINSTALL=false`，关闭 YOLO 的在线探测和自动安装依赖。整个模型根只读，上述五类缓存与锁目录按目标路径覆盖为可写；HF 与 ModelScope 自身的锁也位于各自可写缓存目录中。
 
 升级后的应用镜像包含正式媒体依赖和本地音频加载支持。旧的 `PYTHONPATH`、`runtime-packages`、`video_engine.py`、`/app/backend/iic` 兼容挂载和 `MINERU_TOOLS_CONFIG_JSON` 不再加入新编排；完成备份后可从 `.env` 清理旧音频配置和仅供运行时补包使用的 `PYTHONPATH` 等无效变量。旧文件先保留，供旧实例回滚使用。Worker 的 `WORKER_GPUS`、`MAX_BATCH_SIZE` 和前端的无效运行时 `VITE_API_BASE_URL` 使用普通 `null` 显式取消继承值，按 Docker 的 unset 语义不传入容器。Scheduler 显式使用 `/app/data/output` 和 `/app/data/uploads`，与原目录挂载一致。
 
