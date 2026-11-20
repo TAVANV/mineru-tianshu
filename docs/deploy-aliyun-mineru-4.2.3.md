@@ -179,7 +179,7 @@ done
 sha256sum "$backup_dir/"*.tgz > "$backup_dir/SHA256SUMS"
 sha256sum -c "$backup_dir/SHA256SUMS"
 
-dc --profile manual create --no-deps --no-build --pull never vllm-mineru
+dc --profile manual create --no-build --pull never vllm-mineru
 dc up -d --no-build --pull never
 dc --profile manual ps -a
 ```
@@ -232,7 +232,7 @@ if [ -f "$backup_dir/config/vllm-model-entrypoint.py" ]; then
 fi
 docker compose --project-name tianshu --project-directory /root/tianshu \
   -f "$backup_dir/compose.previous.yml" --profile manual \
-  create --no-deps --no-build --pull never vllm-mineru
+  create --no-build --pull never vllm-mineru
 docker compose --project-name tianshu --project-directory /root/tianshu \
   -f "$backup_dir/compose.previous.yml" up -d --no-build --pull never
 ```
