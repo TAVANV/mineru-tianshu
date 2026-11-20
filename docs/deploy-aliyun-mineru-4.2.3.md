@@ -6,12 +6,12 @@
 
 ## 1. 发布与部署组合
 
-发布前先把经过检查的修改推送到 `deploy/mineru-4.2.3`。现有 main 分支未包含本次修改，应在 Actions 中选择该升级分支，本次后端发布 `6`，前端代码没有变化，继续使用已发布的 `4`；后续构建填写未占用的整数或留空自动分配。也可在有仓库权限的联网终端执行：
+本次修改最初在 `deploy/mineru-4.2.3` 分支发布，现已合并到 main，后续构建在 Actions 中选择 main 即可。本次后端发布 `6`，前端代码没有变化，继续使用已发布的 `4`；后续构建填写未占用的整数或留空自动分配。也可在有仓库权限的联网终端执行：
 
 ```bash
-gh workflow run aliyun-backend.yml --ref deploy/mineru-4.2.3
+gh workflow run aliyun-backend.yml --ref main
 # 只有前端变更时才需要再次发布；留空自动分配新整数。
-gh workflow run aliyun-frontend.yml --ref deploy/mineru-4.2.3
+gh workflow run aliyun-frontend.yml --ref main
 ```
 
 确认本次使用的每个镜像构建成功，源码 SHA 对应各自的发布提交后再切换。版本分配器只接受大于等于 3 的整数，失败也占用版本号；若所填版本已被占用，按发布流程使用后续整数，并同步修改现有 `.env` 中的镜像地址。不要把 SDK 版本 `4.2.3` 填入 Actions 的版本输入，也不要覆盖既有标签。
