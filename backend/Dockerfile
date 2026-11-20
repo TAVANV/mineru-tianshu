@@ -129,6 +129,8 @@ WORKDIR /app/backend
 
 RUN python -c "import ffmpeg, soundfile, kaldi_native_fbank, imagehash, pywt; from funasr import AutoModel; from audio_engines.sensevoice_engine import SenseVoiceEngine; from video_engines.keyframe_extractor import KeyframeExtractor, VideoOCREngine; from video_engines.video_engine import VideoProcessingEngine; assert VideoProcessingEngine.check_ffmpeg(); print(chr(9989) + ' 音频与视频关键帧入口可用')"
 
+RUN python -c "from ultralytics import YOLO; from remove_watermark.lama_inpainter import SimpleLama; from remove_watermark.watermark_remover import WatermarkRemover, LAMA_AVAILABLE, ULTRALYTICS_AVAILABLE; assert LAMA_AVAILABLE and ULTRALYTICS_AVAILABLE; print(chr(9989) + ' YOLO 与离线 LaMa 入口可用')"
+
 EXPOSE 8000 8001 8002
 
 USER tianshu

@@ -97,3 +97,6 @@ ffmpeg-python>=0.2.0
 soundfile>=0.13.0
 ImageHash==4.3.2
 PyWavelets==1.8.0
+
+# 9. 水印检测；LaMa 使用既有 Torch/Pillow/NumPy 和外置 TorchScript 权重。
+ultralytics==8.3.253

@@ -21,7 +21,7 @@ except ImportError:
     ULTRALYTICS_AVAILABLE = False
 
 try:
-    from simple_lama_inpainting import SimpleLama
+    from .lama_inpainter import SimpleLama
 
     LAMA_AVAILABLE = True
 except ImportError:
@@ -57,10 +57,12 @@ class WatermarkRemover:
         """
         if not ULTRALYTICS_AVAILABLE:
             raise ImportError("ultralytics not installed. Install: pip install ultralytics")
+        if use_lama and not LAMA_AVAILABLE:
+            raise ImportError("LaMa 运行时不可用，请检查 torch、numpy 和 Pillow 依赖")
 
         self.model_path = model_path or self.DEFAULT_MODEL_ID
         self.device = device
-        self.use_lama = use_lama and LAMA_AVAILABLE
+        self.use_lama = use_lama
 
         self.yolo = None
         self.lama = None
@@ -133,13 +135,8 @@ class WatermarkRemover:
 
         logger.info("📥 Loading LaMa...")
 
-        try:
-            self.lama = SimpleLama()
-            logger.info("✅ LaMa loaded")
-        except Exception as e:
-            logger.warning(f"Failed to load LaMa: {e}")
-            logger.warning("Falling back to OpenCV")
-            self.use_lama = False
+        self.lama = SimpleLama(device=self.device)
+        logger.info("✅ LaMa loaded")
 
         return self.lama
 
