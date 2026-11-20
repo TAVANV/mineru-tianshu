@@ -1,4 +1,5 @@
 # 生产事故防线测试需要的轻量运行时依赖；不安装 MinerU、Torch 或 GPU 引擎。
+aiohttp>=3.14.3
 email-validator>=2.2.0
 fastapi==0.141.1
 httpx>=0.28.0
