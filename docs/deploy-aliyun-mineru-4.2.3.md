@@ -1,6 +1,6 @@
 # 阿里云镜像升级到 MinerU 4.2.3
 
-本文用于在 `192.168.100.27` 的 `/root/tianshu` 原位升级。前后端发布镜像使用整数标签 `4`，后端内安装的 MinerU SDK 版本为 `4.2.3`。本文提供配置与执行步骤；是否已上线，以 Actions 产物、实际运行镜像和端到端验收记录为准。
+本文用于在目标服务器的 `/root/tianshu` 原位升级。前后端发布镜像使用整数标签 `4`，后端内安装的 MinerU SDK 版本为 `4.2.3`。本文提供配置与执行步骤；是否已上线，以 Actions 产物、实际运行镜像和端到端验收记录为准。
 
 软件版本与模型发布名分别管理：新版 SDK 是 `4.2.3`，小模型目录为 `MinerU-4_models_torch`，VLM 使用 `MinerU2.5-Pro-2605-1.2B`。VLM 名称中的 `2.5` 不代表仍在运行旧 SDK；旧 `2509` 权重保留用于兼容与回滚，新配置默认选择 Pro。
 
@@ -37,23 +37,26 @@ dc() {
 
 始终使用原有的单一 `.env`。`.env.registry.example` 仅作为非敏感变量的合并模板，完成第 4 节备份后，再由部署脚本或编辑器按键更新原 `.env`；禁止用 `cp` 覆盖原文件，也不创建活动 `.env.registry`。原 `.env` 的 JWT、管理员密码、RustFS 访问密钥、MCP 密钥、内部 API 凭据、`DATABASE_PATH`、网络配置和自定义地址沿用；不要从示例文件重建原 `.env`，也不要把现有密钥复制进文档或提交到 Git。
 
+模板中的 `SERVER_HOST=your-server.example.com` 是占位符，URL 和白名单通过 `${SERVER_HOST}` 插值。真实地址仅写入服务器本地未跟踪的 `.env`，或在执行验收命令的本机 shell 设置；不要提交到仓库。模板网段使用上游通用示例，已有部署仍沿用实际原网络，不用示例覆盖。
+
 | 配置 | 本次值或处理方式 |
 | --- | --- |
 | `COMPOSE_FILE` | `docker-compose.yml:docker-compose.external-models.yml:docker-compose.vllm.yml:docker-compose.registry.yml`，Linux 服务器使用冒号分隔 |
+| `SERVER_HOST` | `your-server.example.com` 占位符，仅在本地配置真实地址 |
 | `TIANSHU_BACKEND_IMAGE` / `TIANSHU_FRONTEND_IMAGE` | `registry.cn-chengdu.aliyuncs.com/tavan-ai/tianshu-backend:4` / `tianshu-frontend:4` |
 | `VLLM_IMAGE` | `vllm/vllm-openai:v0.31.0-cu129`，可由变量覆盖 |
 | `RUSTFS_IMAGE` | 保留现场 `rustfs/rustfs@sha256:0725587f6fcca83c1898f321424327d6e6da5e01ea20382905dd258ed5af3be4` |
 | `OFFLINE_MODELS_PATH` | `/root/tianshu/models-offline-4.2.3` |
 | `MINERU_VLM_MODEL_DIR` | 默认留空，由模型 `config.yaml` 选择 Pro；也可显式指定挂载根内的目录 |
-| `TIANSHU_NETWORK_NAME` / `TIANSHU_SUBNET` / `TIANSHU_GATEWAY` | 保留原 `tianshu-network` / `172.30.0.0/16` / `172.30.0.1` |
+| `TIANSHU_NETWORK_NAME` / `TIANSHU_SUBNET` / `TIANSHU_GATEWAY` | 沿用原网络；模板仅示例 `tianshu-network` / `172.28.0.0/16` / `172.28.0.1` |
 | `API_PORT` / `FRONTEND_PORT` | `8100` / `8080` |
 | `NGINX_CLIENT_MAX_BODY_SIZE` | `0`，沿用当前 Nginx 已生效的上传大小设置 |
-| `ALLOWED_ORIGINS` | 显式传入后端，沿用原 CORS 白名单；缺省允许 HTTP 前端及本地调试地址 |
+| `ALLOWED_ORIGINS` | 显式传入后端，沿用原 CORS 白名单；模板加入 `http://${SERVER_HOST}:8080`，overlay 缺省仅允许本地调试地址 |
 | `WORKER_PORT` / `MCP_PORT` / `VLLM_PORT` | `8001` / `8002` / `30024`，保留原全接口绑定 |
-| `MCP_ALLOWED_HOSTS` | 逗号分隔，默认含 `192.168.100.27:8002`、`localhost:*`、`127.0.0.1:*` 与 IPv6 回环 |
-| `MCP_ALLOWED_ORIGINS` | 逗号分隔，默认含 HTTP 前端 `http://192.168.100.27:8080`、MCP 自身地址及回环来源 |
+| `MCP_ALLOWED_HOSTS` | 逗号分隔，模板加入 `${SERVER_HOST}:8002`；overlay 缺省仅含本机回环地址 |
+| `MCP_ALLOWED_ORIGINS` | 逗号分隔，模板加入 `http://${SERVER_HOST}:8080`、MCP 自身地址及回环来源；overlay 缺省仅含回环来源 |
 | `RUSTFS_PORT` / `RUSTFS_CONSOLE_PORT` | `9000` / `9001`，保留原全接口绑定 |
-| `RUSTFS_PUBLIC_URL` | `http://192.168.100.27:9000`，与历史图片链接一致 |
+| `RUSTFS_PUBLIC_URL` | 必须在本地 `.env` 显式提供，沿用历史图片公开地址；模板为 `http://${SERVER_HOST}:9000` |
 | `RUSTFS_SECURE` / `REDIS_DB` | `false` / `0`，显式传入 API 与 Worker |
 | `MAX_CONCURRENT_TASKS` / `MINERU_VIRTUAL_VRAM_SIZE` | `4` 个 Worker 进程 / 每进程规划值 `6` GiB |
 | `MINERU_PROCESSING_WINDOW_SIZE` | `8`，降低每进程同时物化的页面图像数量 |
@@ -190,11 +193,14 @@ dc --profile manual ps -a
 
 ## 6. 验收
 
+先在当前本机 shell 设置 `SERVER_HOST` 为实际服务器地址；以下命令仅演示占位值，执行前替换，真实值不写入受版本控制的文件。
+
 ```bash
+SERVER_HOST=your-server.example.com
 dc --profile manual ps -a
-curl --fail http://192.168.100.27:8100/api/v1/health
-curl --fail http://192.168.100.27:8002/health
-curl --fail --head http://192.168.100.27:8080/
+curl --fail "http://${SERVER_HOST}:8100/api/v1/health"
+curl --fail "http://${SERVER_HOST}:8002/health"
+curl --fail --head "http://${SERVER_HOST}:8080/"
 dc exec -T backend python -c \
   'import os,sqlite3; p=os.environ["DATABASE_PATH"]; c=sqlite3.connect("file:"+p+"?mode=ro",uri=True); print(c.execute("PRAGMA quick_check").fetchone()[0])'
 docker inspect --format '{{.Config.Image}} {{.Image}}' \
@@ -204,7 +210,7 @@ dc logs --tail 100 backend worker scheduler mcp-server
 
 按以下清单完成真实推理后再恢复全部流量：
 
-1. 旧账号可登录，旧 API Key 与 MCP 远程客户端继续工作；历史任务、下载、源 PDF 预览和图片均可访问，历史图片仍使用 `http://192.168.100.27:9000`。
+1. 旧账号可登录，旧 API Key 与 MCP 远程客户端继续工作；历史任务、下载、源 PDF 预览和图片均可访问，历史图片仍使用原 `.env` 中的公开地址。
 2. 单个小 PDF、图片与带页范围 PDF 解析成功；超过 40 页的 PDF 产生 20 页分片并合并，父子任务计数正确；ZIP 批量流程可用。
 3. 提交 VLM/hybrid PDF，确认 vLLM 从待启动状态进入运行并加载选中的 Pro 权重，再核对 Markdown、JSON 与图片。仅健康检查成功不能证明模型已加载。
 4. 实际运行音频、视频与所使用的去水印样例，确认本地模型与新镜像中的依赖可用，无联网下载或旧补丁挂载依赖。

@@ -45,8 +45,8 @@ services:
       - "${API_PORT:-8100}:8000"
     environment:
       <<: *registry-environment
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://192.168.100.27:8080,http://localhost:8080,http://127.0.0.1:8080}
-      RUSTFS_PUBLIC_URL: ${RUSTFS_PUBLIC_URL:-http://192.168.100.27:9000}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+      RUSTFS_PUBLIC_URL: ${RUSTFS_PUBLIC_URL:?set RUSTFS_PUBLIC_URL in .env}
       RUSTFS_SECURE: ${RUSTFS_SECURE:-false}
       FAIR_SCHEDULING_ENABLED: ${FAIR_SCHEDULING_ENABLED:-true}
       REDIS_QUEUE_ENABLED: ${REDIS_QUEUE_ENABLED:-false}
@@ -73,7 +73,7 @@ services:
       PDF_SPLIT_ENABLED: ${PDF_SPLIT_ENABLED:-true}
       PDF_SPLIT_THRESHOLD_PAGES: ${PDF_SPLIT_THRESHOLD_PAGES:-40}
       PDF_SPLIT_CHUNK_SIZE: ${PDF_SPLIT_CHUNK_SIZE:-20}
-      RUSTFS_PUBLIC_URL: ${RUSTFS_PUBLIC_URL:-http://192.168.100.27:9000}
+      RUSTFS_PUBLIC_URL: ${RUSTFS_PUBLIC_URL:?set RUSTFS_PUBLIC_URL in .env}
       RUSTFS_SECURE: ${RUSTFS_SECURE:-false}
       FAIR_SCHEDULING_ENABLED: ${FAIR_SCHEDULING_ENABLED:-true}
       REDIS_QUEUE_ENABLED: ${REDIS_QUEUE_ENABLED:-false}
@@ -130,8 +130,8 @@ services:
       - "${MCP_PORT:-8002}:8002"
     environment:
       <<: *registry-environment
-      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-192.168.100.27:8002,localhost:*,127.0.0.1:*,[::1]:*}
-      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-http://192.168.100.27:8080,http://192.168.100.27:8002,http://localhost:*,https://localhost:*,http://127.0.0.1:*,https://127.0.0.1:*,http://[::1]:*,https://[::1]:*}
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-localhost:*,127.0.0.1:*,[::1]:*}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-http://localhost:*,https://localhost:*,http://127.0.0.1:*,https://127.0.0.1:*,http://[::1]:*,https://[::1]:*}
     volumes: *registry-model-volumes
 
   frontend:
