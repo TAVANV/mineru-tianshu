@@ -321,6 +321,7 @@ class VideoProcessingEngine:
             if result.get("json_data"):
                 json_data = result["json_data"]
                 json_data["type"] = "video"
+                json_data.setdefault("source", {})
                 json_data["source"]["file_type"] = "video"
                 json_data["source"]["video_format"] = video_path.suffix[1:]
                 json_data["source"]["original_filename"] = video_path.name

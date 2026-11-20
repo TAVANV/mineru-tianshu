@@ -92,5 +92,8 @@ ftfy>=6.3.0
 
 # 8. 音视频解析
 funasr>=1.3.0
+kaldi-native-fbank==1.23.3
 ffmpeg-python>=0.2.0
 soundfile>=0.13.0
+ImageHash==4.3.2
+PyWavelets==1.8.0

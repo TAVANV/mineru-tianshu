@@ -165,6 +165,8 @@ ENV HOME=/home/tianshu
 # 设置工作目录为后端
 WORKDIR /app/backend
 
+RUN python -c "import ffmpeg, soundfile, kaldi_native_fbank, imagehash, pywt; from funasr import AutoModel; from audio_engines.sensevoice_engine import SenseVoiceEngine; from video_engines.keyframe_extractor import KeyframeExtractor, VideoOCREngine; from video_engines.video_engine import VideoProcessingEngine; assert VideoProcessingEngine.check_ffmpeg(); print(chr(9989) + ' 音频与视频关键帧入口可用')"
+
 # 暴露端口
 # 8000: API Server
 # 8001: LitServe Worker

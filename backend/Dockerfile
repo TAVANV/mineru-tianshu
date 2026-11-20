@@ -100,7 +100,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # 在构建阶段验证实际调用的公开入口。
 RUN python -c "import torch; import pypdf; import boto3; import botocore; import openai; print(chr(9989) + ' 三方依赖验证通过')" \
     && python -c "import flash_attn; print(chr(9989) + ' flash_attn 可用')" \
-    && python -c "import onnxruntime as o; p = o.get_available_providers(); assert 'CUDAExecutionProvider' in p, p; print(chr(9989) + ' onnxruntime-gpu ' + o.__version__ + ' ' + str(p))" \
+    && python -c "import onnxruntime as o; from importlib.metadata import distributions; assert not any(d.metadata['Name'].lower() == 'onnxruntime' for d in distributions()); p = o.get_available_providers(); assert 'CUDAExecutionProvider' in p, p; print(chr(9989) + ' onnxruntime-gpu ' + o.__version__ + ' ' + str(p))" \
     && python -c "from mineru.parser import parse; from mineru.render import render_content_list, render_content_list_v2; print(chr(9989) + ' MinerU 公开解析与渲染入口可用')" \
     && pip show mineru flash-attn | grep -E "^(Name|Version)"
 
@@ -126,6 +126,8 @@ RUN groupadd -g 10001 tianshu && \
 ENV HOME=/home/tianshu
 
 WORKDIR /app/backend
+
+RUN python -c "import ffmpeg, soundfile, kaldi_native_fbank, imagehash, pywt; from funasr import AutoModel; from audio_engines.sensevoice_engine import SenseVoiceEngine; from video_engines.keyframe_extractor import KeyframeExtractor, VideoOCREngine; from video_engines.video_engine import VideoProcessingEngine; assert VideoProcessingEngine.check_ffmpeg(); print(chr(9989) + ' 音频与视频关键帧入口可用')"
 
 EXPOSE 8000 8001 8002
 
